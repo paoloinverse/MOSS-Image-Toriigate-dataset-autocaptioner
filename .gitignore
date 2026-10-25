@@ -1,9 +1,3 @@
 __pycache__/
 *.pyc
-.env
-.env.local
-
-# Virtual environments
-.venv/
-venv/
-__pycache__/
+*.log
