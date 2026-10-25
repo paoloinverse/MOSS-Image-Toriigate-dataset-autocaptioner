@@ -197,6 +197,43 @@ def test_server_args():
     check("kv cache types", "--cache-type-k" in args and "q8_0" in args)
     check("host/port", "--host" in args and "--port" in args)
     check("extra passthrough", "--flash-attn" in args)
+    # Regression: the old code appended a bare '--api' which llama.cpp never
+    # had ('error: invalid argument: --api' -> exit 1).  The flag must now be
+    # the real --api-key (probed), and '-af' must survive.
+    check("no bogus --api flag", "--api" not in args)
+    check("--api-key present", "--api-key" in args)
+    check("-af flash attn", "-af" in args)
+    # Reasoning budget flows through only when the binary supports it.
+    cfg2 = ServerConfig(model=cfg.model, plan=cfg.plan,
+                        reasoning_budget=4096, binary="/usr/bin/llama-server")
+    args2 = sm.build_args(cfg2)
+    check("reasoning budget passed",
+          "--reasoning-budget" in args2
+          and args2[args2.index("--reasoning-budget") + 1] == "4096")
+
+
+# ------------------------------------------------------------------ profiles
+def test_model_profiles():
+    from app.core.models import (KV_CACHE_TYPES, MODEL_PROFILES,
+                                 get_model_profile)
+
+    check("bf16 in KV types", "bf16" in KV_CACHE_TYPES)
+    tg = get_model_profile("toriigate")
+    qw = get_model_profile("qwen3.8-27b")
+    check("toriigate Q8_0 context cap",
+          tg.max_context_by_quant.get("Q8_0") == 32768)
+    check("qwen3.8 IQ4_XS context cap",
+          qw.max_context_by_quant.get("UD-IQ4_XS") == 131072)
+    check("thinking levels present",
+          len(tg.thinking_levels) >= 4 and len(qw.thinking_levels) >= 4)
+    budgets = [l.budget for l in qw.thinking_levels]
+    check("thinking budgets ascend", budgets == sorted(budgets))
+    unknown = get_model_profile("does-not-exist")
+    check("unknown model neutral profile",
+          unknown.max_context_by_quant == {}
+          and unknown.thinking_levels == ())
+    check("profiles registered", set(MODEL_PROFILES) >= {"toriigate",
+                                                         "qwen3.8-27b"})
 
 
 # ------------------------------------------------------------------ payload
@@ -218,6 +255,24 @@ def test_payload():
               and pl["top_k"] == 40 and "min_p" in pl)
         check("streaming", pl["stream"] is True)
 
+        # Live Tab 2 settings override the preset values (thinking levels).
+        from app.context import InferenceSettings
+        s = InferenceSettings(temperature=0.6, top_p=0.9, top_k=20, min_p=0.0,
+                              reasoning_budget=4096)
+        pl2 = build_payload(img, DEFAULT_PRESETS["moss"], "SYS", settings=s)
+        check("settings override sampling",
+              pl2["temperature"] == 0.6 and pl2["top_p"] == 0.9
+              and pl2["top_k"] == 20 and pl2["min_p"] == 0.0)
+        check("settings drive thinking",
+              pl2.get("enable_thinking") is True
+              and pl2.get("reasoning_budget_tokens") == 4096)
+        s_off = InferenceSettings(reasoning_budget=0)
+        # Preset enable_thinking stays on unless overridden by a preset that
+        # disables it; with budget 0 no reasoning tokens are injected.
+        pl3 = build_payload(img, DEFAULT_PRESETS["moss"], "SYS", settings=s_off)
+        check("zero budget -> no reasoning tokens",
+              "reasoning_budget_tokens" not in pl3)
+
 
 # ------------------------------------------------------------------ batch collect
 def test_collect_images():
@@ -238,6 +293,7 @@ if __name__ == "__main__":
     test_arch_from_config()
     test_presets_and_postproc()
     test_server_args()
+    test_model_profiles()
     test_payload()
     test_collect_images()
     print("\n%d failure(s): %s" % (len(FAILURES), FAILURES or "none"))

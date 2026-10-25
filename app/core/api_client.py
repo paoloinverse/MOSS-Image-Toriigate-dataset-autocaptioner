@@ -30,8 +30,15 @@ def image_to_data_url(path: str) -> str:
 
 
 def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
-                  max_tokens: int | None = None) -> dict:
+                  max_tokens: int | None = None,
+                  settings=None) -> dict:
     params: GenerationParams = preset.params
+    # Tab 2 live settings win over the preset when provided (AppContext's
+    # InferenceSettings); this keeps server-side --reasoning-budget and the
+    # request-side thinking flags consistent with what the user picked.
+    reasoning_budget = int(getattr(settings, "reasoning_budget",
+                                   params.reasoning_budget) or 0)
+    enable_thinking = bool(params.enable_thinking) or reasoning_budget > 0
     payload: dict = {
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -41,18 +48,19 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
                  "image_url": {"url": image_to_data_url(image_path)}},
             ]},
         ],
-        "temperature": params.temperature,
-        "top_p": params.top_p,
+        "temperature": float(getattr(settings, "temperature",
+                                     params.temperature)),
+        "top_p": float(getattr(settings, "top_p", params.top_p)),
         "max_tokens": max_tokens or params.max_tokens,
         "stream": True,
     }
     # llama-server accepts sampling extras at top level of the request body.
-    payload["top_k"] = params.top_k
-    payload["min_p"] = params.min_p
-    if params.enable_thinking:
+    payload["top_k"] = int(getattr(settings, "top_k", params.top_k))
+    payload["min_p"] = float(getattr(settings, "min_p", params.min_p))
+    if enable_thinking:
         payload["enable_thinking"] = True
-    if params.reasoning_budget > 0:
-        payload["reasoning_budget_tokens"] = params.reasoning_budget
+    if reasoning_budget > 0:
+        payload["reasoning_budget_tokens"] = reasoning_budget
     return payload
 
 
@@ -65,15 +73,18 @@ class CaptionClient:
 
     async def caption(self, image_path: str, preset: CaptionPreset,
                       system_prompt: str, on_chunk: ChunkCb = None,
-                      cancel_event=None) -> str:
+                      cancel_event=None, settings=None) -> str:
         """Stream a chat completion and return the full assistant text.
 
         ``on_chunk(text)`` receives each delta for live GUI log tailing.
         ``cancel_event`` (threading.Event/asyncio-friendly bool check) allows
-        the batch runner to abort mid-request.
+        the batch runner to abort mid-request.  ``settings`` (AppContext's
+        InferenceSettings) overrides sampling/thinking values with the live
+        Tab 2 state so requests match the running server configuration.
         """
         url = f"{self.base_url}/v1/chat/completions"
-        payload = build_payload(image_path, preset, system_prompt)
+        payload = build_payload(image_path, preset, system_prompt,
+                                settings=settings)
         chunks: list[str] = []
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream("POST", url, json=payload) as resp:

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from app.core import llamacpp
 from app.core.hardware import HardwareManager
 from app.core.models import ModelFile
 from app.core.resources import ResourcePlan, MIN_CONTEXT
@@ -114,6 +115,23 @@ class ServerManager(QObject):
     def build_args(self, cfg: ServerConfig) -> list[str]:
         binary = self.find_binary() or cfg.binary
         caps = llamacpp.probe_capabilities(binary)
+        # Warn *before* spawning when the user selected GPUs but the binary
+        # was compiled without any GPU backend (the silent CPU-only run that
+        # produced "no usable GPU found, --gpu-layers option will be ignored"
+        # in the field).  Guarded so duck-typed hw stubs keep working.
+        try:
+            want_gpu = bool(self.hw.selected_gpus)
+        except Exception:
+            want_gpu = False
+        if want_gpu and not caps.get("gpu", False):
+            self.log.emit(
+                "[server] WARNING: this llama-server binary does NOT advertise "
+                "CUDA/ROCm/Vulkan support - GPU offload (-ngl/-sm/-ts) will be "
+                "ignored and inference runs CPU-only.\n"
+                "    fix    : re-run 'Auto-install / build' in Tab 2 (the guided "
+                "installer now detects nvcc outside PATH and verifies the "
+                "compiled binary actually has GPU support), or point 'Binary:' "
+                "at a GPU-enabled llama.cpp build.")
         args = [binary]
         if cfg.model:
             args += ["-m", str(cfg.model.local_path())]

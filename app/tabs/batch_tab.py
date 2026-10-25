@@ -159,7 +159,7 @@ class BatchTab(QWidget):
                              if self.ctx.server.config else
                              f"http://{self.ctx.settings.host}:{self.ctx.settings.port}",
                              preset, self.ctx.effective_system_prompt(),
-                             images, self)
+                             images, self, settings=self.ctx.settings)
         worker.log.connect(self.append_log)
         worker.progress.connect(self.on_progress)
         worker.chunk.connect(self.on_chunk)
