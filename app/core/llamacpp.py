@@ -559,6 +559,7 @@ class InstallRunner(QObject):
         self.backend = backend          # auto | cuda | rocm | vulkan | cpu
         self._cancel = threading.Event()
         self._preflight: PreflightResult | None = None
+        self._configure_retried = False
 
     # ------------------------------------------------------------- public
     def cancel(self):
@@ -887,6 +888,21 @@ class InstallRunner(QObject):
             "vulkan": ["-DGGML_VULKAN=ON"],
             "cpu": [],
         }[backend]
+        # Explicitly DISABLE every GPU backend that was NOT selected.
+        # llama.cpp's CMake auto-enables backends whose SDK merely happens
+        # to be present (e.g. GGML_VULKAN defaults to ON when Vulkan is
+        # available - and on recent trees even without a full SDK), which
+        # made a pure CUDA configure abort with
+        #   "Could NOT find Vulkan (missing: Vulkan_LIBRARY
+        #    Vulkan_INCLUDE_DIR glslc)".
+        _BACKEND_SWITCHES = {
+            "cuda": "GGML_CUDA",
+            "rocm": "GGML_HIP",
+            "vulkan": "GGML_VULKAN",
+        }
+        for name, var in _BACKEND_SWITCHES.items():
+            if name != backend:
+                build_flags.append(f"-D{var}=OFF")
 
         build_dir = src / "build"
         jobs = max(1, (os.cpu_count() or 4) // 2)
@@ -897,8 +913,22 @@ class InstallRunner(QObject):
             # nvcc exists only inside the CUDA toolkit root: hand it to cmake.
             configure_cmd.append(f"-DCMAKE_CUDA_COMPILER="
                                  f"{cuda_root / 'bin' / 'nvcc'}")
-        self.log.emit(f"[install] configuring ({' '.join(build_flags) or 'CPU'}) …")
-        self._stream(configure_cmd)
+        self.log.emit(f"[install] configuring ({' '.join(build_flags) or 'CPU-only'}) …")
+        try:
+            self._stream(configure_cmd)
+        except AppError:
+            # A stale CMakeCache.txt from an earlier attempt makes cmake
+            # replay detection with the previous flags; wipe the build dir
+            # and retry exactly once before giving up.
+            if self._configure_retried:
+                raise
+            self._configure_retried = True
+            if not (build_dir / "CMakeCache.txt").exists():
+                raise
+            self.log.emit("[install] configure failed - clearing the "
+                          "stale CMake cache and retrying once …")
+            shutil.rmtree(build_dir, ignore_errors=True)
+            self._stream(configure_cmd)
         if self._cancel.is_set():
             raise AppError("Installation cancelled by user",
                            detail="configure completed; compile skipped.")

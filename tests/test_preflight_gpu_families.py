@@ -72,9 +72,17 @@ assert r.ok and r.backend=="cuda" and r.gpu_families=={"nvidia"}, "A FAILED"
 r=scenario("B nvidia+phantom-amd,no-nvcc", pci_map={"0000:01:00.0":RTX,"0000:0d:00.0":AMD_VIRT}, nv_driver=True, amdgpu=False, has_nvcc=False)
 assert not r.ok and "NVIDIA" in r.error.detail and "ROCm" not in r.error.detail, "B FAILED"
 
-# Scenario C: genuine dual-GPU with amdgpu driver loaded -> still halts for ROCm
-r=scenario("C real amd+nvidia,no-hipcc", pci_map={"0000:01:00.0":RTX,"0000:05:00.0":("0x030000","0x1002")}, nv_driver=True, amdgpu=True, has_hipcc=False)
-assert not r.ok and "AMD" in r.error.detail, "C FAILED"
+# Scenario C: genuine dual-GPU (amdgpu loaded) but CUDA toolkit works -> must
+# NOT halt: the NVIDIA+CUDA combo can serve the build, so the secondary AMD
+# display silicon is dropped instead of demanding a ROCm stack (this was the
+# residual false-positive that kept blocking RTX 5060 Ti + AMD iGPU boxes).
+r=scenario("C real amd+nvidia,nvcc,no-hipcc", pci_map={"0000:01:00.0":RTX,"0000:05:00.0":("0x030000","0x1002")}, nv_driver=True, amdgpu=True, has_hipcc=False)
+assert r.ok and r.backend=="cuda" and r.gpu_families=={"nvidia"}, "C FAILED"
+
+# Scenario C2: same hardware but NO nvcc either -> now ROCm truly matters,
+# so the preflight must halt demanding the ROCm toolchain (no silent CPU).
+r=scenario("C2 real amd+nvidia,no-nvcc,no-hipcc", pci_map={"0000:01:00.0":RTX,"0000:05:00.0":("0x030000","0x1002")}, nv_driver=True, amdgpu=True, has_nvcc=False, has_hipcc=False)
+assert not r.ok and "AMD" in r.error.detail and "CUDA" in r.error.detail, "C2 FAILED"
 
 # Scenario D: genuine AMD box with amdgpu + hipcc -> rocm backend
 r=scenario("D real amd + hipcc", pci_map={"0000:05:00.0":("0x030000","0x1002")}, nv_driver=False, amdgpu=True, has_hipcc=True, has_nvcc=False)
