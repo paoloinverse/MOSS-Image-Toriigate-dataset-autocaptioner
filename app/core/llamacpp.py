@@ -659,11 +659,18 @@ class InstallRunner(QObject):
             # (perfectly valid) CUDA/CPU build we drop 'amd' from the family
             # set - it must not hijack backend selection further down either.
             if not has_hipcc:
-                if amd_real:
+                cuda_can_serve = ("nvidia" in hw and has_nvcc) or \
+                                 self._has_nvidia_smi()
+                if amd_real and not cuda_can_serve:
                     blocked.append((
                         "AMD GPU(s) present but no ROCm/HIP compiler found "
                         "(hipcc missing, /opt/rocm/bin/hipcc absent)", "rocm"))
                 else:
+                    # Either phantom AMD silicon (no amdgpu driver bound), or
+                    # a real-but-secondary AMD display chip on an NVIDIA box
+                    # where CUDA already covers inference: dropping 'amd' here
+                    # mirrors Tab 1's NVML truth instead of demanding a ROCm
+                    # stack this machine will never use.
                     hw.discard("amd")
                     res.gpu_families = hw
             elif not amd_real:
@@ -978,8 +985,14 @@ class InstallRunner(QObject):
 
     def _has_nvidia_driver(self) -> bool:
         """True when an NVIDIA kernel driver is loaded (GPU actually usable)."""
-        if shutil.which("nvidia-smi") is not None:
-            return True
+        return self._has_nvidia_smi() or self._nvidia_proc_driver()
+
+    @staticmethod
+    def _has_nvidia_smi() -> bool:
+        return shutil.which("nvidia-smi") is not None
+
+    @staticmethod
+    def _nvidia_proc_driver() -> bool:
         try:
             return Path("/proc/driver/nvidia/version").exists()
         except OSError:
