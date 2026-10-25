@@ -72,17 +72,6 @@ The app stores downloaded GGUF models and multimodal projectors under `~/.cache/
 
 The **global side panel** always shows the focused image's caption editor (loads existing `.txt`/`.json` captions) with a manual "Save Caption" button.
 
-## Testing
-
-Lightweight, environment-safe tests (no huge downloads or memory allocations):
-
-```bash
-source .venv/bin/activate
-python -m pytest tests/ -v
-```
-
-For headless CI environments, the GUI smoke test falls back to Qt's `offscreen` platform automatically. Live end-to-end testing with real GPUs and model downloads is expected to be done by the user on their own hardware; the app reports errors verbosely with actionable fixes in the log panel and dialogs.
-
 ## Troubleshooting
 
 - **"qt.qpa.plugin: Could not load the Qt platform plugin xcb"** → install the optional system libraries above, or force Wayland with `QT_QPA_PLATFORM=wayland ./run.sh`.
