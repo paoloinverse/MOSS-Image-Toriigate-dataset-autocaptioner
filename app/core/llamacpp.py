@@ -23,6 +23,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -298,6 +299,95 @@ def pick_best(preferred: str = "") -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Missing-package detection -> copy-pasteable fix commands
+# ---------------------------------------------------------------------------
+#: Well-known toolchain / GPU-SDK packages, keyed by distro family.  Used to
+#: turn "nvcc / g++ / cmake / vulkan.h is missing" into ready-to-run command
+#: lines instead of a cryptic mid-compile failure.
+_FIX_PACKAGES: dict[str, dict[str, list[str]]] = {
+    "cuda": {
+        "apt": ["nvidia-cuda-toolkit"],
+        "dnf": ["gcc-c++", "cuda-toolkit"],
+        "pacman": ["cuda"],
+        "zypper": ["cuda-toolkit"],
+    },
+    "vulkan": {
+        "apt": ["libvulkan-dev", "vulkan-tools", "glslang-tools"],
+        "dnf": ["vulkan-devel", "glslang", "vulkan-tools"],
+        "pacman": ["vulkan-devel", "glslang"],
+        "zypper": ["vulkan-devel", "glslang-tools", "vulkan-tools"],
+    },
+    "rocm": {
+        "apt": ["hip-runtime-amd", "hip-dev"],
+        "dnf": ["hip-runtime-amd", "hip-dev"],
+        "pacman": ["hip-runtime-amd"],
+        "zypper": ["rocm-hip-runtime"],
+    },
+    "buildtools": {
+        "apt": ["git", "cmake", "build-essential"],
+        "dnf": ["git", "cmake", "gcc", "gcc-c++", "make"],
+        "pacman": ["git", "cmake", "gcc", "make"],
+        "zypper": ["git", "cmake", "gcc", "gcc-c++", "make"],
+    },
+}
+
+
+def detect_pkg_manager() -> str | None:
+    """Return 'apt' | 'dnf' | 'pacman' | 'zypper' (best guess) or None."""
+    if sys.platform == "darwin":
+        return "brew"
+    if shutil.which("apt-get") or shutil.which("apt"):
+        return "apt"
+    if shutil.which("dnf") or shutil.which("yum"):
+        return "dnf"
+    if shutil.which("pacman"):
+        return "pacman"
+    if shutil.which("zypper"):
+        return "zypper"
+    # Fall back to os-release when the manager itself is not on PATH.
+    try:
+        txt = Path("/etc/os-release").read_text(errors="replace").lower()
+    except OSError:
+        return None
+    if any(d in txt for d in ("debian", "ubuntu", "mint", "pop")):
+        return "apt"
+    if any(d in txt for d in ("fedora", "rhel", "centos", "rocky", "alma")):
+        return "dnf"
+    if any(d in txt for d in ("arch", "manjaro", "endeavour")):
+        return "pacman"
+    if "suse" in txt or "opensuse" in txt:
+        return "zypper"
+    return None
+
+
+def _install_verb(mgr: str) -> str:
+    return {"apt": "sudo apt install",
+            "dnf": "sudo dnf install",
+            "yum": "sudo dnf install",
+            "pacman": "sudo pacman -S",
+            "zypper": "sudo zypper install",
+            "brew": "brew install"}.get(mgr, "your package manager to install")
+
+
+def fix_command(group: str, mgr: str | None = None) -> str:
+    """Copy-pasteable privileged command line that installs a package group.
+
+    ``group`` is a key of :data:`_FIX_PACKAGES` ('cuda', 'vulkan', 'rocm',
+    'buildtools').  When the distro's package manager cannot be determined a
+    generic hint is produced instead of a bogus command.
+    """
+    mgr = mgr or detect_pkg_manager()
+    pkgs = _FIX_PACKAGES.get(group, {})
+    if mgr and mgr in pkgs:
+        return f"{_install_verb(mgr)} {' '.join(pkgs[mgr])}"
+    if mgr == "brew":  # no GPU SDKs on macOS; generic fallback below
+        return f"brew install {' '.join(pkgs.get('apt', []))}"
+    listed = ", ".join(sorted({p for lst in pkgs.values() for p in lst}))
+    return (f"install these packages with your distro's package manager "
+            f"(sudo …): {listed}")
+
+
+# ---------------------------------------------------------------------------
 # Guided installation (clone + cmake build) - runs inside a QThread
 # ---------------------------------------------------------------------------
 class InstallRunner(QObject):
@@ -327,12 +417,31 @@ class InstallRunner(QObject):
                       "current build step finishes.")
 
     def check_prerequisites(self) -> tuple[bool, list[str]]:
-        """Verify git/cmake/compiler availability (no heavy work)."""
+        """Verify git/cmake/compiler availability (no heavy work).
+
+        Each missing tool is reported together with a copy-pasteable install
+        command for the detected distro's package manager - the caller (and
+        the GUI preflight dialog) can surface these directly to the user,
+        who most likely needs privileged access to run them.
+        """
+        mgr = detect_pkg_manager()
+        verb = _install_verb(mgr) if mgr else "sudo apt install"
         missing = []
         for tool, pkg in (("git", "git"), ("cmake", "cmake"),
                           ("g++", "build-essential")):
             if shutil.which(tool) is None:
-                missing.append(f"{tool}  (sudo apt install {pkg})")
+                # 'g++' lives in build-essential/gcc-c++, not a package named
+                # 'g++' on every distro - map it through the buildtools group.
+                if tool == "g++":
+                    pkgs = (_FIX_PACKAGES["buildtools"].get(mgr)
+                            if mgr else ["build-essential"]) or []
+                    compilers = [p for p in pkgs
+                                 if p in ("build-essential", "gcc-c++", "gcc")]
+                    inst = f"{verb} {' '.join(compilers)}" if compilers \
+                        else fix_command("buildtools", mgr)
+                else:
+                    inst = f"{verb} {pkg}"
+                missing.append(f"{tool}  (fix: {inst})")
         if missing:
             return False, missing
         v = self._run_capture(["cmake", "--version"])
@@ -413,32 +522,38 @@ class InstallRunner(QObject):
             raise AppError("Installation cancelled by user",
                            detail="git stage completed; build not started.")
 
-        # ---- backend selection ----------------------------------------
+        # ---- backend selection + missing-package detection --------------
         # Robust GPU-toolchain discovery (the old `shutil.which("nvcc")`-only
         # check silently produced CPU builds on machines with CUDA installed
         # outside PATH - e.g. "llama sees none" despite three RTX GPUs).
         cuda_root = self._find_cuda_root()
         has_nvcc = self._has_nvcc(cuda_root)
         has_driver = self._has_nvidia_driver()
+        rocm_ready = self._has_rocm()
+        vulkan_ready = self._has_vulkan()
         backend = self.backend
         if backend == "auto":
             if has_nvcc:
                 backend = "cuda"
-            elif self._has_rocm():
+            elif rocm_ready:
                 backend = "rocm"
-            elif self._has_vulkan():
+            elif vulkan_ready:
                 backend = "vulkan"
             else:
                 backend = "cpu"
             self.log.emit(f"[install] auto-detected GPU backend: {backend}")
-        if backend == "cpu" and has_driver:
-            self.log.emit(
-                "[install] WARNING: NVIDIA GPU(s) present but no CUDA "
-                "compiler (nvcc) found -> building CPU-only llama-server; "
-                "GPU offload (-ngl) will be IGNORED by that binary.")
-            # Explain *why* the other GPU backends were not chosen, so the
-            # user gets an actionable fix instead of a silent downgrade.
-            vulkan_missing = [name for name, ok in (
+
+        # Collect every *missing development package* that blocks a GPU
+        # backend, so the user gets copy-pasteable 'sudo …' command lines
+        # instead of a cascaded cmake compile error (e.g. NVIDIA GPUs present
+        # but nvcc absent, or a Vulkan runtime loader without its SDK).
+        missing_gpu_pkgs: list[tuple[str, str]] = []   # (reason, fix group)
+        if has_driver and not has_nvcc:
+            missing_gpu_pkgs.append(
+                ("NVIDIA GPU(s) detected but no CUDA compiler (nvcc) found",
+                 "cuda"))
+        if has_driver and not vulkan_ready:
+            vk_missing = [name for name, ok in (
                     ("Vulkan SDK library (libvulkan.so)",
                      self._vulkan_lib_dir() is not None),
                     ("Vulkan headers (vulkan/vulkan.h)",
@@ -446,25 +561,66 @@ class InstallRunner(QObject):
                     ("shader compiler (glslc/glslangValidator)",
                      self._vulkan_shaderc() is not None))
                 if not ok]
-            if vulkan_missing:
+            if vk_missing:
+                missing_gpu_pkgs.append(
+                    ("a Vulkan driver/loader is present but the development "
+                     "packages are missing: " + ", ".join(vk_missing),
+                     "vulkan"))
+
+        # Explain why the requested/auto backend degraded to CPU, with the
+        # exact privileged commands needed to enable GPU offload.
+        if backend == "cpu":
+            if missing_gpu_pkgs:
+                for reason, group in missing_gpu_pkgs:
+                    self.log.emit(
+                        f"[install] WARNING: {reason} -> building CPU-only "
+                        "llama-server; GPU offload (-ngl) will be IGNORED by "
+                        "that binary.")
+                self.log.emit("[install] To enable GPU offload, install the "
+                              "missing packages (requires sudo/root) and "
+                              "press 'Auto-install / build' again:")
+                seen: set[str] = set()
+                for _, group in missing_gpu_pkgs:
+                    if group not in seen:
+                        seen.add(group)
+                        self.log.emit("[install]   " + fix_command(group))
+            elif has_driver:
                 self.log.emit(
-                    "[install] note: a Vulkan driver/loader is present but "
-                    "the development packages are missing: "
-                    + ", ".join(vulkan_missing) + ".")
-                self.log.emit(
-                    "[install] hint: install them to enable Vulkan GPU "
-                    "offload, e.g. 'sudo apt install libvulkan-dev "
-                    "vulkan-tools glslang-tools' (Debian/Ubuntu), "
-                    "'sudo dnf install vulkan-devel glslang' (Fedora) or "
-                    "your distro's equivalents - then press "
-                    "'Auto-install / build' again.")
-            else:
-                self.log.emit(
-                    "[install] hint: install the CUDA toolkit "
-                    "(e.g. 'sudo apt install nvidia-cuda-toolkit' or from "
-                    "developer.nvidia.com) for full-speed GPU offload, or "
-                    "the Vulkan SDK dev packages listed above, then press "
-                    "'Auto-install / build' again.")
+                    "[install] WARNING: NVIDIA GPU(s) present but no CUDA "
+                    "compiler (nvcc) found -> building CPU-only llama-server; "
+                    "GPU offload (-ngl) will be IGNORED by that binary.")
+                self.log.emit("[install] hint: "
+                              + fix_command("cuda") + "  (or grab the toolkit "
+                              "from developer.nvidia.com), then press "
+                              "'Auto-install / build' again.")
+
+        # A manually-requested GPU backend whose toolchain is incomplete must
+        # never reach cmake (it would abort mid-configure with a disorienting
+        # 'Could NOT find …' error).  Fail early with the fix commands.
+        backend_group = {"cuda": "cuda", "rocm": "rocm", "vulkan": "vulkan"}
+        if backend in backend_group:
+            ready = {"cuda": has_nvcc, "rocm": rocm_ready,
+                     "vulkan": vulkan_ready}[backend]
+            if not ready:
+                grp = backend_group[backend]
+                cmds = [fix_command(grp)]
+                if grp == "cuda" and "vulkan" in [g for _, g
+                                                  in missing_gpu_pkgs]:
+                    cmds.append(fix_command("vulkan"))
+                raise AppError(
+                    f"Cannot build the {backend.upper()} backend: required "
+                    "development packages are missing",
+                    detail="Detected your hardware, but the toolchain for "
+                           f"'{backend}' is incomplete, so cmake would fail "
+                           "partway through the build.",
+                    suggestions=[f"Install the missing packages (needs "
+                                 f"privileged access): {cmds[0]}"
+                                 + (f" ; {cmds[1]}" if len(cmds) > 1 else ""),
+                                 "Then press 'Auto-install / build' again - "
+                                 "the existing checkout is re-used so only "
+                                 "the compile step repeats.",
+                                 "Or choose the 'cpu' backend to build now "
+                                 "without GPU offload."])
 
         build_flags = {
             "cuda": ["-DGGML_CUDA=ON"],
@@ -509,7 +665,10 @@ class InstallRunner(QObject):
                 suggestions=["Scroll up in the log for the compiler error.",
                              "Common causes: GPU SDK missing (CUDA toolkit / "
                              "ROCm), RAM exhaustion during parallel compile "
-                             "(retry with fewer jobs), or cmake too old."])
+                             "(retry with fewer jobs), or cmake too old.",
+                             "Missing packages can be installed with e.g. '"
+                             + fix_command("buildtools") + "' or '"
+                             + fix_command("cuda") + "'."])
         ver = probe_version(bin_path)
         caps = probe_capabilities(bin_path)
         self.log.emit(f"[install] SUCCESS: {bin_path}"
@@ -521,9 +680,10 @@ class InstallRunner(QObject):
                 f"{backend.upper()} support (see the 'ggml ...' feature lines "
                 "above). It will run CPU-only and ignore -ngl.")
             self.log.emit(
-                "[install] hint: install the CUDA toolkit (e.g. "
-                "'sudo apt install nvidia-cuda-toolkit' or from developer.nvidia.com) "
-                "and press 'Auto-install / build' again; the existing checkout "
+                f"[install] hint: install/repair the {backend.upper()} "
+                "toolchain, e.g. '" + fix_command(backend_group[backend]) +
+                "' (or the CUDA toolkit from developer.nvidia.com), then "
+                "press 'Auto-install / build' again; the existing checkout "
                 "is re-used so only the compile step repeats.")
         elif backend == "cuda":
             self.log.emit("[install] verified: binary advertises CUDA support "
@@ -679,22 +839,49 @@ class InstallRunner(QObject):
                            suggestions=["Ensure the tool is installed and on "
                                         "PATH, then retry."]) from exc
         assert proc.stdout
+        tail: list[str] = []
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
             if line:
                 self.log.emit("[install] " + line)
+                tail.append(line)
+                del tail[:-12]          # keep the last few error lines
             if self._cancel.is_set():
                 proc.kill()
                 break
         rc = proc.wait()
         if rc != 0:
+            blob = "\n".join(tail).lower()
+            suggestions = ["Fix the reported problem (permissions, missing "
+                           "SDK, network) and press the button again - the "
+                           "installer resumes from the existing checkout."]
+            # Translate common 'missing development package' cmake errors into
+            # concrete privileged command lines instead of a raw stack trace.
+            fixes = []
+            if "could not find vulkan" in blob or "vulkan_library" in blob \
+                    or "vulkan_include_dir" in blob:
+                fixes.append(fix_command("vulkan"))
+            if "nvcc" in blob or "cuda compiler" in blob \
+                    or "could not find cuda" in blob:
+                fixes.append(fix_command("cuda"))
+            if "hip" in blob and ("not found" in blob or "missing" in blob):
+                fixes.append(fix_command("rocm"))
+            if "no c/c++ compiler" in blob or "cmake c compiler" in blob \
+                    or "g++ not found" in blob:
+                fixes.append(fix_command("buildtools"))
+            for f in dict.fromkeys(fixes):     # dedupe, keep order
+                self.log.emit("[install] FIX: " + f)
+            if fixes:
+                suggestions.insert(
+                    0, "A required development package is missing. Install "
+                       "it (needs sudo/root), then press the button again: "
+                       + ";  then ".join(dict.fromkeys(fixes)))
             raise AppError(
                 f"Step failed with exit code {rc}: {' '.join(cmd[:3])} …",
                 detail="See the '[install]' log lines above for the tool's own "
-                       "error message.",
-                suggestions=["Fix the reported problem (permissions, missing "
-                             "SDK, network) and press the button again - the "
-                             "installer resumes from the existing checkout."])
+                       "error message."
+                       + (" Fix command(s) provided below." if fixes else ""),
+                suggestions=suggestions)
 
 
 def suggested_install_root() -> str:

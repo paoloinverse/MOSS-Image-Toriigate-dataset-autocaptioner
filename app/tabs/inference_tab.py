@@ -442,8 +442,14 @@ class InferenceTab(QWidget):
         # 1) Toolchain preflight BEFORE bothering the user with dialogs.
         runner_probe = llamacpp.InstallRunner(llamacpp.suggested_install_root())
         ok, missing = runner_probe.check_prerequisites()
-        tool_msg = ("Build tools detected (git, cmake, g++)."
-                    if ok else "MISSING build tools:\n  - " + "\n  - ".join(missing))
+        mgr = llamacpp.detect_pkg_manager()
+        tool_msg = ("Build tools detected (git, cmake, g++)." if ok else
+                    "MISSING build tools:\n  - " + "\n  - ".join(missing))
+        if not ok:
+            tool_msg += ("\n\nCopy-paste these commands into a terminal "
+                         "(they need sudo/root):\n"
+                         + "\n".join(f"  $ {m.split('fix: ', 1)[1].rstrip(')')}"
+                                     for m in missing if "fix: " in m))
         # 2) Ask where to install (default folder pre-filled & editable).
         folder = QFileDialog.getExistingDirectory(
             self, "Choose the llama.cpp install folder (cancel = default)",
@@ -465,12 +471,17 @@ class InferenceTab(QWidget):
             self.ctx.log.emit("[install] " + self.status_note)
             return
         if not ok:
+            # Surface ready-to-run command lines (they need privileged
+            # access, so we only *offer* them - the user pastes into a shell).
+            cmds = [m.split("fix: ", 1)[1].rstrip(")")
+                    for m in missing if "fix: " in m]
             self.ctx.report_error(
                 "[install] cannot start the guided build - missing tools:\n  - "
                 + "\n  - ".join(missing) + "\n"
-                "    fix    : sudo apt install " +
-                " ".join(m.split()[0] for m in missing) +
-                "\n             then press 'Auto-install / build' again.",
+                "    fix    : run these commands in a terminal (requires "
+                "sudo/root):\n"
+                + "\n".join(f"             $ {c}" for c in cmds)
+                + "\n             then press 'Auto-install / build' again.",
                 context="guided llama.cpp install", dialog=True)
             return
         # 3) Run in background with live logs.

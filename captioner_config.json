@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "active_preset": "moss",
+  "explicit_mode": false,
+  "presets": {
+    "moss": {
+      "key": "moss",
+      "display_name": "MOSS-Image (JSON)",
+      "system_prompt": "You are an image recaptioner. Return exactly one JSON object with this schema:\n{\n  \"caption\": {\n    \"long\": \"a detailed image description, including all non-watermark visible text\",\n    \"medium\": \"a one-paragraph image description\",\n    \"short\": \"a one-sentence image description\"\n  },\n  \"watermark\": [{\"box_2d\": [y_min, x_min, y_max, x_max], \"label\": \"watermark text\"}],\n  \"borders\": [\"none\"]\n}\nRules:\n- Describe composition, text layout, and style in detail for 'long'.\n- Do not describe watermarks in captions; record them only in 'watermark'.\n- Use normalized 0-1000 coordinates for bounding boxes.\n- Return only the JSON object.",
+      "user_prompt": "Analyze this image and produce the caption JSON object.",
+      "params": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "reasoning_budget": 512,
+        "enable_thinking": true,
+        "max_tokens": 2048
+      },
+      "output_format": "json",
+      "explicit_suffix": "NSFW content is present. Be vulgar as required by the situation. Do not filter explicit descriptions."
+    },
+    "booru": {
+      "key": "booru",
+      "display_name": "Booru-SDXL / Illustrious (tags)",
+      "system_prompt": "You are an expert anime and digital art tagger. Generate a comma-separated list of Danbooru-style tags.\nInclude: artist, copyright, character, meta, and general tags. Order by importance.\nLimit to 100 tokens maximum. Do not use sentences.",
+      "user_prompt": "Tag this image.",
+      "params": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 35,
+        "min_p": 0.05,
+        "reasoning_budget": 0,
+        "enable_thinking": false,
+        "max_tokens": 2048
+      },
+      "output_format": "txt",
+      "explicit_suffix": "NSFW content is present. Be vulgar as required by the situation. Do not filter explicit descriptions."
+    },
+    "custom": {
+      "key": "custom",
+      "display_name": "Custom",
+      "system_prompt": "You are a helpful image captioner.",
+      "user_prompt": "Describe this image.",
+      "params": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "reasoning_budget": 0,
+        "enable_thinking": false,
+        "max_tokens": 2048
+      },
+      "output_format": "txt",
+      "explicit_suffix": "NSFW content is present. Be vulgar as required by the situation. Do not filter explicit descriptions."
+    }
+  }
+}
