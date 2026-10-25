@@ -10,14 +10,22 @@ Supported models (per spec):
               auto-detected from the repo file list (any ``mmproj*.gguf``
               whose quant matches the chosen base quant when possible).
 
-All files are downloaded into ``~/.cache/app_models/`` via ``huggingface_hub``
-with SHA verification handled by the hub client itself (etag / LFS checksums)
-plus a local size sanity check performed after download ("verify").
+Storage locations (user-selectable, persisted in ``app_settings.json``):
+
+* ``default``   – the app cache folder ``~/.cache/app_models/`` (overridable
+                  with the ``APPCAP_CACHE_DIR`` env var).  Disk-space is
+                  checked before any bytes hit the wire.
+* ``unsloth``   – an Unsloth Desktop compatible folder supplied by the user.
+                  The directory is auto-created when missing; already-present
+                  GGUFs are detected and re-used instead of re-downloading.
+                  Unsloth Desktop stores its downloads under ``<root>/models/``
+                  (and legacy ``<root>/llama-cpp/``), so those subfolders are
+                  scanned automatically.
 
 Error-management policy for this module: **never** attempt huge allocations
 or blind multi-GB downloads inside tests or background threads without an
 explicit user action.  All network/disk failures surface as
-:class:`ModelOperationError` carrying a verbose, human-readable report that
+:class:`AppError` carrying a verbose, human-readable report that
 the GUI can show verbatim (reason + remediation hints).
 """
 from __future__ import annotations
@@ -34,12 +42,14 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Structured, verbose error type shared by model/backend operations
 # ---------------------------------------------------------------------------
-class ModelOperationError(Exception):
+class AppError(Exception):
     """Actionable error for downloads / verification / architecture lookup.
 
     ``report()`` renders a multi-line message designed for the GUI log and
     message boxes: what failed, why, and concrete steps to fix it.
     """
+
+    prefix = "[models]"      # subclasses may override the log tag
 
     def __init__(self, message: str, detail: str = "", suggestions=None):
         super().__init__(message)
@@ -48,7 +58,7 @@ class ModelOperationError(Exception):
         self.suggestions: list[str] = list(suggestions or [])
 
     def report(self) -> str:
-        lines = [f"[models] ERROR: {self.message}"]
+        lines = [f"{self.prefix} ERROR: {self.message}"]
         if self.detail:
             lines.append(f"    reason : {self.detail}")
         for s in self.suggestions:
@@ -56,7 +66,7 @@ class ModelOperationError(Exception):
         return "\n".join(lines)
 
     @classmethod
-    def classify(cls, exc: Exception, context: str = "") -> "ModelOperationError":
+    def classify(cls, exc: Exception, context: str = "") -> "AppError":
         """Map any low-level exception to a typed, verbose error."""
         import socket
         name = type(exc).__name__
@@ -90,28 +100,101 @@ class ModelOperationError(Exception):
                        ["The repo layout may have changed; verify filenames in the "
                         "registry (app/core/models.py)."])
         if isinstance(exc, OSError) and (
-                "space" in lower or isinstance(exc, OSError) and exc.errno == errno_ENOSPC()):
+                "space" in lower or exc.errno == errno_ENOSPC()):
             free = 0
             try:
-                free = shutil.disk_usage(CACHE_DIR.parent).free // (1024 ** 3)
+                free = shutil.disk_usage(default_cache_dir()).free // (1024 ** 3)
             except OSError:
                 pass
             return cls("Insufficient disk space for download",
                        base_detail,
-                       [f"Free space on {CACHE_DIR}: ~{free} GiB available.",
-                        "Delete unused GGUFs from ~/.cache/app_models/ or set a "
-                        "larger volume via the CACHE_DIR environment override."])
+                       [f"Free space on '{default_cache_dir()}': ~{free} GiB.",
+                        "Delete unused GGUFs there, or switch the storage "
+                        "location to an Unsloth-desktop compatible folder on a "
+                        "larger volume (Tab 1 -> Storage Location)."])
         return cls("Model operation failed", base_detail,
                    ["Re-run 'Download & Verify' in Tab 1.",
                     "If the problem persists, copy this whole message into the "
                     "bug report."])
 
 
+# Backwards-compatible alias (older code/tests may still import this name).
+ModelOperationError = AppError
+
+
+class StorageLocationError(AppError):
+    """Raised when the configured model-storage location is unusable."""
+
+    prefix = "[storage]"
+
+
 def errno_ENOSPC() -> int:
     import errno
     return errno.ENOSPC
 
-CACHE_DIR = Path(os.path.expanduser("~/.cache/app_models"))
+
+# ---------------------------------------------------------------------------
+# Persistent application settings (~/.config/moss-captioner/app_settings.json)
+# ---------------------------------------------------------------------------
+SETTINGS_PATH = Path(os.environ.get(
+    "APPCAP_SETTINGS",
+    os.path.join(os.environ.get("XDG_CONFIG_HOME",
+                                os.path.expanduser("~/.config")),
+                 "moss-captioner", "app_settings.json")))
+
+
+def load_app_settings() -> dict:
+    """Read the persisted settings; corrupt/unreadable files never crash.
+
+    Returns a dict; on any problem an empty dict is returned and the issue is
+    printed to stderr (surfaced in the GUI log by callers).
+    """
+    try:
+        if SETTINGS_PATH.is_file():
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+            print(f"[settings] {SETTINGS_PATH} does not contain a JSON object; "
+                  "ignoring it.", flush=True)
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[settings] could not read {SETTINGS_PATH}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+    return {}
+
+
+def save_app_settings(data: dict) -> None:
+    """Atomically persist settings; failures raise StorageLocationError."""
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, SETTINGS_PATH)
+    except OSError as exc:
+        raise StorageLocationError(
+            "Could not save application settings",
+            detail=f"{type(exc).__name__}: {exc} (path: {SETTINGS_PATH})",
+            suggestions=["Check permissions of ~/.config/moss-captioner/",
+                         "Ensure the partition holding it has free space."]
+        ) from exc
+
+
+def default_cache_dir() -> Path:
+    """Default app-managed model cache (env-overridable for portability)."""
+    return Path(os.environ.get(
+        "APPCAP_CACHE_DIR",
+        os.path.expanduser("~/.cache/app_models")))
+
+
+#: Deprecated alias - always resolves to the *default* cache.  Runtime code
+#: must go through ``STORAGE`` (see StorageManager) to honour the user's
+#: selected storage location.
+CACHE_DIR = default_cache_dir()
 
 # Quantization name -> approximate bits per weight (for size estimation when
 # the remote file metadata is unavailable).
@@ -120,6 +203,253 @@ QUANT_BITS = {
     "Q5_K_M": 5.7, "Q4_K_M": 4.8, "UD-IQ4_XS": 4.4, "IQ4_XS": 4.25,
     "Q3_K_M": 3.9, "Q2_K": 2.6,
 }
+
+
+# ---------------------------------------------------------------------------
+# Storage-location management (default app cache vs Unsloth-desktop folder)
+# ---------------------------------------------------------------------------
+STORAGE_DEFAULT = "default"
+STORAGE_UNSLOTH = "unsloth"
+
+#: Subfolders scanned inside an Unsloth Desktop data directory.  Unsloth UI
+#: keeps its GGUF downloads under ``models/`` (newer builds also use
+#: ``llama-cpp/``); both are probed so existing downloads are re-used.
+UNSLOTH_SUBDIRS = ("models", "llama-cpp")
+
+
+class StorageManager:
+    """Remembers where GGUFs live / should be downloaded.
+
+    Two user-selectable modes (Tab 1 -> "Storage Location"):
+
+    * ``STORAGE_DEFAULT`` – ``~/.cache/app_models/<repo-id>/``.  The location
+      is displayed to the user and free disk space is checked before any
+      download starts; a shortage raises :class:`StorageLocationError` with
+      remediation hints instead of failing mid-transfer.
+    * ``STORAGE_UNSLOTH`` – a user-supplied Unsloth Desktop compatible folder.
+      Missing directories are created automatically; required models already
+      present anywhere inside the tree are detected and re-used (no download).
+    """
+
+    def __init__(self, mode: str = STORAGE_DEFAULT, unsloth_root: str = ""):
+        self.mode: str = mode if mode in (STORAGE_DEFAULT, STORAGE_UNSLOTH) \
+            else STORAGE_DEFAULT
+        self.unsloth_root: str = unsloth_root or ""
+
+    # ---------------------------------------------------------- persistence
+    def to_dict(self) -> dict:
+        return {"mode": self.mode, "unsloth_root": self.unsloth_root}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "StorageManager":
+        d = d or {}
+        return cls(mode=str(d.get("mode", STORAGE_DEFAULT)),
+                   unsloth_root=str(d.get("unsloth_root", "") or ""))
+
+    # ------------------------------------------------------------- helpers
+    @staticmethod
+    def _usable(p: Path) -> bool:
+        """Directory that exists (or can be created) and accepts writes."""
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        return p.is_dir() and os.access(p, os.W_OK)
+
+    def unsloth_search_roots(self) -> list[Path]:
+        """Candidate scan roots for an Unsloth data folder (best first)."""
+        root = Path(os.path.expanduser(self.unsloth_root)) if self.unsloth_root else None
+        if root is None:
+            return []
+        roots = [root]
+        for sub in UNSLOTH_SUBDIRS:
+            cand = root / sub
+            if cand.is_dir():
+                roots.append(cand)
+        return roots
+
+    # ------------------------------------------------------------ public API
+    def ensure_ready(self) -> tuple[Path, list[str]]:
+        """Validate/auto-create the active location.
+
+        Returns ``(primary_dir, warnings)``.  Raises
+        :class:`StorageLocationError` when the location cannot be used at all
+        (never silently falls back - the GUI shows the verbose report).
+        """
+        warnings: list[str] = []
+        if self.mode == STORAGE_DEFAULT:
+            dest = default_cache_dir()
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise StorageLocationError(
+                    "Cannot create the default model cache folder",
+                    detail=f"{type(exc).__name__}: {exc} (path: {dest})",
+                    suggestions=["Check permissions on ~/.cache/",
+                                 "Or switch to an Unsloth-desktop folder on another volume."]
+                ) from exc
+            if not os.access(dest, os.W_OK):
+                raise StorageLocationError(
+                    "Default model cache folder is not writable",
+                    detail=f"path: {dest}",
+                    suggestions=[f"chmod u+w '{dest}' or change ownership.",
+                                 "Or select an Unsloth-desktop folder elsewhere."])
+            return dest, warnings
+
+        # ---- Unsloth-compatible mode --------------------------------------
+        if not self.unsloth_root.strip():
+            raise StorageLocationError(
+                "Unsloth storage selected but no folder path configured",
+                detail="The 'Unsloth desktop models folder' field is empty.",
+                suggestions=["Pick the folder in Tab 1 -> Storage Location "
+                             "(e.g. ~/Unsloth/Desktop/models), or switch back "
+                             "to the default cache."])
+        root = Path(os.path.expanduser(self.unsloth_root.strip()))
+        existed = root.exists()
+        if not existed:
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                warnings.append(f"[storage] created missing folder: {root}")
+            except OSError as exc:
+                raise StorageLocationError(
+                    "Cannot create the Unsloth models folder",
+                    detail=f"{type(exc).__name__}: {exc} (path: {root})",
+                    suggestions=["Verify the path (typos, unmounted drive?).",
+                                 "Ensure the parent directory is writable.",
+                                 "Or switch back to the default cache location."]
+                ) from exc
+        elif not root.is_dir():
+            raise StorageLocationError(
+                "Unsloth models path exists but is not a directory",
+                detail=f"path: {root}",
+                suggestions=["Remove/rename the conflicting file, or pick a "
+                             "different folder in Tab 1."])
+        if not os.access(root, os.W_OK):
+            raise StorageLocationError(
+                "Unsloth models folder is not writable",
+                detail=f"path: {root}",
+                suggestions=["Fix ownership/permissions (chown/chmod), or run "
+                             "from the account that owns the Unsloth install.",
+                             "Read-only reuse is not supported while downloads "
+                             "may still be needed."])
+        if not existed:
+            warnings.append(f"[storage] new empty Unsloth folder at {root}; "
+                            "downloads will land here.")
+        return root, warnings
+
+    def search_dirs(self, repo_id: str) -> list[Path]:
+        """Ordered candidate folders where this repo's files may live."""
+        slug = repo_id.replace("/", "--")
+        dirs: list[Path] = []
+        if self.mode == STORAGE_UNSLOTH and self.unsloth_root.strip():
+            for r in self.unsloth_search_roots():
+                for sub in (slug, repo_id):          # --slug and literal forms
+                    d = r / sub
+                    if d not in dirs:
+                        dirs.append(d)
+        d = default_cache_dir() / slug
+        if d not in dirs:
+            dirs.append(d)
+        return dirs
+
+    def primary_download_dir(self, repo_id: str) -> Path:
+        """Where new downloads for ``repo_id`` should be written."""
+        if self.mode == STORAGE_UNSLOTH and self.unsloth_root.strip():
+            return Path(os.path.expanduser(self.unsloth_root.strip())) / \
+                repo_id.replace("/", "--")
+        return default_cache_dir() / repo_id.replace("/", "--")
+
+    def find_existing(self, repo_id: str, filename: str) -> Path | None:
+        """Locate an already-downloaded copy (Unsloth reuse + own cache)."""
+        for d in self.search_dirs(repo_id):
+            cand = d / filename
+            if cand.is_file():
+                return cand
+        if self.mode == STORAGE_UNSLOTH and self.unsloth_root.strip():
+            # Last resort: recursive scan of the Unsloth tree (some builds
+            # nest by quant shard folders).  Bounded depth to stay snappy.
+            for r in self.unsloth_search_roots():
+                try:
+                    for pattern in ("*/*/" + filename, "**/" + filename):
+                        for p in r.glob(pattern):
+                            if p.is_file():
+                                return p
+                except OSError:
+                    continue
+        return None
+
+    def required_files_status(self, spec: "ModelSpec",
+                              model_file: "ModelFile | None" = None):
+        """Autodetect whether the models a spec needs are already available.
+
+        Returns ``(present, missing, bytes_present)`` where ``present`` /
+        ``missing`` are lists of ``(filename, path_or_None)`` tuples covering
+        every quant of ``spec`` (or just ``model_file`` when given), including
+        each file's mmproj companion.  Used by the GUI to report re-use hits
+        (e.g. files downloaded earlier by Unsloth Desktop) and gaps.
+        """
+        present: list[tuple[str, Path]] = []
+        missing: list[str] = []
+        total_bytes = 0
+        files = [model_file] if model_file is not None else list(spec.files.values())
+        seen: set[str] = set()
+        for mf in files:
+            names = [mf.filename]
+            if mf.mmproj_filename:
+                names.append(mf.mmproj_filename)
+            for n in names:
+                if n in seen:
+                    continue
+                seen.add(n)
+                hit = self.find_existing(spec.source_repo, n)
+                if hit is not None:
+                    try:
+                        total_bytes += hit.stat().st_size
+                    except OSError:
+                        pass
+                    present.append((n, hit))
+                else:
+                    missing.append(n)
+        return present, missing, total_bytes
+
+    def describe(self) -> str:
+        """Human-readable one-liner of the active location for the GUI."""
+        if self.mode == STORAGE_UNSLOTH:
+            root = self.unsloth_root.strip() or "(not configured)"
+            n = 0
+            if self.unsloth_root.strip():
+                try:
+                    n = sum(1 for _ in Path(os.path.expanduser(root)).glob("**/*.gguf"))
+                except OSError:
+                    n = -1
+            extra = f" - {n} GGUF file(s) found for re-use" if n > 0 else (
+                " - folder missing; it will be created on first use" if n == 0 else "")
+            return f"Unsloth desktop folder: {root}{extra}"
+        d = default_cache_dir()
+        try:
+            free_gb = shutil.disk_usage(d if d.is_dir() else d.parent).free / 1024 ** 3
+            state = f"{free_gb:.1f} GiB free"
+        except OSError:
+            state = "space unknown"
+        return f"Default app cache: {d} ({state})"
+
+
+# Process-wide active storage configuration (hydrated from app_settings.json
+# at startup; mutated by Tab 1 and read by every path resolver below).
+STORAGE = StorageManager.from_dict(load_app_settings().get("storage"))
+
+
+def set_storage(mode: str, unsloth_root: str = "") -> StorageManager:
+    """Update + persist the global storage configuration."""
+    global STORAGE
+    STORAGE = StorageManager(mode=mode, unsloth_root=unsloth_root)
+    try:
+        settings = load_app_settings()
+        settings["storage"] = STORAGE.to_dict()
+        save_app_settings(settings)
+    except AppError:
+        raise       # caller reports verbosely; config stays in-memory anyway
+    return STORAGE
 
 
 @dataclass
@@ -137,17 +467,26 @@ class ModelFile:
         return self.params_billions * 1e9 * bits / 8 / (1024 * 1024)
 
     def local_path(self) -> Path:
-        return CACHE_DIR / self.repo_id.replace("/", "--") / self.filename
+        """Best available local copy (Unsloth reuse wins), else canonical
+        destination inside the configured storage location."""
+        hit = STORAGE.find_existing(self.repo_id, self.filename)
+        if hit is not None:
+            return hit
+        return STORAGE.primary_download_dir(self.repo_id) / self.filename
 
     def mmproj_local_path(self) -> Path | None:
         if not self.mmproj_filename:
             return None
-        return CACHE_DIR / self.repo_id.replace("/", "--") / self.mmproj_filename
+        hit = STORAGE.find_existing(self.repo_id, self.mmproj_filename)
+        if hit is not None:
+            return hit
+        return STORAGE.primary_download_dir(self.repo_id) / self.mmproj_filename
 
     def is_downloaded(self) -> bool:
         ok = self.local_path().is_file()
         if ok and self.mmproj_filename:
-            ok = self.mmproj_local_path() is not None and self.mmproj_local_path().is_file()
+            mp = self.mmproj_local_path()
+            ok = mp is not None and mp.is_file()
         return ok
 
 
@@ -277,26 +616,41 @@ def estimate_download_mb(repo_id: str, filenames: list[str]) -> float:
 
 def preflight_download_check(repo_id: str, filenames: list[str],
                              est_total_mb: float | None = None):
-    """Validate disk space + writability BEFORE any bytes hit the wire.
+    """Validate storage location + disk space BEFORE any bytes hit the wire.
 
-    Raises :class:`ModelOperationError` with a verbose report when the
-    download cannot possibly succeed, so the GUI can tell the user exactly
-    what to fix instead of failing mid-transfer after minutes of bandwidth.
+    Raises :class:`AppError` / :class:`StorageLocationError` with a verbose
+    report when the download cannot possibly succeed, so the GUI can tell the
+    user exactly what to fix instead of failing mid-transfer after minutes of
+    bandwidth.  In Unsloth mode this also auto-creates the folder when it is
+    missing (reported as a warning).
+
+    Returns ``(free_mb, est_total_mb)``.
     """
     if est_total_mb is None:
         est_total_mb = estimate_download_mb(repo_id, filenames)
 
-    dest_dir = CACHE_DIR / repo_id.replace("/", "--")
+    # ---- storage location (auto-create / validate) -------------------------
     try:
-        probe_dir = dest_dir if dest_dir.is_dir() else CACHE_DIR.parent
+        _root, warnings = STORAGE.ensure_ready()
+    except StorageLocationError:
+        raise
+    except Exception as exc:
+        raise AppError.classify(exc, context=f"preparing storage location "
+                                            f"'{STORAGE.describe()}'") from exc
+    for w in warnings:
+        print(w, flush=True)          # surfaced in the GUI log by the caller
+
+    dest_dir = STORAGE.primary_download_dir(repo_id)
+    try:
+        probe_dir = dest_dir if dest_dir.is_dir() else _root
         probe_dir.mkdir(parents=True, exist_ok=True)
         free_mb = shutil.disk_usage(probe_dir).free / (1024 * 1024)
     except OSError as exc:
-        raise ModelOperationError(
-            "Cannot prepare the model cache directory",
+        raise StorageLocationError(
+            "Cannot prepare the model download directory",
             detail=f"{type(exc).__name__}: {exc} (path: {dest_dir})",
-            suggestions=[f"Ensure {CACHE_DIR} is on a writable volume.",
-                         "Check permissions: chmod/chown the ~/.cache tree."]) from exc
+            suggestions=[f"Ensure '{_root}' is on a writable volume.",
+                         "Check permissions of the selected storage folder."]) from exc
 
     # Writability smoke test (tiny file, removed immediately).
     try:
@@ -305,53 +659,67 @@ def preflight_download_check(repo_id: str, filenames: list[str],
         os.close(fd)
         os.unlink(tmp)
     except OSError as exc:
-        raise ModelOperationError(
-            "Model cache directory is not writable",
+        raise StorageLocationError(
+            "Model storage directory is not writable",
             detail=f"{type(exc).__name__}: {exc} (path: {probe_dir})",
-            suggestions=["Fix ownership/permissions of ~/.cache/app_models."]) from exc
+            suggestions=["Fix ownership/permissions of the selected storage "
+                         "folder (Tab 1 -> Storage Location)."]) from exc
 
     if est_total_mb > 0:
         needed_mb = est_total_mb * 1.05          # 5% slack for temp/LFS overhead
         if needed_mb > free_mb:
-            raise ModelOperationError(
+            raise AppError(
                 "Not enough disk space for this download",
                 detail=(f"{repo_id}: {', '.join(filenames)} needs ~"
                         f"{est_total_mb / 1024:.1f} GiB but only "
                         f"{free_mb / 1024:.1f} GiB is free on {probe_dir}."),
                 suggestions=[
-                    "Delete unused GGUFs under ~/.cache/app_models/.",
+                    "Delete unused GGUFs from the current storage folder.",
                     "Choose a smaller quantization (e.g. UD-IQ4_XS instead of Q8_0).",
-                    "Point the cache at a larger volume before retrying."])
+                    "Switch the storage location (Tab 1) to a folder on a larger "
+                    "volume - e.g. an Unsloth-desktop compatible directory.",
+                    "If the models were already downloaded elsewhere (Unsloth), "
+                    "point that folder here to re-use them without downloading."])
     return free_mb, est_total_mb
 
 
 def download_model_files(repo_id: str, filenames: list[str],
                          progress_cb=None) -> list[Path]:
-    """Blocking download of ``filenames`` from ``repo_id`` into CACHE_DIR.
+    """Blocking download of ``filenames`` from ``repo_id`` into the
+    configured storage location (default cache or Unsloth folder).
 
     Runs ONLY from an explicit user action ("Download & Verify"); performs a
     disk-space/writability preflight first and converts every Hub failure
-    into a :class:`ModelOperationError` with remediation hints.
+    into an :class:`AppError` with remediation hints.
+
+    Files already present anywhere in the storage tree (e.g. downloaded by
+    Unsloth Desktop) are skipped and reported as re-used.
 
     ``progress_cb(filename, done_bytes, total_bytes)`` is invoked by the
-    caller-side worker thread.  Returns the local paths written.
+    caller-side worker thread.  Returns the local paths written/re-used.
     """
     try:
         preflight_download_check(repo_id, filenames)
-    except ModelOperationError:
+    except AppError:
         raise
     except Exception as exc:
-        raise ModelOperationError.classify(exc, context="download preflight") from exc
+        raise AppError.classify(exc, context="download preflight") from exc
 
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as exc:
-        raise ModelOperationError.classify(exc, context="import huggingface_hub") from exc
+        raise AppError.classify(exc, context="import huggingface_hub") from exc
 
-    dest_dir = CACHE_DIR / repo_id.replace("/", "--")
+    dest_dir = STORAGE.primary_download_dir(repo_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
     out: list[Path] = []
     for fn in filenames:
+        existing = STORAGE.find_existing(repo_id, fn)
+        if existing is not None:
+            # Re-use (Unsloth download or previous app download) - no bytes.
+            print(f"[models] re-using existing file: {existing}", flush=True)
+            out.append(existing)
+            continue
         try:
             p = hf_hub_download(
                 repo_id=repo_id,
@@ -362,7 +730,7 @@ def download_model_files(repo_id: str, filenames: list[str],
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            raise ModelOperationError.classify(
+            raise AppError.classify(
                 exc, context=f"downloading '{fn}' from '{repo_id}'") from exc
     return out
 
