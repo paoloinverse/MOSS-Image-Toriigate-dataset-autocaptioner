@@ -161,9 +161,11 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
       compiled without CUDA silently ran CPU-only.
 
     Returns ``{"has_api_key": bool, "has_reasoning_budget": bool,
-               "cuda": bool}``.  Every check is conservative: when the
-    binary cannot be probed at all we assume the modern feature exists and
-    GPU support does not, so startup never breaks harder than before.
+               "cuda": bool, "gpu": bool}``.  Every check is conservative:
+    when the binary cannot be probed at all we assume the modern features
+    exist and GPU support does not, so startup never breaks harder than
+    before.  ``gpu`` is True when *any* GPU backend (CUDA/ROCm/Vulkan/Metal)
+    was detected.
     """
     p = Path(str(path))
     key: tuple[str, int] | None = None
@@ -178,7 +180,7 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
     info = _build_info_lines(p)
     if not help_txt and not info:
         caps = {"has_api_key": True, "has_reasoning_budget": True,
-                "cuda": False}
+                "cuda": False, "gpu": False}
     else:
         def supported(flag: str) -> bool:
             """True unless --help explicitly lists the flag as unsupported."""
@@ -196,7 +198,8 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
         # GPU detection: prefer the explicit feature list printed by
         # `llama-server --version` ("ggml CUDA_blas", "feature: ... CUDA").
         # Fall back to linked libraries via ldd (catches older builds whose
-        # version banner omits the feature list).
+        # version banner omits the feature list).  ROCm/Vulkan/Metal count as
+        # GPU support too - any of them means -ngl/-sm/-ts are honoured.
         cuda = ("cuda" in info) or ("cuda" in help_txt)
         if not cuda:
             ldd = shutil.which("ldd")
@@ -209,8 +212,11 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
                             or "cublas" in out)
                 except Exception:
                     pass
+        gpu_any = (cuda or "rocm" in info or "hip" in info or "vulkan" in info
+                   or "metal" in info or "vulkan" in help_txt
+                   or "metal" in help_txt)
         caps = {"has_api_key": has_api_key, "has_reasoning_budget": has_rb,
-                "cuda": cuda}
+                "cuda": cuda, "gpu": gpu_any}
     if key is not None:
         _CAP_CACHE[key] = caps
     return caps

@@ -31,6 +31,7 @@ class InferenceSettings:
     top_k: int = 40
     min_p: float = 0.05
     reasoning_budget: int = 0
+    thinking_level: str = ""         # Tab 2 combo key ("" = off) - persisted
     cache_type: str = "q8_0"
     split_mode: str = "row"
     host: str = "127.0.0.1"

@@ -41,12 +41,16 @@ class BatchWorker(QThread):
     finished_all = Signal(bool)             # completed vs cancelled
 
     def __init__(self, base_url: str, preset: CaptionPreset,
-                 system_prompt: str, images: list[str], parent=None):
+                 system_prompt: str, images: list[str], parent=None,
+                 settings=None):
         super().__init__(parent)
         self.base_url = base_url
         self.preset = preset
         self.system_prompt = system_prompt
         self.images = list(images)
+        # Live Tab 2 InferenceSettings (temperature/top_k/... + thinking
+        # budget); None keeps the pure preset behaviour.
+        self.settings = settings
         self.cancel_event = threading.Event()
 
     def stop(self):
@@ -81,7 +85,8 @@ class BatchWorker(QThread):
 
                 text = await client.caption(
                     img, self.preset, self.system_prompt,
-                    on_chunk=on_chunk, cancel_event=self.cancel_event)
+                    on_chunk=on_chunk, cancel_event=self.cancel_event,
+                    settings=self.settings)
                 if self.cancel_event.is_set():
                     break
                 if not text.strip():

@@ -5,11 +5,14 @@
   ROCm > Vulkan > CPU), 'Browse…' (pick an existing install) and
   'Auto-install / build' (guided clone+compile in a background thread with
   live log streaming, explicit folder choice, disk/toolchain preflight).
-* Generation sliders (Temperature, Top-P, Top-K, Min-P).
-* "Reasoning Budget" slider -> --reasoning-budget / reasoning_budget_tokens.
-* KV cache type dropdown (f16 / q8_0 / q4_0 …).
+* Generation sliders (Temperature, Top-P, Top-K, Min-P); per-model profile
+  defaults are re-applied whenever the selected model changes.
+* "Thinking level" combo (Off/Low/Medium/High -> --reasoning-budget +
+  reasoning_budget_tokens) plus a fine-grained Reasoning Budget slider.
+* KV cache type dropdown populated from models.KV_CACHE_TYPES (incl. bf16).
 * Start/Stop llama-server buttons; the computed resource plan (-c/-ngl) is
-  previewed live so the user sees the dynamic KV sizing decision.
+  previewed live so the user sees the dynamic KV sizing decision, capped by
+  the per-model/per-quant hard limit from the model profile.
 """
 from __future__ import annotations
 
@@ -24,7 +27,8 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog,
 
 from app.context import AppContext
 from app.core import llamacpp
-from app.core.models import read_arch_info, resolve_mmproj
+from app.core.models import (KV_CACHE_TYPES, get_model_profile, read_arch_info,
+                             resolve_mmproj)
 from app.core.resources import ResourcePlanError, plan_resources
 
 
@@ -45,6 +49,7 @@ class InferenceTab(QWidget):
         st = ctx.settings
         self._last_plan = None
         self._last_file = None
+        self._profiled_key: str | None = None   # model key whose defaults were applied
         self._installer: llamacpp.InstallRunner | None = None
 
         root = QVBoxLayout(self)
@@ -119,13 +124,22 @@ class InferenceTab(QWidget):
         self.top_k_slider, self.top_k_val = _slider("Top-K", 1, 200, st.top_k, 1)
         self.min_p_slider, self.min_p_val = _slider("Min-P", 0.0, 1.0, st.min_p)
         self.reason_slider, self.reason_val = _slider(
-            "Reasoning Budget", 0, 8192, st.reasoning_budget, 1)
+            "Reasoning Budget", 0, 16384, st.reasoning_budget, 1)
         self.reason_slider.setSingleStep(64)
 
         gf.addRow("Temperature:", self._row(self.temp_slider, self.temp_val))
         gf.addRow("Top-P:", self._row(self.top_p_slider, self.top_p_val))
         gf.addRow("Top-K:", self._row(self.top_k_slider, self.top_k_val))
         gf.addRow("Min-P:", self._row(self.min_p_slider, self.min_p_val))
+        # Thinking level: named per-model preset (Off/Low/Medium/High) that
+        # sets the reasoning budget; the slider below stays for fine control.
+        self.thinking_combo = QComboBox()
+        self.thinking_combo.setToolTip(
+            "Model-specific thinking levels (Qwen3-family hybrid thinker).\n"
+            "Sets --reasoning-budget on the server and reasoning_budget_tokens\n"
+            "/ enable_thinking in the request payload.")
+        self._populate_thinking_levels(st.thinking_level or st.reasoning_budget)
+        gf.addRow("Thinking level:", self.thinking_combo)
         gf.addRow("Reasoning Budget (tokens):",
                   self._row(self.reason_slider, self.reason_val))
         hint = QLabel("Reasoning budget maps to --reasoning-budget / "
@@ -139,8 +153,12 @@ class InferenceTab(QWidget):
         kv_box = QGroupBox("KV Cache")
         kf = QFormLayout(kv_box)
         self.cache_combo = QComboBox()
-        self.cache_combo.addItems(["f16", "q8_0", "q4_0", "q4_1", "fp8"])
-        self.cache_combo.setCurrentText(st.cache_type)
+        # models.KV_CACHE_TYPES is the single source of truth (incl. bf16).
+        self.cache_combo.addItems(list(KV_CACHE_TYPES))
+        if st.cache_type in KV_CACHE_TYPES:
+            self.cache_combo.setCurrentText(st.cache_type)
+        else:
+            self.cache_combo.setCurrentText("q8_0")
         kf.addRow("Cache type (-ctk/-ctv):", self.cache_combo)
         self.plan_label = QLabel("Plan: press Refresh Plan")
         self.plan_label.setWordWrap(True)
@@ -171,7 +189,10 @@ class InferenceTab(QWidget):
         self.top_k_slider.valueChanged.connect(
             lambda v: self._set_param("top_k", v, self.top_k_val))
         self.reason_slider.valueChanged.connect(
-            lambda v: self._set_param("reasoning_budget", v, self.reason_val))
+            lambda v: (self._set_param("reasoning_budget", v, self.reason_val),
+                       self._sync_reasoning_to_slider()))
+        self.thinking_combo.currentIndexChanged.connect(
+            self._on_thinking_level_changed)
         self.cache_combo.currentTextChanged.connect(
             lambda t: setattr(self.ctx.settings, "cache_type", t))
         self.split_combo.currentTextChanged.connect(
@@ -191,10 +212,134 @@ class InferenceTab(QWidget):
         self.browse_binary_btn.clicked.connect(self.browse_binary)
         self.install_btn.clicked.connect(self.autoinstall)
         self.ctx.server_state.connect(self.on_server_state)
-        self.ctx.model_changed.connect(self.refresh_plan)
+        # Model switches must BOTH re-plan (per-model KV caps) and re-apply
+        # the run-out-of-the-box profile defaults (sampling, thinking, cache).
+        self.ctx.model_changed.connect(self._on_model_changed)
         self.ctx.binary_changed.connect(self._refresh_binary_status)
 
         self._refresh_binary_status()
+
+    # ---------------------------------------------------------- model profiles
+    def _profile(self):
+        """ModelProfile of the currently selected model (Tab 1 key/quant)."""
+        return get_model_profile(self.ctx.selected_model_key)
+
+    def _on_model_changed(self):
+        """model_changed handler: re-populate per-model widgets + re-plan.
+
+        Preset sampling defaults are only applied once per model *key* (not
+        on every quant switch), so a user's manual slider tweaks survive
+        quant changes - while the Thinking-level combo is always rebuilt to
+        match the active profile and the plan is always recomputed with the
+        new per-quant context cap.
+        """
+        key = self.ctx.selected_model_key
+        if key != self._profiled_key:
+            self._profiled_key = key
+            self._apply_profile_defaults()
+            return
+        self._populate_thinking_levels(
+            self.ctx.settings.thinking_level
+            or self.ctx.settings.reasoning_budget)
+        self.refresh_plan()
+
+    def _populate_thinking_levels(self, select):
+        """Fill the Thinking-level combo from the active model profile.
+
+        ``select`` is a level key (str) or a raw budget (int); when nothing
+        matches exactly, the closest budget wins so persisted settings map
+        onto the named levels.
+        """
+        prof = self._profile()
+        self.thinking_combo.blockSignals(True)
+        self.thinking_combo.clear()
+        levels = prof.thinking_levels
+        if not levels:
+            # Unknown model: keep a single explicit Off entry; the fine-grained
+            # Reasoning Budget slider still works for any chat template.
+            self.thinking_combo.addItem("Off (no thinking)", "")
+            self.thinking_combo.setEnabled(False)
+            self.thinking_combo.blockSignals(False)
+            return
+        self.thinking_combo.setEnabled(True)
+        for lvl in levels:
+            self.thinking_combo.addItem(lvl.label, lvl.key)
+        idx = 0
+        if isinstance(select, str):
+            for i, lvl in enumerate(levels):
+                if lvl.key == select:
+                    idx = i
+                    break
+        else:   # int budget from persisted settings -> nearest named level
+            best = None
+            for i, lvl in enumerate(levels):
+                d = abs(lvl.budget - int(select or 0))
+                if best is None or d < best[0]:
+                    best = (d, i)
+            idx = best[1] if best else 0
+        self.thinking_combo.setCurrentIndex(idx)
+        self.thinking_combo.blockSignals(False)
+
+    def _on_thinking_level_changed(self, _index: int):
+        lvl_key = self.thinking_combo.currentData() or ""
+        budgets = {l.key: l.budget for l in self._profile().thinking_levels}
+        budget = int(budgets.get(lvl_key, 0))
+        self.ctx.settings.thinking_level = lvl_key
+        # Clamp into the slider range before pushing the value through it so
+        # the label + settings stay consistent with the widget state.
+        self.reason_slider.blockSignals(True)
+        clamped = max(self.reason_slider.minimum(),
+                      min(self.reason_slider.maximum(), budget))
+        self.reason_slider.setValue(clamped)
+        self.reason_slider.blockSignals(False)
+        self._set_param("reasoning_budget", clamped, self.reason_val)
+
+    def _sync_reasoning_to_slider(self):
+        """Keep the combo aligned when the budget slider is moved manually."""
+        budgets = {l.key: l.budget for l in self._profile().thinking_levels}
+        cur = self.thinking_combo.currentData() or ""
+        val = int(self.reason_slider.value())
+        if budgets.get(cur, 0) != val:
+            self.ctx.settings.thinking_level = ""
+            self.thinking_combo.blockSignals(True)
+            for i in range(self.thinking_combo.count()):
+                if self.thinking_combo.itemData(i) == "":
+                    self.thinking_combo.setCurrentIndex(i)
+                    break
+            self.thinking_combo.blockSignals(False)
+
+    def _apply_profile_defaults(self):
+        """Run-out-of-the-box preset for the selected model (Tab 2).
+
+        Applies sampling defaults, default KV-cache type and the default
+        thinking level, then refreshes the plan (the per-quant context cap
+        changed with the model).  Called on every model_changed.
+        """
+        prof = self._profile()
+        st = self.ctx.settings
+        # Sampling defaults -> sliders (which write back into settings).
+        pairs = ((self.temp_slider, self.temp_val, "temperature",
+                  prof.temperature, 100),
+                 (self.top_p_slider, self.top_p_val, "top_p",
+                  prof.top_p, 100),
+                 (self.top_k_slider, self.top_k_val, "top_k",
+                  prof.top_k, 1),
+                 (self.min_p_slider, self.min_p_val, "min_p",
+                  prof.min_p, 100))
+        for sl, lbl, attr, value, div in pairs:
+            sl.setValue(int(round(value * div)))
+            self._set_param(attr, sl.value() / div, lbl)
+        # Default cache type (kept only if still valid for llama.cpp).
+        if prof.default_cache_type in KV_CACHE_TYPES:
+            self.cache_combo.setCurrentText(prof.default_cache_type)
+        # Default thinking level for this model.
+        self._populate_thinking_levels(prof.default_thinking)
+        self._on_thinking_level_changed(
+            self.thinking_combo.currentIndex())
+        if prof.note:
+            self.ctx.log.emit(f"[profile] {self.ctx.selected_model_key}: "
+                              + prof.note)
+        self.refresh_plan()
 
     @staticmethod
     def _row(slider, label) -> QWidget:
@@ -376,9 +521,14 @@ class InferenceTab(QWidget):
         try:
             arch = read_arch_info(spec.hf_config_repo, mf.local_path())
             mm = mf.mmproj_local_path() if mf.mmproj_filename else None
+            # Per-model/per-quant KV-cache hard limit from the profile
+            # (run-out-of-the-box presets); falls back to the global cap for
+            # models without a profile entry.
+            prof = get_model_profile(ctx.selected_model_key)
+            max_ctx = prof.max_context_by_quant.get(mf.quant or "")
             plan = plan_resources(ctx.hw, mf, arch,
                                   cache_type=ctx.settings.cache_type,
-                                  mmproj_path=mm)
+                                  mmproj_path=mm, max_context=max_ctx)
         except ResourcePlanError as exc:
             ctx.report_error(exc, context=f"planning resources for {mf.filename}",
                              dialog=True)
@@ -436,8 +586,10 @@ class InferenceTab(QWidget):
             host=ctx.settings.host,
             port=ctx.settings.port,
             split_mode=ctx.settings.split_mode,
+            tensor_split=self.ctx.hw.tensor_split_string(),
             cache_type_k=ctx.settings.cache_type,
             cache_type_v=ctx.settings.cache_type,
+            reasoning_budget=int(ctx.settings.reasoning_budget),
             extra_args=self.extra_args.toPlainText().strip(),
             explicit_mode=ctx.explicit_mode,
             binary=self.binary_edit.text().strip() or "llama-server",
