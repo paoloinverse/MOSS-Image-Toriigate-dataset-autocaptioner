@@ -422,9 +422,19 @@ def manual_hint(group: str) -> str:
 # ---------------------------------------------------------------------------
 # Preflight: base build tools, GPU family (PCI enumeration), vendor toolchains
 # ---------------------------------------------------------------------------
-#: PCI class prefix for display controllers ("0x0300xx": VGA-compatible and
-#: 3D controller) - used by /sys/bus/pci enumeration below.
-_PCI_DISPLAY_CLASS_PREFIX = "0x03"
+#: PCI base class for display controllers (0x03).  Only its *graphics*
+#: programming interfaces count as GPUs: 0x0300 VGA-compatible, 0x0302
+#: 3D controller (the class modern discrete NVIDIA/AMD cards report) and
+#: 0x0380 other display controller.  The sibling subclass 0x04xx is
+#: *Multimedia audio* - every discrete GPU ships an HDMI/DP audio function
+#: (e.g. an RTX 5060 Ti exposes 01:00.0 class 0x030000 + 01:00.1 class
+#: 0x040300) and motherboards expose a 0x040300 HDA controller under the
+#: chipset vendor ID.  Matching on the whole 0x03 prefix was a bug: it let
+#: those audio endpoints masquerade as GPUs, so machines with e.g. an AMD
+#: Threadripper PCIe virtual-HDMI function (0x1022:0x145a, class 0x038000)
+#: were tagged 'amd' and the preflight demanded a ROCm toolchain that the
+#: user's NVIDIA-only box could never satisfy.
+_PCI_GRAPHICS_IFACES = ("0x0300", "0x0302", "0x0380")
 #: Well-known GPU vendor PCI IDs: 0x10de NVIDIA, 0x1002 AMD/ATI,
 #: 0x8086 Intel (iGPU - usable through the Vulkan backend).
 _GPU_VENDOR_IDS = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}
@@ -433,12 +443,14 @@ _GPU_VENDOR_IDS = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}
 def enumerate_gpu_families() -> set[str]:
     """Hardware-level GPU vendor enumeration - *not* toolkit based.
 
-    Walks ``/sys/bus/pci/devices/*/class`` + ``vendor`` and maps display
-    controllers to 'nvidia' | 'amd' | 'intel'.  This works even when no
-    driver, CUDA toolkit or ROCm stack is installed (which is precisely the
-    case where the old ``shutil.which('nvcc')``-style probing silently
-    degraded the guided build to CPU-only).  Non-Linux / unreadable sysfs
-    yields an empty set; callers then fall back to toolkit-based detection.
+    Walks ``/sys/bus/pci/devices/*/class`` + ``vendor`` and maps **graphics**
+    display controllers (PCI class 0x0300/0x0302/0x0380 - see
+    :data:`_PCI_GRAPHICS_IFACES` for why 0x04xx audio functions are excluded)
+    to 'nvidia' | 'amd' | 'intel'.  This works even when no driver, CUDA
+    toolkit or ROCm stack is installed (which is precisely the case where the
+    old ``shutil.which('nvcc')``-style probing silently degraded the guided
+    build to CPU-only).  Non-Linux / unreadable sysfs yields an empty set;
+    callers then fall back to toolkit-based detection.
     """
     families: set[str] = set()
     base = Path("/sys/bus/pci/devices")
@@ -449,7 +461,7 @@ def enumerate_gpu_families() -> set[str]:
     for d in devs:
         try:
             cls = (d / "class").read_text().strip().lower()
-            if not cls.startswith(_PCI_DISPLAY_CLASS_PREFIX):
+            if not cls.startswith(_PCI_GRAPHICS_IFACES):
                 continue
             ven = (d / "vendor").read_text().strip().lower()
             fam = _GPU_VENDOR_IDS.get(ven)
@@ -585,17 +597,41 @@ class InstallRunner(QObject):
         hw = enumerate_gpu_families()
         has_nv_driver = self._has_nvidia_driver()
         rocm_present = self._has_rocm()
+        # Driver-truth override (mirrors Tab 1's NVML-based detection): when
+        # the NVIDIA kernel driver demonstrably owns at least one GPU, any
+        # 'amd'/'intel' family that PCI enumeration added comes from *other*
+        # silicon - a chipset virtual-display function, a dead legacy ATI
+        # card, or an integrated GPU the BIOS disabled in favour of the
+        # discrete card.  Such phantom families must not hijack backend
+        # selection or demand a ROCm toolchain this NVIDIA-only box can
+        # never satisfy (the exact false-positive seen with RTX cards whose
+        # platform exposes an AMD-family display function).
+        amd_real = self._amdgpu_driver_loaded()
+        if has_nv_driver and "nvidia" in hw:
+            if not amd_real:
+                hw.discard("amd")
+                hw.discard("intel")
         # On non-Linux (or empty sysfs) fall back to toolkit/driver evidence.
-        if not hw:
+        elif not hw:
             if has_nv_driver:
                 hw.add("nvidia")
             if rocm_present:
                 hw.add("amd")
+        # A loaded ROCm *kernel driver* is stronger proof of a real AMD GPU
+        # than the /opt/rocm toolkit directory alone (users install that on
+        # NVIDIA boxes too, e.g. for HIP-SDK builds).  Add 'amd' when amdgpu
+        # is bound to a device so an iGPU/dGPU that sysfs enumeration missed
+        # still gets its toolchain demanded - and never removed later.
+        if amd_real:
+            hw.add("amd")
         res.gpu_families = hw
 
         # -- Stage 3: vendor-specific toolchain must match the hardware -----
         cuda_root = self._find_cuda_root()
         has_nvcc = self._has_nvcc(cuda_root)
+        rocm_root = self._find_rocm_root()
+        has_hipcc = (shutil.which("hipcc") is not None
+                     or (rocm_root / "bin" / _exe("hipcc")).is_file())
         vulkan_ready = self._has_vulkan()
         want = self.backend if self.backend != "auto" else None
 
@@ -613,10 +649,29 @@ class InstallRunner(QObject):
             blocked.append((
                 f"NVIDIA GPU(s) present but no CUDA compiler (nvcc) found - "
                 f"{detail}", "cuda"))
-        if "amd" in hw and not rocm_present and not forced_cpu:
-            blocked.append((
-                "AMD GPU(s) present but no ROCm/HIP toolchain found "
-                "(hipcc missing, /opt/rocm absent)", "rocm"))
+        if "amd" in hw and not forced_cpu:
+            # Only HALT when the AMD family is backed by *real usable AMD
+            # compute hardware*: a driver-owned card (amdgpu loaded) with no
+            # HIP compiler.  'amd' can also enter `hw` through the toolkit-
+            # only fallback (a leftover /opt/rocm directory on an NVIDIA box)
+            # or as PCI-enumerated silicon whose kernel driver is absent; in
+            # both cases ROCm cannot work here, so instead of blocking the
+            # (perfectly valid) CUDA/CPU build we drop 'amd' from the family
+            # set - it must not hijack backend selection further down either.
+            if not has_hipcc:
+                if amd_real:
+                    blocked.append((
+                        "AMD GPU(s) present but no ROCm/HIP compiler found "
+                        "(hipcc missing, /opt/rocm/bin/hipcc absent)", "rocm"))
+                else:
+                    hw.discard("amd")
+                    res.gpu_families = hw
+            elif not amd_real:
+                # hipcc exists (e.g. real ROCm install) but nothing AMD is
+                # actually drivable here -> phantom family from the toolkit
+                # fallback; keep it out of the report and the choice logic.
+                hw.discard("amd")
+                res.gpu_families = hw
         if want == "vulkan" and not vulkan_ready and not forced_cpu:
             blocked.append((
                 "Vulkan backend requested but the development SDK is "
@@ -649,14 +704,19 @@ class InstallRunner(QObject):
             return res
 
         # -- Stage 4: choose the backend -------------------------------------
+        # NOTE: rocm_present is deliberately NOT used here - it merely means
+        # "/opt/rocm exists or hipcc on PATH", which can be a leftover SDK
+        # directory on a machine without any AMD GPU (or an iGPU that must
+        # not hijack a CUDA build).  The validated ROCm toolchain from stage
+        # 3 (has_hipcc) plus real AMD hardware in `hw` is what counts.
         if os.environ.get("APPCAP_LLAMA_FORCE_CPU") == "1":
             res.backend, res.reason = "cpu", "CPU forced via APPCAP_LLAMA_FORCE_CPU=1"
         elif want:
             res.backend, res.reason = want, f"explicitly requested {want.upper()}"
         elif "nvidia" in hw and has_nvcc:
             res.backend, res.reason = "cuda", "NVIDIA GPU + CUDA toolkit (nvcc)"
-        elif "amd" in hw and rocm_present:
-            res.backend, res.reason = "rocm", "AMD GPU + ROCm/HIP toolchain"
+        elif "amd" in hw and has_hipcc:
+            res.backend, res.reason = "rocm", "AMD GPU + ROCm/HIP toolchain (hipcc)"
         elif hw and vulkan_ready:
             res.backend, res.reason = "vulkan", "GPU present, Vulkan SDK complete"
         elif not hw:
@@ -926,7 +986,61 @@ class InstallRunner(QObject):
             return False
 
     def _has_rocm(self) -> bool:
-        return shutil.which("hipcc") is not None or Path("/opt/rocm").is_dir()
+        """Legacy toolkit-presence probe ('/opt/rocm exists or hipcc on PATH').
+
+        Kept for older call sites; :meth:`preflight` no longer trusts it for
+        backend selection because a bare /opt/rocm directory without hipcc is
+        frequently a leftover SDK install on NVIDIA-only machines.
+        """
+        return shutil.which("hipcc") is not None or self._find_rocm_root().is_dir()
+
+    def _find_rocm_root(self) -> Path:
+        """First plausible ROCm root (contains bin/hipcc), else /opt/rocm."""
+        candidates: list[str] = []
+        for env in ("ROCM_PATH", "ROCR_VISIBLE"):
+            v = os.environ.get(env)
+            if v:
+                candidates.append(v)
+        candidates.append("/opt/rocm")
+        try:
+            base = Path("/opt")
+            if base.is_dir():
+                # Newest rocm-X.Y release first, then the plain /opt/rocm
+                # symlink target.
+                releases = sorted((d for d in base.glob("rocm-*")
+                                   if d.is_dir()), reverse=True)
+                candidates += [str(d) for d in releases]
+        except OSError:
+            pass
+        for c in candidates:
+            p = Path(c)
+            if (p / "bin" / _exe("hipcc")).is_file():
+                return p
+        return Path("/opt/rocm")
+
+    @staticmethod
+    def _amdgpu_driver_loaded() -> bool:
+        """True when the amdgpu kernel driver owns at least one DRM card.
+
+        Reads ``/sys/class/drm/card*/device/driver`` - works even without any
+        ROCm userspace installed, which makes it the strongest *hardware*
+        proof for the AMD family (mirroring what nvidia-smi//proc gives for
+        NVIDIA).  Never *removes* a PCI-enumerated 'amd' family: an iGPU with
+        only the minimal framebuffer driver still counts as AMD hardware.
+        """
+        try:
+            cards = sorted(Path("/sys/class/drm").glob("card[0-9]*"))
+        except OSError:
+            return False
+        for c in cards:
+            try:
+                drv = (c / "device" / "driver")
+                if drv.is_symlink() and \
+                        Path(os.readlink(str(drv))).name == "amdgpu":
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _has_vulkan(self) -> bool:
         """True only when a Vulkan *development* build is actually possible.
