@@ -1,0 +1,124 @@
+"""Shared application context passed to every tab / panel.
+
+Holds the long-lived backend singletons plus cross-tab state so widgets stay
+independent of each other (tabs talk through the context's signals).
+
+Also provides :meth:`AppContext.report_error`, the single funnel every tab
+uses for verbose, structured error reporting: the full multi-line message is
+always written to the global log (Tab 5), and optionally shown in a modal
+message box when ``dialog=True``.
+"""
+from __future__ import annotations
+
+import traceback
+
+from dataclasses import dataclass, field
+
+from PySide6.QtCore import QObject, Signal
+
+from app.core.hardware import HardwareManager
+from app.core.models import ModelSpec, build_registry
+from app.core.presets import DEFAULT_PRESETS, CaptionPreset, _clone
+from app.core.server import ServerManager
+
+
+@dataclass
+class InferenceSettings:
+    """Live values from Tab 2 consumed when building server/payload config."""
+    extra_args: str = ""
+    temperature: float = 1.0
+    top_p: float = 0.95
+    top_k: int = 40
+    min_p: float = 0.05
+    reasoning_budget: int = 0
+    cache_type: str = "q8_0"
+    split_mode: str = "row"
+    host: str = "127.0.0.1"
+    port: int = 8080
+
+
+class AppContext(QObject):
+    model_changed = Signal()            # model/quant selection changed
+    preset_changed = Signal()           # active preset/explicit mode changed
+    image_focused = Signal(str)         # path of focused image (Tab 4 -> panel)
+    server_state = Signal(str)          # mirrored from ServerManager.state_changed
+    log = Signal(str)                   # global log sink (Tab 5 text box)
+    error_log = Signal(str, bool)       # (verbose report, show_modal_dialog)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hw = HardwareManager(self)
+        self.server = ServerManager(self.hw, self)
+        self.registry: dict[str, ModelSpec] = build_registry()
+        self.presets: dict[str, CaptionPreset] = {
+            k: _clone(v) for k, v in DEFAULT_PRESETS.items()}
+        self.active_preset_key: str = "moss"
+        self.explicit_mode: bool = False
+        self.settings = InferenceSettings()
+        self.selected_model_key: str = "toriigate"
+        self.selected_quant: str = "Q8_0"
+        self.dataset_root: str | None = None
+        self.recursive: bool = True
+        self.focused_image: str | None = None
+        self.batch_selection: list[str] = []      # checked images (Tab 5)
+
+        # Wire internal mirrors ------------------------------------------------
+        self.server.state_changed.connect(self.server_state.emit)
+        self.server.log.connect(self.log.emit)
+        self.hw.log_message.connect(self.log.emit)
+        self.error_log.connect(self._on_error_log)
+
+    # ------------------------------------------------------------------ errors
+    def report_error(self, exc: Exception | str, context: str = "",
+                     dialog: bool = False):
+        """Centralized, verbose error reporting.
+
+        Structured errors (:class:`ModelOperationError`,
+        :class:`ResourcePlanError`) render their own reason + fix-suggestion
+        reports; anything else is wrapped with a short traceback so live
+        testing on the user's machine produces actionable bug reports
+        instead of silent failures or crash dialogs.
+        """
+        lines: list[str] = []
+        if context:
+            lines.append(f"[app] while: {context}")
+        if isinstance(exc, str):
+            lines.append(exc)
+        elif hasattr(exc, "report") and callable(exc.report):
+            # Typed, verbose error - use its structured multi-line rendering.
+            lines.extend(exc.report().splitlines())
+        else:
+            tb = "".join(traceback.format_exception(type(exc), exc,
+                                                    exc.__traceback__, limit=8))
+            lines.append(f"[app] ERROR: {type(exc).__name__}: {exc}")
+            lines.append("    trace  : " + tb.replace("\n", "\n    ").rstrip())
+            lines.append("    fix    : copy this whole block into the bug report.")
+        report = "\n".join(lines)
+        self.error_log.emit(report, bool(dialog))
+
+    def _on_error_log(self, report: str, dialog: bool):
+        # Always land in the global log first (works even before tabs exist).
+        self.log.emit(report)
+        if dialog:
+            try:
+                from PySide6.QtWidgets import QApplication, QMessageBox
+                top = QApplication.topLevelWidgets()
+                parent = next((w for w in top if w.isVisible()), None)
+                QMessageBox.warning(parent, "Auto-Captioner - Error", report)
+            except Exception:
+                # No display / headless: the log entry above is sufficient.
+                pass
+
+    # ------------------------------------------------------------------ helpers
+    @property
+    def active_model_spec(self) -> ModelSpec:
+        return self.registry[self.selected_model_key]
+
+    @property
+    def active_preset(self) -> CaptionPreset:
+        return self.presets[self.active_preset_key]
+
+    def effective_system_prompt(self) -> str:
+        spec = self.active_model_spec
+        return self.active_preset.effective_system_prompt(
+            explicit=self.explicit_mode, abliterated_model=spec.abliterated)
