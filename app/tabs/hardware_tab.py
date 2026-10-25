@@ -257,11 +257,16 @@ class HardwareModelsTab(QWidget):
                 g.split_weight = weight
 
     # ------------------------------------------------------------------ RAM UI
-    def on_ram_updated(self, avail: int, total: int):
-        used_pct = int(100 * (total - avail) / max(1, total))
-        self.ram_bar.setValue(used_pct)
+    def on_ram_updated(self, avail_mib: int, total_mib: int):
+        """Slot for HardwareManager.ram_updated (values arrive in MiB)."""
+        total_mib = max(1, int(total_mib))
+        avail_mib = max(0, min(int(avail_mib), total_mib))
+        used_pct = int(100 * (total_mib - avail_mib) / total_mib)
+        # QProgressBar.setValue() takes a 32-bit int; clamp so no upstream
+        # arithmetic slip can ever raise a libshiboken OverflowError here.
+        self.ram_bar.setValue(max(0, min(100, used_pct)))
         self.ram_label.setText(
-            f"{avail/1024**3:.1f} / {total/1024**3:.1f} GiB available "
+            f"{avail_mib / 1024:.1f} / {total_mib / 1024:.1f} GiB available "
             "(spilling target when weights exceed VRAM)")
 
     # ------------------------------------------------------------------ models
@@ -336,10 +341,18 @@ class HardwareModelsTab(QWidget):
         lines = [probe.describe()]
         if mode == STORAGE_UNSLOTH and unsloth_root.strip():
             p = Path(os.path.expanduser(unsloth_root.strip()))
-            if not p.exists():
+            try:
+                exists, isdir = p.exists(), p.is_dir()
+            except OSError as exc:
+                # Exotic filesystems (FUSE/network mounts, failing drives) can
+                # raise on stat(); report it instead of claiming "missing".
+                exists = isdir = False
+                lines.append(f"WARNING: cannot inspect this path ({type(exc).__name__}: "
+                             f"{exc}). Check that the volume is mounted/readable.")
+            if not exists:
                 lines.append("Directory does not exist yet - it will be created "
                              "automatically when you apply / download.")
-            elif not p.is_dir():
+            elif not isdir:
                 lines.append("WARNING: the path exists but is not a directory.")
             spec = self.ctx.active_model_spec
             mf = self.current_file()

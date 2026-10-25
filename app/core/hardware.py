@@ -185,12 +185,15 @@ class HardwareManager(QThread):
     -------
     gpus_updated(list)      : list[GPUInfo] – emitted whenever the static
                               topology changes or on every poll (cheap).
-    ram_updated(int, int)   : available_bytes, total_bytes
+    ram_updated(int, int)   : available_mib, total_mib  (MiB, never raw bytes)
     log_message(str)        : human-readable startup/detection log lines
     """
 
     gpus_updated = Signal(list)
-    ram_updated = Signal(int, int)
+    # Values are emitted in MiB, not bytes: multi-hundred-GiB systems easily
+    # exceed the 32-bit signed range (~2.1e9), which made byte-sized signals
+    # raise libshiboken "Overflow ... type 'i'" errors on every poll.
+    ram_updated = Signal(int, int)   # available_mib, total_mib
     log_message = Signal(str)
 
     def __init__(self, parent=None):
@@ -245,7 +248,11 @@ class HardwareManager(QThread):
         vm = psutil.virtual_memory()
         self.ram_available_bytes = vm.available
         self.ram_total_bytes = vm.total
-        self.ram_updated.emit(vm.available, vm.total)
+        # Emit in MiB: raw byte counts on >2 TiB-RAM machines overflow the
+        # 32-bit int slot of Signal(int, int) (libshiboken OverflowError).
+        avail_mib = max(0, min(vm.available // (1024 * 1024), 2**31 - 1))
+        total_mib = max(0, min(vm.total // (1024 * 1024), 2**31 - 1))
+        self.ram_updated.emit(avail_mib, total_mib)
         self.gpus_updated.emit(list(self.gpus))
 
     # -- helpers -----------------------------------------------------------
