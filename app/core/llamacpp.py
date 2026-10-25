@@ -317,6 +317,28 @@ _FIX_PACKAGES: dict[str, dict[str, list[str]]] = {
         "pacman": ["cuda"],
         "zypper": ["cuda-toolkit"],
     },
+    # A CUDA *compiler* (nvcc) can be present while the math libraries are
+    # not: minimal toolkit installs (or NVIDIA-repo 'cuda-compiler-13-x'
+    # packages) ship nvcc but no libcublas headers/libs, so cmake finds the
+    # toolkit yet the generate step dies with
+    #   Target "ggml-cuda" links to: CUDA::cublas ... but the target was
+    #   not found.
+    # NOTE: there is deliberately NO static package list here for apt.
+    # Version-suffixed names such as 'libcublas-dev-13-1' (Ubuntu multiverse)
+    # or 'cuda-toolkit-13-1' (NVIDIA apt repo) change with *every* CUDA
+    # release, and unversioned spellings do not exist in every repo - a
+    # hard-coded list would rot the moment CUDA updates.  For apt the fix
+    # command is resolved dynamically at runtime instead: search the local
+    # apt cache for the versioned -dev packages matching the installed nvcc
+    # (see InstallRunner._apt_cublas_candidates / _cuda_libs_fix_command),
+    # falling back to a self-explanatory 'apt-cache search' recipe that the
+    # user can run themselves.  The other managers keep best-effort lists.
+    "cuda_libs": {
+        "dnf": ["cuda-cublas-devel", "cuda-curand-devel",
+                "cuda-cudnn-devel"],
+        "pacman": ["cblas", "libcublas"],
+        "zypper": ["libcublas-devel", "libcurand-devel"],
+    },
     "vulkan": {
         "apt": ["libvulkan-dev", "vulkan-tools", "glslang-tools"],
         "dnf": ["vulkan-devel", "glslang", "vulkan-tools"],
@@ -417,6 +439,174 @@ def manual_hint(group: str) -> str:
                                for p in lst}))
     return (f"No supported package manager detected - install these manually "
             f"for your distro: {listed}")
+
+
+# ---------------------------------------------------------------------------
+# Future-proof CUDA math-library fix commands (apt cache lookup)
+# ---------------------------------------------------------------------------
+#: NVIDIA CUDA libraries whose *development* packages ggml-cuda links
+#: against.  cublas is mandatory; curand/cudnn are optional but ship in the
+#: same versioned family, so we search for them too and include whichever
+#: the user's repos actually carry.
+_CUDA_LIB_STEMS = ("cublas", "curand", "cudnn")
+
+
+def _apt_cache_search(patterns: list[str]) -> set[str]:
+    """Package names from `apt-cache search --names-only` for regex patterns.
+
+    Returns an empty set when apt-cache is unavailable or fails; every
+    exception is swallowed because this runs on a UI error path where any
+    answer beats none.
+    """
+    found: set[str] = set()
+    exe = shutil.which("apt-cache")
+    if not exe:
+        return found
+    try:
+        proc = subprocess.run([exe, "search", "--names-only"] + patterns,
+                              capture_output=True, text=True, timeout=10.0)
+    except Exception:
+        return found
+    if proc.returncode != 0 and not proc.stdout:
+        return found
+    for line in proc.stdout.splitlines():
+        name = line.strip().split(" ", 1)[0].strip()
+        # 'apt-cache search' prints 'NAME - short description'; plain names
+        # only ever contain lowercase letters/digits/+-.  Anything else
+        # (e.g. 'No matches') is discarded.
+        if name and re.fullmatch(r"[a-z0-9][a-z0-9+.\-]*", name):
+            found.add(name)
+    return found
+
+
+def _cuda_version_dots(nvcc_ver: str) -> str:
+    """Normalise an nvcc version ('13.1', '13.1.2') to 'MAJOR.MINOR'."""
+    m = re.match(r"(\d+)\.(\d+)", nvcc_ver or "")
+    return f"{m.group(1)}.{m.group(2)}" if m else ""
+
+
+def _cuda_version_dashes(nvcc_ver: str) -> str:
+    """Normalise an nvcc version to the repo suffix 'MAJOR-MINOR'."""
+    d = _cuda_version_dots(nvcc_ver)
+    return d.replace(".", "-") if d else ""
+
+
+def apt_cuda_libs_fix_command(nvcc_ver: str = "",
+                              search_fn=None) -> tuple[list[str], list[str]]:
+    """Resolve copy-pasteable apt commands for the missing cuBLAS dev libs.
+
+    Never hard-codes version-suffixed package names: those change with every
+    CUDA release (libcublas-dev-13-1 today, libcublas-dev-14-0 tomorrow),
+    and unversioned spellings do not exist in every repo.  Instead we query
+    the *local apt cache* for candidates that match the installed toolkit
+    version, so the suggestion is always a package the user's own repos can
+    actually deliver.
+
+    Candidate families, tried in order of precision:
+      1. Ubuntu multiverse split packages:   libcublas-dev[-X.Y(-Z)]
+      2. NVIDIA-repo metapackage:            cuda-toolkit-X.Y[-Z]
+      3. NVIDIA-repo component packages:     cuda-libraries-dev-X-Y[-Z]
+
+    Returns ``(commands, notes)``: ready-to-run lines first, then plain
+    guidance strings (empty when nothing concrete could be resolved).  When
+    the cache yields no exact match the user gets a self-explanatory
+    ``apt-cache search`` recipe instead of a guessed name that would fail.
+    """
+    search = search_fn or _apt_cache_search
+    dashes = _cuda_version_dashes(nvcc_ver)          # e.g. '13-1'
+    dots = _cuda_version_dots(nvcc_ver)              # e.g. '13.1'
+
+    # Regex families used both to query the apt cache and to filter its
+    # answers.  Every pattern is *anchored* and pinned to the installed
+    # major.minor (or major-minor) whenever the version is known - never a
+    # blind wildcard that could suggest a package from a different CUDA
+    # series than the toolkit in use.
+    lib_dev_pats = tuple(rf"lib{stem}-dev([-_.]\d[^ ]*)?"
+                         for stem in _CUDA_LIB_STEMS)
+    tk_pats = ((rf"cuda-toolkit-{re.escape(dashes)}([-_.]\d[^ ]*)?",)
+               if dashes else ())
+    comp_pats = ((rf"cuda-libraries-dev-{re.escape(dashes)}([-_.]\d[^ ]*)?",)
+                 if dashes else ())
+    pats: list[str] = []
+    for p in (*lib_dev_pats, *tk_pats, *comp_pats):
+        pats.append("^" + p + "$")
+    if not dashes:   # unknown nvcc version: accept any versioned spelling
+        for stem in _CUDA_LIB_STEMS:
+            pats.append(rf"^lib{stem}-dev([-_.]\d[^ ]*)?$")
+
+    hits = search(pats)
+
+    def pick(prefixes: tuple[str, ...]) -> list[str]:
+        sel = [n for n in hits
+               if any(re.fullmatch(p, n) for p in prefixes)]
+        return sorted(sel, key=lambda s: (len(s), s))[:3]
+
+    commands: list[str] = []
+    notes: list[str] = []
+    libdev = pick(lib_dev_pats)
+    toolkit = pick(tk_pats)
+    comp = pick(comp_pats)
+
+    # The *smallest* set that definitely satisfies ggml-cuda is the mandatory
+    # cuBLAS dev package(s); curand/cudnn are optional in llama.cpp's CMake,
+    # so list them only when they share a family with cublas (i.e. installing
+    # one command pulls everything).  A fat multi-hundred-MB metapackage is
+    # never suggested as the primary line when a lean split package exists.
+    must = [n for n in libdev if "cublas" in n]
+    if must:
+        commands.append(f"sudo apt install {' '.join(must)}")
+    elif libdev:
+        commands.append(f"sudo apt install {' '.join(libdev)}")
+    alt = ([f"sudo apt install {' '.join(toolkit)}"] if toolkit else
+           [f"sudo apt install {' '.join(comp)}"] if comp else [])
+    if alt:
+        commands.append(alt[0] + "   # alternative: full toolkit metapackage")
+
+    if not commands:
+        # Nothing in the local cache matches.  Do NOT guess a versioned name
+        # (it would rot or simply not exist); hand the user the discovery
+        # recipe plus the two canonical package families to look for.
+        probe = "apt-cache search -n '^lib(cublas|curand|cudnn)-dev'"
+        if dashes:
+            probe += f" ; apt-cache search -n 'cuda-(toolkit|libraries-dev)-{re.escape(dashes)}'"
+            notes.append(
+                f"No package matching CUDA {dots or dashes} was found in "
+                "your apt cache. Run the search command above; if it lists "
+                "nothing, either enable the universe/multiverse components "
+                "(Ubuntu ships libcublas-dev-* there) or add the NVIDIA CUDA "
+                "apt repository (it provides cuda-toolkit-"
+                f"{dashes}/cuda-libraries-dev-{dashes}).")
+        else:
+            notes.append(
+                "Could not determine your CUDA version from nvcc, and the "
+                "apt cache search returned nothing. Run the search command "
+                "above to find the 'libcublas-dev*' package matching your "
+                "toolkit, then sudo apt install it.")
+        commands.append(probe + "   # then: sudo apt install <the -dev package(s) it lists>")
+    else:
+        notes.append(
+            "These names were resolved live from your apt cache against the "
+            "installed nvcc version, so they exist in your repos today. If "
+            "apt reports 'Unable to locate', run: sudo apt update && retry, "
+            "or use the alternative command listed next.")
+    return commands, notes
+
+
+def _cuda_libs_fix_command(mgr: str | None, nvcc_ver: str,
+                           search_fn=None) -> tuple[list[str], list[str]]:
+    """Fix commands + notes for the 'cuda_libs' group, per package manager.
+
+    apt gets the dynamic cache-resolved spelling (future-proof across CUDA
+    releases); other managers fall back to their static best-effort lists.
+    ``search_fn`` lets callers (and tests) inject a custom apt-cache query.
+    Returns ``(commands, notes)``, mirroring :func:`apt_cuda_libs_fix_command`.
+    """
+    if mgr == "apt":
+        return apt_cuda_libs_fix_command(nvcc_ver, search_fn=search_fn)
+    return ([fix_command("cuda_libs", mgr)],
+            ["Package names above come from the app's built-in table for your "
+             "package manager; verify with its search command if apt/dnf "
+             "reports 'Unable to locate'."])
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +749,10 @@ class InstallRunner(QObject):
         self.backend = backend          # auto | cuda | rocm | vulkan | cpu
         self._cancel = threading.Event()
         self._preflight: PreflightResult | None = None
+        #: CUDA toolkit root discovered during the last preflight() - reused
+        #: by _stream()'s error translation so a mid-configure cuBLAS failure
+        #: can name the exact cuda-toolkit-X-Y metapackage to install.
+        self._cuda_root: Path | None = None
         self._configure_retried = False
 
     # ------------------------------------------------------------- public
@@ -629,7 +823,19 @@ class InstallRunner(QObject):
 
         # -- Stage 3: vendor-specific toolchain must match the hardware -----
         cuda_root = self._find_cuda_root()
+        self._cuda_root = cuda_root         # also used by _stream() error hints
         has_nvcc = self._has_nvcc(cuda_root)
+        # nvcc alone is NOT a complete CUDA toolkit: minimal installs (the
+        # NVIDIA-repo 'cuda-compiler-*' metapackage, distro split packages)
+        # ship the compiler but no math libraries.  llama.cpp's ggml-cuda
+        # links CUDA::cublas / curand / cudnn, so cmake *configures* fine and
+        # then dies in the generate step with
+        #   Target "ggml-cuda" links to: CUDA::cublas ... not found.
+        # Verify the linkable dev libraries during preflight instead of
+        # letting the user discover it after a multi-minute download.
+        missing_cuda_libs: list[str] = []
+        if has_nvcc and cuda_root is not None:
+            missing_cuda_libs = self._missing_cuda_libs(cuda_root)
         rocm_root = self._find_rocm_root()
         has_hipcc = (shutil.which("hipcc") is not None
                      or (rocm_root / "bin" / _exe("hipcc")).is_file())
@@ -650,6 +856,20 @@ class InstallRunner(QObject):
             blocked.append((
                 f"NVIDIA GPU(s) present but no CUDA compiler (nvcc) found - "
                 f"{detail}", "cuda"))
+        elif has_nvcc and any(n in missing_cuda_libs
+                              for n in self._CUDA_REQUIRED_LIBS):
+            # nvcc is there, cuBLAS dev files are not: cmake would find
+            # 'CUDAToolkit' but generate would die on CUDA::cublas.  HALT now,
+            # with the exact packages to install, instead of failing twice
+            # after a multi-minute download+configure.  (Missing curand/cudnn
+            # alone do NOT block - those imported targets are optional in
+            # llama.cpp's CMake; they only appear in the fix command.)
+            blocked.append((
+                f"CUDA toolkit at {cuda_root} is incomplete: nvcc works but "
+                f"the development libraries ggml-cuda links against are "
+                f"missing ({', '.join(missing_cuda_libs)}). A minimal "
+                "'cuda-compiler' install is not enough - llama.cpp needs "
+                "cuBLAS dev files too.", "cuda_libs"))
         if "amd" in hw and not forced_cpu:
             # Only HALT when the AMD family is backed by *real usable AMD
             # compute hardware*: a driver-owned card (amdgpu loaded) with no
@@ -689,23 +909,49 @@ class InstallRunner(QObject):
         if blocked:
             groups = list(dict.fromkeys(g for _, g in blocked))
             mgr = detect_pkg_manager()
-            cmds = [fix_command(g, mgr) for g in groups]
+            # 'cuda_libs' is resolved dynamically (apt cache lookup pinned to
+            # the installed nvcc version) because its package names are
+            # version-suffixed and change with every CUDA release; every
+            # other group uses its static per-manager list.
+            cmds: list[str] = []
+            cuda_notes: list[str] = []
+            for g in groups:
+                if g == "cuda_libs":
+                    ver = (self._cuda_toolkit_version(cuda_root)
+                           if cuda_root is not None else "")
+                    # route *all* managers through the helper so the apt path
+                    # always uses this runner's (injectable) cache lookup and
+                    # non-apt managers get their static list + a note.
+                    c, n = _cuda_libs_fix_command(mgr, ver,
+                                                  search_fn=self._apt_cache_search)
+                    cmds += c
+                    cuda_notes += n
+                else:
+                    cmds.append(fix_command(g, mgr))
             manuals = ([manual_hint(g) for g in groups] if mgr is None
                        else ([] if is_ubuntu_family() else
-                             [f"Package manager detected: {mgr}"]))
+                             [f"Package manager detected: {mgr}\n"
+                              "(the exact package names above may differ on "
+                              "your distro - verify with your package "
+                              "manager's search command)"]))
+            sug = ["Install the packages above (requires sudo/root), then "
+                   "press 'Auto-install / build' again."]
+            if "cuda_libs" in groups:
+                sug.append("You do NOT need to reinstall CUDA itself - nvcc "
+                           "is fine; only the math-library dev packages are "
+                           "missing. No need to delete the build folder: "
+                           "the installer re-runs cmake automatically.")
+                sug += cuda_notes
+            sug += ["Or point the 'Binary:' field at an existing llama-server "
+                    "('Autodetect' / 'Browse…') and skip building entirely.",
+                    "Only if you really want a CPU-only build: set "
+                    "APPCAP_LLAMA_FORCE_CPU=1 before launching."]
             res.error = PreflightError(
                 "Vendor GPU toolchain incomplete - refusing to build",
                 detail="; ".join(r for r, _ in blocked)
                        + ". Building CPU-only would silently ignore -ngl, "
                          "so the install was stopped before any download.",
-                suggestions=["Install the packages above (requires "
-                             "sudo/root), then press 'Auto-install / build' "
-                             "again.",
-                             "Or point the 'Binary:' field at an existing "
-                             "llama-server ('Autodetect' / 'Browse…') and "
-                             "skip building entirely.",
-                             "Only if you really want a CPU-only build: set "
-                             "APPCAP_LLAMA_FORCE_CPU=1 before launching."],
+                suggestions=sug,
                 commands=cmds,
                 manual=manuals if mgr is None else [])
             self._preflight = res
@@ -978,6 +1224,83 @@ class InstallRunner(QObject):
         self.finished.emit(True, str(bin_path))
 
     # ------------------------------------------------------------- helpers
+    # ------------------------------------------------------------- CUDA libs
+    #: Libraries ggml-cuda links via CMake's FindCUDAToolkit imported targets.
+    #: curand/cudnn are *optional* in llama.cpp (GGML_CUDA_CUDNN defaults to
+    #: OFF) - a missing one there is only a warning, so we list them as fix
+    #: packages but never block the build on them alone.  cublas is mandatory:
+    #: without it cmake configure aborts at generate time with
+    #: "Target 'ggml-cuda' links to: CUDA::cublas but the target was not
+    #: found", which is exactly what this preflight now catches up-front.
+    _CUDA_REQUIRED_LIBS = ("libcublas",)
+    _CUDA_OPTIONAL_LIBS = ("libcurand", "libcudnn")
+
+    def _cuda_lib_dirs(self, cuda_root: Path) -> list[Path]:
+        """Library search dirs of a toolkit root (incl. the per-target tree)."""
+        dirs = [cuda_root / "lib64", cuda_root / "lib"]
+        t = cuda_root / "targets"
+        try:
+            if t.is_dir():
+                dirs += sorted((d for d in t.glob("*/lib")), reverse=True)
+        except OSError:
+            pass
+        return [d for d in dirs if d.is_dir()]
+
+    def _has_cuda_dev_lib(self, name: str, cuda_root: Path | None) -> bool:
+        """True when <name>.so (dev symlink or plain file) is linkable.
+
+        Checks the toolkit root first, then the system loader cache - distro
+        split packages (e.g. Debian's libcublas-dev) install into /usr/lib
+        instead of /usr/local/cuda.
+        """
+        roots = [cuda_root] if cuda_root else []
+        for r in roots:
+            for d in self._cuda_lib_dirs(r):
+                if (d / f"{name}.so").exists() or \
+                        (d / "stubs" / f"{name}.so").exists():
+                    return True
+        try:
+            out = subprocess.run(["ldconfig", "-p"], capture_output=True,
+                                 text=True, timeout=5.0).stdout
+        except Exception:
+            return False
+        needle = f"{name}.so"
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith(needle + " "):   # 'libcublas.so (x64) => …'
+                path = line.split("=>", 1)[-1].strip()
+                # The runtime-only library is NOT enough to link against;
+                # accept it only if the dev symlink itself resolves.
+                try:
+                    if path and Path(path).is_file():
+                        return True
+                except OSError:
+                    pass
+        return False
+
+    def _missing_cuda_libs(self, cuda_root: Path) -> list[str]:
+        """Names of required/optional CUDA math libs absent from the toolkit."""
+        missing = [n for n in self._CUDA_REQUIRED_LIBS
+                   if not self._has_cuda_dev_lib(n, cuda_root)]
+        opt = [n for n in self._CUDA_OPTIONAL_LIBS
+               if not self._has_cuda_dev_lib(n, cuda_root)]
+        return missing + opt
+
+    def _cuda_toolkit_version(self, cuda_root: Path) -> str:
+        """Toolkit version string ('13.1') from nvcc, or '' when unknown."""
+        nvcc = cuda_root / "bin" / _exe("nvcc")
+        if not nvcc.is_file():
+            return ""
+        out = self._run_capture([str(nvcc), "--version"])
+        m = re.search(r"release\s+(\d+\.\d+)", out)
+        return m.group(1) if m else ""
+
+    #: Cache lookup used for the dynamic 'cuda_libs' fix command.  Bound as
+    #: a *class attribute* (not an @staticmethod) so tests - and callers with
+    #: exotic setups - can override it per instance or per class; inside the
+    #: method, ``_apt_cache_search`` resolves to the module-level function.
+    _apt_cache_search = staticmethod(_apt_cache_search)
+
     def _find_cuda_root(self) -> Path | None:
         """First plausible CUDA toolkit root (contains bin/nvcc)."""
         candidates: list[str] = []
@@ -1208,6 +1531,29 @@ class InstallRunner(QObject):
             if "could not find vulkan" in blob or "vulkan_library" in blob \
                     or "vulkan_include_dir" in blob:
                 fixes.append(fix_command("vulkan"))
+            # 'CUDA::cublas / curand / cudnn imported target not found' means
+            # the toolkit root has nvcc but lacks the math dev libraries -
+            # almost always a minimal 'cuda-compiler' install.  The exact
+            # package names are resolved live from the apt cache (pinned to
+            # the installed nvcc version) because they are version-suffixed
+            # and change with every CUDA release; never suggest a hard-coded
+            # name that may not exist in the user's repos.
+            if ("cuda::cublas" in blob or "cuda::curand" in blob
+                    or "cuda::cudnn" in blob
+                    or ("cublas" in blob and "not found" in blob)):
+                self.log.emit("[install] The CUDA toolkit is missing its "
+                              "math libraries (cuBLAS dev files). nvcc alone "
+                              "is not enough for llama.cpp.")
+                v = (self._cuda_toolkit_version(self._cuda_root)
+                     if self._cuda_root else "")
+                mgr = detect_pkg_manager()
+                # route *all* managers through the helper so the apt path
+                # always uses this runner's (injectable) cache lookup.
+                c, n = _cuda_libs_fix_command(mgr, v,
+                                              search_fn=self._apt_cache_search)
+                fixes += c
+                for note in n:
+                    self.log.emit("[install] NOTE: " + note)
             if "nvcc" in blob or "cuda compiler" in blob \
                     or "could not find cuda" in blob:
                 fixes.append(fix_command("cuda"))
