@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QObject, Signal
 
 from app.core.hardware import HardwareManager
-from app.core.models import ModelSpec, build_registry
+from app.core.models import ModelSpec, StorageManager, build_registry
 from app.core.presets import DEFAULT_PRESETS, CaptionPreset, _clone
 from app.core.server import ServerManager
 
@@ -42,6 +42,7 @@ class AppContext(QObject):
     preset_changed = Signal()           # active preset/explicit mode changed
     image_focused = Signal(str)         # path of focused image (Tab 4 -> panel)
     server_state = Signal(str)          # mirrored from ServerManager.state_changed
+    storage_changed = Signal()          # model storage location changed (Tab 1)
     log = Signal(str)                   # global log sink (Tab 5 text box)
     error_log = Signal(str, bool)       # (verbose report, show_modal_dialog)
 
@@ -73,7 +74,8 @@ class AppContext(QObject):
                      dialog: bool = False):
         """Centralized, verbose error reporting.
 
-        Structured errors (:class:`ModelOperationError`,
+        Structured errors (:class:`AppError` and subclasses such as
+        :class:`StorageLocationError`, plus
         :class:`ResourcePlanError`) render their own reason + fix-suggestion
         reports; anything else is wrapped with a short traceback so live
         testing on the user's machine produces actionable bug reports
@@ -113,6 +115,24 @@ class AppContext(QObject):
     @property
     def active_model_spec(self) -> ModelSpec:
         return self.registry[self.selected_model_key]
+
+    @property
+    def storage(self) -> StorageManager:
+        """Active model-storage configuration (Tab 1 -> Storage Location)."""
+        import app.core.models as _models
+        return _models.STORAGE
+
+    def set_storage_location(self, mode: str, unsloth_root: str = "") -> None:
+        """Persist a new storage location and notify every dependent tab.
+
+        Any failure is re-raised as a verbose AppError subclass so the caller
+        can funnel it through :meth:`report_error`.
+        """
+        from app.core.models import set_storage
+        set_storage(mode, unsloth_root)
+        self.log.emit(f"[storage] {self.storage.describe()}")
+        self.storage_changed.emit()
+        self.model_changed.emit()      # cached-file badges must refresh
 
     @property
     def active_preset(self) -> CaptionPreset:
