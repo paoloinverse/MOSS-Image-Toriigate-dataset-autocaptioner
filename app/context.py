@@ -72,7 +72,11 @@ class AppContext(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.hw = HardwareManager(self)
-        self.server = ServerManager(self.hw, self)
+        self.server = ServerManager(self.hw, parent=self)
+        # Keep the server's discovery in sync with the Tab 2 'Binary:' field
+        # *before* the first start() (when server.config is still None), so
+        # find_binary() honours the user's choice instead of ignoring it.
+        self.binary_changed.connect(self._sync_server_preferred_binary)
         self.registry: dict[str, ModelSpec] = build_registry()
         self.presets: dict[str, CaptionPreset] = {
             k: _clone(v) for k, v in DEFAULT_PRESETS.items()}
@@ -102,6 +106,15 @@ class AppContext(QObject):
         self.autodetect_binary(silent=True)
 
     # ------------------------------------------------------------------ binary
+    def _sync_server_preferred_binary(self):
+        """Mirror the current Tab 2 'Binary:' value into ServerManager.
+
+        Called whenever the binary path is autodetected/user-chosen and at
+        startup after persisted settings are hydrated; makes find_binary()
+        honour the field even before the first start() (server.config None).
+        """
+        self.server.preferred_binary = self.settings.binary
+
     def autodetect_binary(self, silent: bool = False) -> str | None:
         """Find a usable llama-server and adopt it into the settings.
 
@@ -113,6 +126,7 @@ class AppContext(QObject):
         chosen = llamacpp.pick_best(self.settings.binary)
         if chosen is not None:
             self.settings.binary = chosen["path"]
+            self._sync_server_preferred_binary()
             if not silent:
                 self.log.emit(
                     f"[llama.cpp] using '{chosen['path']}' "

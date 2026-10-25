@@ -60,6 +60,12 @@ class InferenceTab(QWidget):
         self.binary_edit.textChanged.connect(
             lambda t: setattr(self.ctx.settings, "binary",
                               t.strip() or "llama-server"))
+        # Every edit of the field must also reach ServerManager's discovery
+        # (find_binary) immediately - before the first start(), server.config
+        # is still None and would otherwise ignore the user's Binary: choice.
+        self.binary_edit.textChanged.connect(
+            lambda t: setattr(self.ctx.server, "preferred_binary",
+                              t.strip() or "llama-server"))
         bin_row = QHBoxLayout()
         bin_row.addWidget(self.binary_edit, stretch=1)
         self.autodetect_btn = QPushButton("Autodetect")
