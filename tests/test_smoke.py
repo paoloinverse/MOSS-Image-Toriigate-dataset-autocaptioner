@@ -37,7 +37,8 @@ class FakeHW:
 
 from app.core.hardware import GPUInfo                      # noqa: E402
 from app.core.models import ArchInfo, ModelFile, build_registry, _arch_from_config  # noqa: E402
-from app.core.resources import plan_resources, shrink_context, MIN_CONTEXT          # noqa: E402
+from app.core.resources import (plan_resources, shrink_context, MIN_CONTEXT,   # noqa: E402
+                                MAX_CONTEXT_CAP)
 from app.core.presets import (DEFAULT_PRESETS, parse_moss_json, clean_booru_tags,   # noqa: E402
                               save_caption, load_existing_caption, export_config,
                               import_config, EXPLICIT_TRIGGER, CaptionPreset,
@@ -68,22 +69,29 @@ def test_kv_context_sizing():
 
         hw = FakeHW([gpu(0, "RTX 4090", 24576)])
         plan = plan_resources(hw, mf, arch, "q8_0", mmproj_path=mm)
-        # remaining = 24576-600-100-500 = 23376 MiB -> tokens floor/1024
-        expect = int(23376 * 1024 * 1024 // arch.kv_bytes_per_token("q8_0")) // 1024 * 1024
+        # remaining = 24576-600-100-500 = 23376 MiB -> tokens floor/1024,
+        # then clamped to the global MAX_CONTEXT_CAP ceiling.
+        expect = min(int(23376 * 1024 * 1024 // arch.kv_bytes_per_token("q8_0"))
+                     // 1024 * 1024, MAX_CONTEXT_CAP)
         check("dynamic -c is multiple of 1024", plan.context_tokens % 1024 == 0,
               str(plan.context_tokens))
         check("dynamic -c matches formula", plan.context_tokens == expect,
               f"{plan.context_tokens} vs {expect}")
         check("full offload when fits", plan.n_gpu_layers == 99 and plan.full_offload)
 
-        # q4_0 KV should allow a longer context than q8_0
+        # q4_0 KV should allow a longer context than q8_0 (or both sit at the
+        # shared cap, which is fine - never shorter).
         plan_q4 = plan_resources(hw, mf, arch, "q4_0", mmproj_path=mm)
-        check("KV quant extends context", plan_q4.context_tokens > plan.context_tokens)
+        check("KV quant extends context",
+              plan_q4.context_tokens >= plan.context_tokens,
+              f"q4_0={plan_q4.context_tokens} q8_0={plan.context_tokens}")
 
         # ---- spill to RAM: big Q8_0 on one 24GB GPU --------------------------
         big = ModelFile("big.gguf", "Q8_0", "repo/y", 27)
         bigpath = Path(td) / "big.gguf"
-        bigpath.write_bytes(b"\0" * (1024 * 1024 * 26000))   # 26 GiB weights
+        # Sparse file: logical size 26 GiB without consuming real disk/RAM.
+        with open(bigpath, "wb") as fh:
+            fh.truncate(1024 * 1024 * 26000)
         big.local_path = lambda: bigpath                     # type: ignore
         arch40 = ArchInfo(hidden_size=5120, num_layers=40, num_kv_heads=8, head_dim=128)
         sp = plan_resources(FakeHW([gpu(0, "RTX 3090", 24576)]), big, arch40, "q8_0")
@@ -178,6 +186,10 @@ def test_server_args():
 
     sm = ServerManager.__new__(ServerManager)   # skip QObject init
     sm.hw = HWStub()
+    # build_args logs capability warnings through the Qt signal; with the
+    # QObject never properly initialised (and no event loop) emitting would
+    # raise "Signal source has been deleted", so capture notes instead.
+    sm.log = type("LogCapture", (), {"emit": staticmethod(lambda *a, **k: None)})()
     cfg = ServerConfig(
         model=ModelFile("q.gguf", "Q8_0", "r/s", 27),
         mmproj_path="/cache/mm.gguf",

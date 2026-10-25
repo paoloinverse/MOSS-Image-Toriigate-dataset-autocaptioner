@@ -436,6 +436,35 @@ class InstallRunner(QObject):
                 "[install] WARNING: NVIDIA GPU(s) present but no CUDA "
                 "compiler (nvcc) found -> building CPU-only llama-server; "
                 "GPU offload (-ngl) will be IGNORED by that binary.")
+            # Explain *why* the other GPU backends were not chosen, so the
+            # user gets an actionable fix instead of a silent downgrade.
+            vulkan_missing = [name for name, ok in (
+                    ("Vulkan SDK library (libvulkan.so)",
+                     self._vulkan_lib_dir() is not None),
+                    ("Vulkan headers (vulkan/vulkan.h)",
+                     self._vulkan_header_dir() is not None),
+                    ("shader compiler (glslc/glslangValidator)",
+                     self._vulkan_shaderc() is not None))
+                if not ok]
+            if vulkan_missing:
+                self.log.emit(
+                    "[install] note: a Vulkan driver/loader is present but "
+                    "the development packages are missing: "
+                    + ", ".join(vulkan_missing) + ".")
+                self.log.emit(
+                    "[install] hint: install them to enable Vulkan GPU "
+                    "offload, e.g. 'sudo apt install libvulkan-dev "
+                    "vulkan-tools glslang-tools' (Debian/Ubuntu), "
+                    "'sudo dnf install vulkan-devel glslang' (Fedora) or "
+                    "your distro's equivalents - then press "
+                    "'Auto-install / build' again.")
+            else:
+                self.log.emit(
+                    "[install] hint: install the CUDA toolkit "
+                    "(e.g. 'sudo apt install nvidia-cuda-toolkit' or from "
+                    "developer.nvidia.com) for full-speed GPU offload, or "
+                    "the Vulkan SDK dev packages listed above, then press "
+                    "'Auto-install / build' again.")
 
         build_flags = {
             "cuda": ["-DGGML_CUDA=ON"],
@@ -550,20 +579,83 @@ class InstallRunner(QObject):
         return shutil.which("hipcc") is not None or Path("/opt/rocm").is_dir()
 
     def _has_vulkan(self) -> bool:
-        """Vulkan loader availability (fallback GPU path when CUDA is absent)."""
-        try:
-            r = subprocess.run(["vulkaninfo", "--summary"], capture_output=True,
-                               text=True, timeout=8.0)
-            if "device" in ((r.stdout or "") + (r.stderr or "")).lower():
-                return True
-        except Exception:
-            pass
-        for lib in ("/lib/x86_64-linux-gnu/libvulkan.so.1",
-                    "/usr/lib64/libvulkan.so.1",
-                    "/usr/lib/libvulkan.so.1"):
-            if Path(lib).exists():
-                return True
-        return False
+        """True only when a Vulkan *development* build is actually possible.
+
+        Checking for the runtime loader alone (libvulkan.so.1) was a bug:
+        virtually every driver install ships it, but compiling ggml-vulkan
+        additionally needs the SDK headers (vulkan/vulkan.h), the static/
+        import library (libvulkan.so) and the shader compiler 'glslc' (or
+        glslangValidator).  Picking vulkan without those made cmake's
+        ``find_package(Vulkan)`` abort the whole guided install with
+        "Could NOT find Vulkan (missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR
+        glslc)" - even though the user merely had a runtime loader present.
+        A machine can have a perfectly usable Vulkan *driver* yet no dev
+        package; llama.cpp then has to fall back to CPU (or CUDA/ROCm)
+        instead of failing the build outright.
+        """
+        return (self._vulkan_lib_dir() is not None
+                and self._vulkan_header_dir() is not None
+                and self._vulkan_shaderc() is not None)
+
+    @staticmethod
+    def _vulkan_lib_dir() -> Path | None:
+        """Directory holding the *linkable* libvulkan.so (SDK/dev package).
+
+        The bare runtime file is named ``libvulkan.so.1``; plain ``ld`` can
+        only link against ``libvulkan.so``, which is created by the Vulkan
+        development package.  CMake's FindVulkan reports exactly that as
+        ``Vulkan_LIBRARY`` missing, so require the unversioned symlink.
+        """
+        dirs = []
+        env = os.environ.get("VULKAN_SDK")
+        if env:
+            sdk = Path(env)
+            dirs += [sdk / "lib", sdk]
+        dirs += [Path("/usr/lib/x86_64-linux-gnu"), Path("/usr/lib64"),
+                 Path("/usr/lib"), Path("/usr/local/lib"),
+                 Path("/lib/x86_64-linux-gnu")]
+        for d in dirs:
+            try:
+                if (d / "libvulkan.so").is_file():
+                    return d
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _vulkan_header_dir() -> Path | None:
+        """Directory containing ``vulkan/vulkan.h`` (Vulkan headers package)."""
+        dirs = []
+        env = os.environ.get("VULKAN_SDK")
+        if env:
+            dirs.append(Path(env) / "include")
+        prefix = os.environ.get("XDG_PREFIX") or "/usr"
+        dirs += [Path(prefix) / "include", Path("/usr/local/include")]
+        for d in dirs:
+            try:
+                if (d / "vulkan" / "vulkan.h").is_file():
+                    return d
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _vulkan_shaderc() -> str | None:
+        """Path to a SPIR-V shader compiler glslc-style (required by cmake)."""
+        for name in ("glslc", "glslangValidator"):
+            p = shutil.which(name)
+            if p:
+                return p
+        sdk = os.environ.get("VULKAN_SDK")
+        if sdk:
+            for name in ("glslc", "glslangValidator"):
+                cand = Path(sdk) / "bin" / name
+                try:
+                    if cand.is_file() and os.access(cand, os.X_OK):
+                        return str(cand)
+                except OSError:
+                    continue
+        return None
 
     def _run_capture(self, cmd: list[str], timeout: float = 8.0) -> str:
         try:
