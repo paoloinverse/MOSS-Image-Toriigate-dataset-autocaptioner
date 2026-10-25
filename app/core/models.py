@@ -252,9 +252,9 @@ class StorageManager:
         """Directory that exists (or can be created) and accepts writes."""
         try:
             p.mkdir(parents=True, exist_ok=True)
+            return p.is_dir() and os.access(p, os.W_OK)
         except OSError:
             return False
-        return p.is_dir() and os.access(p, os.W_OK)
 
     def unsloth_search_roots(self) -> list[Path]:
         """Candidate scan roots for an Unsloth data folder (best first)."""
@@ -264,7 +264,16 @@ class StorageManager:
         roots = [root]
         for sub in UNSLOTH_SUBDIRS:
             cand = root / sub
-            if cand.is_dir():
+            # NOTE: plain .is_dir() raises OSError on exotic filesystems
+            # (FUSE/network mounts, permission-transit errors); treating that
+            # as "folder missing" was bug #1 - an existing (even empty)
+            # 'models' subdir got reported as non-existent.  Swallow only
+            # filesystem access errors here; anything else must surface.
+            try:
+                ok = cand.is_dir()
+            except OSError:
+                ok = False
+            if ok:
                 roots.append(cand)
         return roots
 
@@ -305,7 +314,19 @@ class StorageManager:
                              "(e.g. ~/Unsloth/Desktop/models), or switch back "
                              "to the default cache."])
         root = Path(os.path.expanduser(self.unsloth_root.strip()))
-        existed = root.exists()
+        try:
+            existed = root.exists()
+            is_dir = root.is_dir()
+        except OSError as exc:
+            raise StorageLocationError(
+                "Cannot inspect the Unsloth models folder",
+                detail=f"{type(exc).__name__}: {exc} (path: {root})",
+                suggestions=["The path lives on a filesystem that refused the "
+                             "stat() call (unmounted/failing drive, stale "
+                             "network mount, or permission-transit error).",
+                             "Verify the volume is mounted and readable.",
+                             "Or pick a different folder / switch back to the "
+                             "default cache location."]) from exc
         if not existed:
             try:
                 root.mkdir(parents=True, exist_ok=True)
@@ -318,7 +339,7 @@ class StorageManager:
                                  "Ensure the parent directory is writable.",
                                  "Or switch back to the default cache location."]
                 ) from exc
-        elif not root.is_dir():
+        elif not is_dir:
             raise StorageLocationError(
                 "Unsloth models path exists but is not a directory",
                 detail=f"path: {root}",
@@ -417,13 +438,24 @@ class StorageManager:
         if self.mode == STORAGE_UNSLOTH:
             root = self.unsloth_root.strip() or "(not configured)"
             n = 0
+            exists = None          # None = unknown (stat failed)
             if self.unsloth_root.strip():
+                p = Path(os.path.expanduser(root))
                 try:
-                    n = sum(1 for _ in Path(os.path.expanduser(root)).glob("**/*.gguf"))
+                    exists = p.is_dir()
+                    n = sum(1 for _ in p.glob("**/*.gguf"))
                 except OSError:
+                    exists = None
                     n = -1
-            extra = f" - {n} GGUF file(s) found for re-use" if n > 0 else (
-                " - folder missing; it will be created on first use" if n == 0 else "")
+            if exists is False:
+                extra = " - folder missing; it will be created on first use"
+            elif exists is None:
+                extra = (" - WARNING: the filesystem refused to inspect this "
+                         "path (unmounted/failing drive?)")
+            elif n > 0:
+                extra = f" - {n} GGUF file(s) found for re-use"
+            else:
+                extra = ""
             return f"Unsloth desktop folder: {root}{extra}"
         d = default_cache_dir()
         try:
