@@ -298,19 +298,29 @@ class HardwareModelsTab(QWidget):
             self.mmproj_label.setText("mmproj: —")
             return
         spec = self.ctx.active_model_spec
-        try:
-            mm = mf.mmproj_filename or resolve_mmproj(spec, mf) or "(none found)"
-        except Exception as exc:      # e.g. unexpected Hub API breakage
-            mm = "(lookup failed)"
-            self.ctx.report_error(exc, context=f"auto-detecting mmproj for {spec.source_repo}")
         state = []
-        if mf.local_path().is_file():
+        try:
+            # Fuzzy companion lookup: finds Unsloth-style names
+            # ('mmproj-Model-Q8_0.gguf') as well as our default
+            # ('Model-Q8_0.mmproj.gguf'); adopts the discovered name.
+            mp_path, mm_name = mf.resolve_mmproj_companion()
+            if mp_path is None:
+                mm_name = mm_name or resolve_mmproj(spec, mf) or "(none found)"
+        except Exception as exc:      # e.g. unexpected Hub API breakage
+            mp_path, mm = None, "(lookup failed)"
+            self.ctx.report_error(exc, context=f"auto-detecting mmproj for {spec.source_repo}")
+        else:
+            mm = mm_name or "(none found)"
+        try:
+            gguf_here = mf.local_path().is_file()
+        except OSError:
+            gguf_here = False
+        if gguf_here:
             state.append(f"GGUF cached ({mf.local_path().parent})")
-        if mm != "(none found)":
-            mf.mmproj_filename = mf.mmproj_filename or mm
-            mp_path = mf.mmproj_local_path()
-            if mp_path is not None and mp_path.is_file():
-                state.append(f"mmproj cached ({mp_path.parent})")
+        if mp_path is not None:
+            state.append(f"mmproj cached ({mp_path.parent})")
+        elif mm != "(none found)":
+            state.append("mmproj NOT found locally - would be downloaded")
         self.mmproj_label.setText(f"mmproj: {mm}" +
                                   (f"   [{', '.join(state)}]" if state else ""))
         self.ctx.model_changed.emit()
@@ -358,15 +368,27 @@ class HardwareModelsTab(QWidget):
             mf = self.current_file()
             if mf is not None:
                 gguf = probe.find_existing(spec.source_repo, mf.filename)
-                mmn = mf.mmproj_filename or \
-                    probe.find_existing(spec.source_repo, f"mmproj-{mf.quant}.gguf")
+                # Fuzzy companion search via the probe storage (handles both
+                # 'Model-Q8_0.mmproj.gguf' and Unsloth's
+                # 'mmproj-Model-Q8_0.gguf' naming).
+                from app.core.models import STORAGE as _ACTIVE
+                mp_path, mm_name = None, None
+                try:
+                    _saved_mode, _saved_root = (_ACTIVE.mode, _ACTIVE.unsloth_root)
+                    _ACTIVE.mode, _ACTIVE.unsloth_root = mode, unsloth_root
+                    try:
+                        mp_path, mm_name = mf.resolve_mmproj_companion()
+                    finally:
+                        _ACTIVE.mode, _ACTIVE.unsloth_root = _saved_mode, _saved_root
+                except Exception:
+                    mp_path, mm_name = None, mf.mmproj_filename
                 if gguf is not None:
                     lines.append(f"Required model re-use OK: {mf.filename} found at "
                                  f"{gguf} - no download needed.")
-                    if isinstance(mmn, Path) and mmn.is_file():
-                        lines.append(f"mmproj re-use OK: {mmn.name}")
+                    if mp_path is not None:
+                        lines.append(f"mmproj re-use OK: {mp_path.name}")
                     else:
-                        lines.append(f"mmproj '{mf.mmproj_filename or '?'}' NOT found "
+                        lines.append(f"mmproj '{mm_name or '?'}' NOT found "
                                      "in this folder - it would still be downloaded.")
                 else:
                     lines.append(f"'{mf.filename}' not found here yet - it would be "
@@ -415,7 +437,17 @@ class HardwareModelsTab(QWidget):
             return
         spec = self.ctx.active_model_spec
         names = [mf.filename]
-        mm = mf.mmproj_filename or resolve_mmproj(spec, mf)
+        # Fuzzy companion lookup first: if the projector already exists in
+        # the selected storage under a non-default name (Unsloth layout),
+        # adopt that name instead of queueing a duplicate download.
+        try:
+            mp_path, mm_name = mf.resolve_mmproj_companion()
+        except Exception as exc:
+            mp_path, mm_name = None, mf.mmproj_filename
+            self.ctx.report_error(exc, context="mmproj detection before download")
+        if mp_path is not None:
+            self.ctx.log.emit(f"[dl] mmproj re-use OK: {mp_path}")
+        mm = mm_name or resolve_mmproj(spec, mf)
         if mm:
             mf.mmproj_filename = mm
             names.append(mm)
