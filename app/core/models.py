@@ -702,6 +702,134 @@ def build_registry() -> dict[str, ModelSpec]:
     return {torii.key: torii, qwen.key: qwen}
 
 
+# ---------------------------------------------------------------------------
+# Unified application configuration (export / import)
+# ---------------------------------------------------------------------------
+#: Current schema version of the single-file config bundle.
+CONFIG_VERSION = 2
+
+
+def export_full_config(ctx) -> dict:
+    """One JSON-serialisable dict covering **every** configurable piece.
+
+    Sections: captioning presets (Tab 3), inference settings incl. the
+    llama-server binary path (Tab 2), storage location (Tab 1) and the
+    selected model/quant (Tab 1).  Dataset paths are deliberately excluded -
+    they belong to the session, not to a shareable profile.
+    """
+    from app.core.presets import export_config
+    presets_payload = json.loads(export_config(
+        ctx.presets, ctx.active_preset_key, ctx.explicit_mode))
+    return {
+        "version": CONFIG_VERSION,
+        "app": "moss-toriigate-autocaptioner",
+        "presets": presets_payload,
+        "settings": ctx.settings.to_dict(),
+        "storage": ctx.storage.to_dict(),
+        "model": {"key": ctx.selected_model_key, "quant": ctx.selected_quant},
+    }
+
+
+def _coerce(value, target_type, default):
+    """Best-effort type coercion for imported scalars; keeps *default* on junk."""
+    try:
+        if target_type is bool:
+            return bool(value)
+        if target_type in (int,):
+            return int(value)
+        if target_type in (float,):
+            return float(value)
+        if target_type is str:
+            return str(value)
+    except (TypeError, ValueError):
+        return default
+    return value
+
+
+def import_full_config(ctx, raw: str) -> list[str]:
+    """Apply a config bundle produced by :func:`export_full_config`.
+
+    Accepts both the unified v2 bundle and legacy Tab-3-only files (v1 with
+    just presets) so old exports keep working.  Unknown/invalid keys are
+    skipped with a warning instead of aborting the whole import.
+    Returns the list of human-readable warnings (possibly empty).
+    """
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("the file does not contain a JSON object")
+    warnings: list[str] = []
+
+    # ---- presets (also covers legacy v1 files where presets are top-level)
+    pload = data.get("presets")
+    if (isinstance(pload, dict) and "presets" in pload
+            and data.get("scope") != "presets"):
+        from app.core.presets import import_config
+        presets, active, explicit = import_config(json.dumps(pload))
+        ctx.presets = presets
+        ctx.active_preset_key = active
+        ctx.explicit_mode = explicit
+    elif "presets" in data or "active_preset" in data:
+        from app.core.presets import import_config
+        presets, active, explicit = import_config(raw)   # legacy Tab-3 format
+        ctx.presets = presets
+        ctx.active_preset_key = active
+        ctx.explicit_mode = explicit
+        warnings.append("legacy preset-only config imported (v1); "
+                        "re-export to get the unified all-tabs bundle.")
+    else:
+        warnings.append("no 'presets' section found - captioning presets left "
+                        "unchanged.")
+
+    # ---- inference settings (Tab 2)
+    st = data.get("settings")
+    if isinstance(st, dict):
+        fields = ctx.settings.__dataclass_fields__
+        for k, v in st.items():
+            if k not in fields:
+                warnings.append(f"ignored unknown setting key '{k}'")
+                continue
+            cur = getattr(ctx.settings, k)
+            setattr(ctx.settings, k, _coerce(v, type(cur), cur))
+    else:
+        warnings.append("no 'settings' section - inference parameters left "
+                        "unchanged.")
+
+    # ---- storage location (Tab 1)
+    stor = data.get("storage")
+    if isinstance(stor, dict):
+        mode = str(stor.get("mode", ""))
+        root = str(stor.get("unsloth_root", "") or "")
+        if mode in (STORAGE_DEFAULT, STORAGE_UNSLOTH):
+            try:
+                set_storage(mode, root)
+            except AppError as exc:
+                warnings.append("storage section present but applying it "
+                                f"failed: {exc.message}")
+        else:
+            warnings.append(f"invalid storage mode '{mode}' - storage left "
+                            "unchanged.")
+
+    # ---- model selection (Tab 1)
+    mdl = data.get("model")
+    if isinstance(mdl, dict):
+        key = str(mdl.get("key", ""))
+        quant = str(mdl.get("quant", ""))
+        if key in ctx.registry:
+            ctx.selected_model_key = key
+            spec = ctx.registry[key]
+            if quant and quant in spec.quants():
+                ctx.selected_quant = quant
+            else:
+                ctx.selected_quant = ("Q8_0" if "Q8_0" in spec.quants()
+                                      else spec.quants()[0])
+                warnings.append(f"quant '{quant}' not valid for model '{key}' "
+                                f"- using '{ctx.selected_quant}'.")
+        else:
+            warnings.append(f"unknown model key '{key}' - model selection "
+                            "left unchanged.")
+    return warnings
+
+
 # Process-wide registry.  ModelFile.resolve_mmproj_companion() needs to look
 # up a file's owning spec for fallback naming; AppContext builds its own copy
 # (mutable presets live there), so we expose a shared read-only view here.

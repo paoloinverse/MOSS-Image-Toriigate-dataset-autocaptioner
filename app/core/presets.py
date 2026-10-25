@@ -219,6 +219,9 @@ def export_config(presets: dict[str, CaptionPreset], active_key: str,
                   explicit: bool) -> str:
     payload = {
         "version": 1,
+        # Marker lets the unified importer recognise a preset-only file even
+        # when the 'presets' key is nested at top level.
+        "scope": "presets",
         "active_preset": active_key,
         "explicit_mode": explicit,
         "presets": {k: asdict(p) for k, p in presets.items()},

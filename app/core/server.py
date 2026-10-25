@@ -70,23 +70,25 @@ class ServerManager(QObject):
 
     # -- discovery ----------------------------------------------------------
     def find_binary(self) -> str | None:
+        """Locate a runnable llama-server honouring the user's Tab 2 choice.
+
+        Delegates to :mod:`app.core.llamacpp` so discovery, ranking and the
+        "preferred path wins" logic live in one place (also used by the
+        'Autodetect' button and startup autoconfiguration).
+        """
+        from app.core import llamacpp
         cfg = self.config
-        cand = (cfg.binary if cfg else "llama-server")
-        p = shutil.which(cand)
-        if p:
-            return p
-        for local in ("./llama-server", "./bin/llama-server",
-                      os.path.expanduser("~/llama.cpp/build/bin/llama-server")):
-            if os.path.isfile(local) and os.access(local, os.X_OK):
-                return local
-        return None
+        preferred = cfg.binary if cfg else "llama-server"
+        best = llamacpp.pick_best(preferred)
+        return best["path"] if best else None
 
     def describe_binary_search(self) -> str:
         """Verbose explanation of where we looked - used in error reports."""
+        from app.core import llamacpp
         cfg = self.config
         cand = (cfg.binary if cfg else "llama-server")
-        return (f"searched PATH for '{cand}' plus the fallback locations "
-                "./llama-server, ./bin/llama-server and ~/llama.cpp/build/bin/llama-server")
+        return (f"preferred='{cand}' plus " +
+                llamacpp.describe_search().replace("\n", "\n             "))
 
     # -- argv construction ---------------------------------------------------
     def build_args(self, cfg: ServerConfig) -> list[str]:
@@ -137,8 +139,12 @@ class ServerManager(QObject):
         if not binary:
             errors.append(
                 "llama-server binary not found: " + self.describe_binary_search() + ".\n"
-                "    fix    : install llama.cpp (CUDA or ROCm build) and either add it "
-                "to PATH, or set its full path in Tab 2 'Binary'.")
+                "    fix    : press 'Autodetect' or 'Auto-install / build' in Tab 2\n"
+                "             (guided installer clones + compiles llama.cpp for you),\n"
+                "             or navigate to an existing build with 'Browse…',\n"
+                "             or install manually: sudo apt install git cmake "
+                "build-essential && cmake -B ~/llama.cpp/build -S ~/llama.cpp "
+                "-DGGML_CUDA=ON && cmake --build ~/llama.cpp/build -j --target llama-server")
             return errors   # everything below is pointless without a binary
 
         if cfg.model is None:
