@@ -4,7 +4,9 @@
 * Explicit Mode checkbox -> injects NSFW triggers into the system prompt and
   tells the server manager to disable safety-system prompts.
 * System/User prompt editors (live two-way bound to the active preset).
-* Export/Import Config as JSON.
+* Export/Import Config as JSON - the **unified** bundle covering every
+  configurable piece: captioning presets (this tab), inference settings +
+  llama-server binary (Tab 2) and storage/model selection (Tab 1).
 """
 from __future__ import annotations
 
@@ -15,8 +17,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGroupBox,
                                QTextEdit, QVBoxLayout, QWidget)
 
 from app.context import AppContext
-from app.core.presets import (EXPLICIT_TRIGGER, export_config, import_config,
-                              _clone)
+from app.core.models import export_full_config, import_full_config
+from app.core.presets import EXPLICIT_TRIGGER, _clone
 
 
 class PresetsTab(QWidget):
@@ -115,14 +117,15 @@ class PresetsTab(QWidget):
 
     # ------------------------------------------------------------------ IO
     def export_cfg(self):
+        """Export the UNIFIED config: presets + Tab 2 settings + storage."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export captioning config", "captioner_config.json",
+            self, "Export full application config", "captioner_config.json",
             "JSON (*.json)")
         if not path:
             return
         try:
-            raw = export_config(self.ctx.presets, self.ctx.active_preset_key,
-                                self.ctx.explicit_mode)
+            payload = export_full_config(self.ctx)
+            raw = json.dumps(payload, indent=2, ensure_ascii=False)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(raw)
         except OSError as exc:
@@ -135,40 +138,64 @@ class PresetsTab(QWidget):
         except Exception as exc:
             self.ctx.report_error(exc, context="building config export", dialog=True)
             return
-        self.ctx.log.emit(f"[presets] config exported -> {path}")
+        self.ctx.save_settings()
+        self.ctx.log.emit(
+            f"[config] unified config exported -> {path} "
+            "(presets + inference/binary + storage + model selection)")
 
     def import_cfg(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import captioning config", "", "JSON (*.json)")
+            self, "Import application config (unified or legacy preset-only)",
+            "", "JSON (*.json)")
         if not path:
             return
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                presets, active, explicit = import_config(fh.read())
+                raw = fh.read()
         except FileNotFoundError:
             self.ctx.report_error(
                 f"[presets] IMPORT FAILED: file does not exist:\n    {path}\n"
                 "    fix    : re-pick the file in the dialog.",
                 context="importing config", dialog=True)
             return
+        except OSError as exc:
+            self.ctx.report_error(
+                f"[presets] IMPORT FAILED: cannot read file: "
+                f"{type(exc).__name__}: {exc}",
+                context=f"importing config from {path}", dialog=True)
+            return
+        try:
+            warnings = import_full_config(self.ctx, raw)
+        except FileNotFoundError:
+            self.ctx.report_error(
+                f"[presets] IMPORT FAILED: file does not exist:\n    {path}",
+                context="importing config", dialog=True)
+            return
         except (ValueError, json.JSONDecodeError) as exc:
             self.ctx.report_error(
                 f"[presets] IMPORT FAILED: the file is not a valid captioner "
                 f"config.\n    reason : {type(exc).__name__}: {exc}\n"
-                "    fix    : export a fresh config from Tab 3 and edit that, or "
-                "check the JSON syntax (keys: version/presets/active/explicit).",
+                "    fix    : export a fresh config and edit that, or check "
+                "the JSON syntax (keys: version/presets/settings/storage/model).",
                 context="importing config", dialog=True)
             return
         except Exception as exc:
             self.ctx.report_error(exc, context=f"importing config from {path}",
                                   dialog=True)
             return
-        self.ctx.presets = presets
-        self.ctx.active_preset_key = active
-        self.ctx.explicit_mode = explicit
-        self.ctx.log.emit(f"[presets] config imported from {path} "
-                          f"({len(presets)} preset(s))")
+        for w in warnings:
+            self.ctx.log.emit(f"[config] import warning: {w}")
+        self.ctx.save_settings()
+        self.ctx.log.emit(f"[config] unified config imported from {path} "
+                          f"({len(self.ctx.presets)} preset(s); all tabs "
+                          "refreshed)")
         self.reload_combos()
+        # Push the new values into the other tabs' widgets: Tab 2 (binary +
+        # sliders/host/port) and Tab 1 (storage + model/quant selectors).
+        mw = self.window()
+        if isinstance(mw, MainWindow):
+            mw.tab_inference.refresh_from_context()
+            mw.tab_hardware.refresh_from_context()
 
     def reload_combos(self):
         self.preset_combo.blockSignals(True)

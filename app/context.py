@@ -35,6 +35,28 @@ class InferenceSettings:
     split_mode: str = "row"
     host: str = "127.0.0.1"
     port: int = 8080
+    binary: str = "llama-server"     # Tab 2 'Binary:' (autodetected / chosen)
+
+    def to_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+    def apply_dict(self, d: dict) -> None:
+        """Copy recognised keys from *d* with type coercion; ignore the rest."""
+        for k, v in (d or {}).items():
+            if k not in self.__dataclass_fields__:
+                continue
+            try:
+                f = self.__dataclass_fields__[k]
+                if f.type in ("float", float):
+                    setattr(self, k, float(v))
+                elif f.type in ("int", int):
+                    setattr(self, k, int(v))
+                elif f.type in ("str", str):
+                    setattr(self, k, str(v))
+                else:
+                    setattr(self, k, v)
+            except (TypeError, ValueError):
+                pass    # keep the current value on garbage input
 
 
 class AppContext(QObject):
@@ -45,6 +67,7 @@ class AppContext(QObject):
     storage_changed = Signal()          # model storage location changed (Tab 1)
     log = Signal(str)                   # global log sink (Tab 5 text box)
     error_log = Signal(str, bool)       # (verbose report, show_modal_dialog)
+    binary_changed = Signal()           # llama-server path autodetected/chosen
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -63,11 +86,59 @@ class AppContext(QObject):
         self.focused_image: str | None = None
         self.batch_selection: list[str] = []      # checked images (Tab 5)
 
+        # Hydrate persisted settings (storage + inference incl. binary path).
+        from app.core.models import load_app_settings
+        self._persisted = load_app_settings()
+        self.settings.apply_dict(self._persisted.get("settings") or {})
+
         # Wire internal mirrors ------------------------------------------------
         self.server.state_changed.connect(self.server_state.emit)
         self.server.log.connect(self.log.emit)
         self.hw.log_message.connect(self.log.emit)
         self.error_log.connect(self._on_error_log)
+
+        # One-shot llama-server autodetection at startup (cheap --version
+        # probes only; never downloads or compiles anything).
+        self.autodetect_binary(silent=True)
+
+    # ------------------------------------------------------------------ binary
+    def autodetect_binary(self, silent: bool = False) -> str | None:
+        """Find a usable llama-server and adopt it into the settings.
+
+        Honours a previously user-chosen/autodetected path when still valid;
+        otherwise picks the best candidate (CUDA > ROCm > Vulkan > CPU).
+        Returns the adopted path or ``None`` when nothing was found.
+        """
+        from app.core import llamacpp
+        chosen = llamacpp.pick_best(self.settings.binary)
+        if chosen is not None:
+            self.settings.binary = chosen["path"]
+            if not silent:
+                self.log.emit(
+                    f"[llama.cpp] using '{chosen['path']}' "
+                    f"(backend: {chosen['backend']})"
+                    + (f"  [{chosen['version']}]" if chosen.get("version") else ""))
+            self.binary_changed.emit()
+            return chosen["path"]
+        if not silent:
+            self.log.emit("[llama.cpp] autodetect found no llama-server.\n"
+                          + llamacpp.describe_search())
+        return None
+
+    def save_settings(self):
+        """Persist Tab-1/Tab-2 configuration to app_settings.json."""
+        from app.core.models import save_app_settings
+        data = dict(self._persisted)
+        data["storage"] = self.storage.to_dict()
+        data["settings"] = self.settings.to_dict()
+        data["model"] = {"key": self.selected_model_key,
+                        "quant": self.selected_quant}
+        try:
+            save_app_settings(data)
+        except Exception as exc:
+            self.report_error(exc, context="saving application settings",
+                              dialog=False)
+        self._persisted = data
 
     # ------------------------------------------------------------------ errors
     def report_error(self, exc: Exception | str, context: str = "",

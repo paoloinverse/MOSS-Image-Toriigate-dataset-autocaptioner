@@ -1,6 +1,10 @@
 """Tab 2 - Inference Parameters.
 
 * Raw llama.cpp passthrough args + server binary/host/port/split-mode.
+* Binary row: 'Autodetect' (searches PATH/common build dirs, ranks CUDA >
+  ROCm > Vulkan > CPU), 'Browse…' (pick an existing install) and
+  'Auto-install / build' (guided clone+compile in a background thread with
+  live log streaming, explicit folder choice, disk/toolchain preflight).
 * Generation sliders (Temperature, Top-P, Top-K, Min-P).
 * "Reasoning Budget" slider -> --reasoning-budget / reasoning_budget_tokens.
 * KV cache type dropdown (f16 / q8_0 / q4_0 …).
@@ -9,13 +13,17 @@
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QSlider, QSpinBox, QTextEdit,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QMessageBox, QPushButton, QSlider,
+                               QSpinBox, QTextEdit, QVBoxLayout, QWidget)
 
 from app.context import AppContext
+from app.core import llamacpp
 from app.core.models import read_arch_info, resolve_mmproj
 from app.core.resources import ResourcePlanError, plan_resources
 
@@ -37,20 +45,50 @@ class InferenceTab(QWidget):
         st = ctx.settings
         self._last_plan = None
         self._last_file = None
+        self._installer: llamacpp.InstallRunner | None = None
 
         root = QVBoxLayout(self)
 
         # ---- Server ----------------------------------------------------------
         srv_box = QGroupBox("llama.cpp Server")
         form = QFormLayout(srv_box)
-        self.binary_edit = QLineEdit("llama-server")
+        # Binary row: field + Autodetect / Browse / guided install buttons so
+        # nobody has to remember or type a path.
+        self.binary_edit = QLineEdit(st.binary)
+        self.binary_edit.setPlaceholderText(
+            "path to llama-server (or just the name if it is on PATH)")
+        self.binary_edit.textChanged.connect(
+            lambda t: setattr(self.ctx.settings, "binary",
+                              t.strip() or "llama-server"))
+        bin_row = QHBoxLayout()
+        bin_row.addWidget(self.binary_edit, stretch=1)
+        self.autodetect_btn = QPushButton("Autodetect")
+        self.autodetect_btn.setToolTip(
+            "Search PATH and common install/build locations; picks the best\n"
+            "build (CUDA > ROCm > Vulkan > CPU). The chosen path is persisted.")
+        self.browse_binary_btn = QPushButton("Browse…")
+        self.browse_binary_btn.setToolTip(
+            "Navigate to an existing llama-server binary (e.g. inside a\n"
+            "llama.cpp build directory) - no typing required.")
+        self.install_btn = QPushButton("Auto-install / build")
+        self.install_btn.setToolTip(
+            "Guided installer: clones llama.cpp and compiles llama-server in\n"
+            "a background thread with live logs. Asks for confirmation and\n"
+            "an install folder first; nothing heavy runs silently.")
+        bin_row.addWidget(self.autodetect_btn)
+        bin_row.addWidget(self.browse_binary_btn)
+        bin_row.addWidget(self.install_btn)
+        self.binary_status = QLabel("")
+        self.binary_status.setWordWrap(True)
+        self.binary_status.setStyleSheet("color: gray;")
+        form.addRow("Binary:", bin_row)
+        form.addRow(self.binary_status)
         self.host_edit = QLineEdit(st.host)
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(st.port)
         self.split_combo = QComboBox()
         self.split_combo.addItems(["row", "layer", "graph"])
-        form.addRow("Binary:", self.binary_edit)
         form.addRow("Host:", self.host_edit)
         form.addRow("Port:", self.port_spin)
         form.addRow("Split mode (multi-GPU):", self.split_combo)
@@ -143,8 +181,14 @@ class InferenceTab(QWidget):
         self.refresh_plan_btn.clicked.connect(self.refresh_plan)
         self.start_btn.clicked.connect(self.start_server)
         self.stop_btn.clicked.connect(lambda: self.ctx.server.stop())
+        self.autodetect_btn.clicked.connect(self.autodetect_binary)
+        self.browse_binary_btn.clicked.connect(self.browse_binary)
+        self.install_btn.clicked.connect(self.autoinstall)
         self.ctx.server_state.connect(self.on_server_state)
         self.ctx.model_changed.connect(self.refresh_plan)
+        self.ctx.binary_changed.connect(self._refresh_binary_status)
+
+        self._refresh_binary_status()
 
     @staticmethod
     def _row(slider, label) -> QWidget:
@@ -163,6 +207,148 @@ class InferenceTab(QWidget):
             label.setText(str(value))
         else:
             label.setText(f"{value:.2f}")
+
+    # ------------------------------------------------------------------ binary
+    def _refresh_binary_status(self):
+        """Show what the current Binary: field resolves to (and why not)."""
+        path = self.binary_edit.text().strip() or "llama-server"
+        best = llamacpp.pick_best(path)
+        if best and best.get("preferred"):
+            self.binary_status.setText(
+                f"OK: {best['path']}  [backend {best['backend']}]"
+                + (f"  {best['version']}" if best["version"] else ""))
+            self.binary_status.setStyleSheet("color: #272;")
+        elif best:
+            self.binary_status.setText(
+                f"Field '{path}' not runnable - autodetected instead:\n"
+                f"{best['path']}  [backend {best['backend']}]"
+                + (f"  {best['version']}" if best["version"] else ""))
+            self.binary_status.setStyleSheet("color: #a60;")
+        else:
+            self.binary_status.setText(
+                "No llama-server found. Press 'Autodetect' again, 'Browse…' to\n"
+                "pick an existing build, or 'Auto-install / build' to compile one.\n"
+                + llamacpp.platform_hint())
+            self.binary_status.setStyleSheet("color: #a33;")
+
+    def autodetect_binary(self):
+        found = self.ctx.autodetect_binary(silent=False)
+        if found:
+            self.binary_edit.blockSignals(True)
+            self.binary_edit.setText(found)
+            self.binary_edit.blockSignals(False)
+            self.ctx.save_settings()
+            self.ctx.log.emit(f"[llama.cpp] autodetect adopted: {found}")
+        else:
+            self.ctx.report_error(
+                "[llama.cpp] AUTODETECT FAILED: no runnable llama-server was "
+                "found.\n" + llamacpp.describe_search() + "\n"
+                "    fix    : use 'Auto-install / build' (guided compile), or\n"
+                "             'Browse…' if you already have a llama.cpp build.",
+                context="llama-server autodetect", dialog=True)
+        self._refresh_binary_status()
+
+    def browse_binary(self):
+        start = self.binary_edit.text().strip()
+        start_dir = os.path.dirname(start) if os.path.sep in start \
+            else str(Path.home())
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select the llama-server binary", start_dir,
+            "Executables (*);;All files (*)")
+        if not p:
+            return
+        try:
+            ok = Path(p).is_file() and os.access(p, os.X_OK)
+        except OSError as exc:
+            self.ctx.report_error(
+                f"[llama.cpp] cannot inspect the picked file: "
+                f"{type(exc).__name__}: {exc}",
+                context=f"browsing for binary {p}", dialog=True)
+            return
+        if not ok:
+            reply = QMessageBox.warning(
+                self, "Not executable",
+                f"'{p}' is not an executable file.\n\n"
+                "Try to chmod +x it anyway and use this path?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.binary_edit.setText(p)   # fires textChanged -> ctx.settings.binary
+        self.ctx.save_settings()
+        self.ctx.binary_changed.emit()
+        ver = llamacpp.probe_version(Path(p))
+        self.ctx.log.emit(f"[llama.cpp] user-selected binary: {p}"
+                          + (f"  [{ver}]" if ver else
+                             "  (no --version output - still accepting it)"))
+        self._refresh_binary_status()
+
+    # ------------------------------------------------------- guided install
+    def autoinstall(self):
+        if self._installer is not None:
+            self.ctx.log.emit("[install] an installation is already running - "
+                              "see the '[install]' lines in Tab 5.")
+            return
+        # 1) Toolchain preflight BEFORE bothering the user with dialogs.
+        runner_probe = llamacpp.InstallRunner(llamacpp.suggested_install_root())
+        ok, missing = runner_probe.check_prerequisites()
+        tool_msg = ("Build tools detected (git, cmake, g++)."
+                    if ok else "MISSING build tools:\n  - " + "\n  - ".join(missing))
+        # 2) Ask where to install (default folder pre-filled & editable).
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose the llama.cpp install folder (cancel = default)",
+            llamacpp.suggested_install_root())
+        dest = folder or llamacpp.suggested_install_root()
+        reply = QMessageBox.question(
+            self, "Confirm guided llama.cpp install",
+            "The guided installer will now:\n"
+            "  1. clone llama.cpp (~400 MB shallow git clone)\n"
+            "  2. configure + compile llama-server (several minutes)\n\n"
+            f"Install folder : {dest}\n"
+            f"GPU backend    : auto-detect (CUDA/ROCm/Vulkan/CPU)\n"
+            f"Free disk need : ~{runner_probe.required_disk_gb():.0f} GiB\n\n"
+            f"{tool_msg}\n\nProceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            self.status_note = "Guided install cancelled by user."
+            self.ctx.log.emit("[install] " + self.status_note)
+            return
+        if not ok:
+            self.ctx.report_error(
+                "[install] cannot start the guided build - missing tools:\n  - "
+                + "\n  - ".join(missing) + "\n"
+                "    fix    : sudo apt install " +
+                " ".join(m.split()[0] for m in missing) +
+                "\n             then press 'Auto-install / build' again.",
+                context="guided llama.cpp install", dialog=True)
+            return
+        # 3) Run in background with live logs.
+        runner = llamacpp.InstallRunner(dest, backend="auto")
+        runner.log.connect(self.ctx.log.emit)
+        runner.finished.connect(self._on_install_done)
+        self.install_btn.setEnabled(False)
+        self.install_btn.setText("Building… (click to cancel)")
+        self._installer = runner
+        runner.start()
+
+    def _on_install_done(self, success: bool, message: str):
+        runner, self._installer = self._installer, None
+        del runner
+        self.install_btn.setEnabled(True)
+        self.install_btn.setText("Auto-install / build")
+        if success:
+            self.binary_edit.setText(message)   # fires textChanged -> settings
+            self.ctx.save_settings()
+            self.ctx.binary_changed.emit()
+            self.ctx.log.emit(
+                "[install] llama.cpp ready - Binary: updated and persisted. "
+                "Press 'Start llama-server' when your model plan is set.")
+        else:
+            # message is the verbose AppError report from the worker thread.
+            self.ctx.log.emit(message)
+            self.ctx.report_error(message, context="guided llama.cpp install",
+                                  dialog=True)
+        self._refresh_binary_status()
 
     # ------------------------------------------------------------------ plan
     def compute_plan(self):
@@ -214,6 +400,19 @@ class InferenceTab(QWidget):
 
     # ------------------------------------------------------------------ server
     def start_server(self):
+        # Fast, friendly binary check before the (potentially slow) plan
+        # computation - mirrors what the server preflight will say, but with
+        # direct pointers to the three buttons that can fix it.
+        if self.ctx.server.find_binary() is None:
+            self.ctx.report_error(
+                "[server] cannot start: no runnable llama-server found.\n"
+                + llamacpp.describe_search() + "\n"
+                "    fix    : 'Autodetect' (re-scan), 'Browse…' (pick an\n"
+                "             existing build) or 'Auto-install / build'\n"
+                "             (guided clone+compile) in the Server box above.",
+                context="starting llama-server", dialog=True)
+            self._refresh_binary_status()
+            return
         plan, mf, _arch = self.compute_plan()
         if plan is None or mf is None:
             return
