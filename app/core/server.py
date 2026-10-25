@@ -57,9 +57,16 @@ class ServerManager(QObject):
     state_changed = Signal(str)          # "stopped" | "starting" | "ready" | "crashed"
     oom_recovery = Signal(int)           # new context size after shrink
 
-    def __init__(self, hw: HardwareManager, parent=None):
+    def __init__(self, hw: HardwareManager, preferred_binary: str = "",
+                 parent=None):
         super().__init__(parent)
         self.hw = hw
+        # Live mirror of the Tab 2 'Binary:' field (kept in sync by
+        # AppContext).  Used for discovery *before* the first start(), when
+        # self.config is still None - otherwise a user-picked path shown as
+        # OK in the Binary status would be ignored and find_binary() could
+        # wrongly report "no runnable llama-server found".
+        self.preferred_binary = preferred_binary
         self.proc: subprocess.Popen | None = None
         self.config: ServerConfig | None = None
         self._reader_threads: list[threading.Thread] = []
@@ -68,25 +75,37 @@ class ServerManager(QObject):
         self.ready = False
         self._shutdown_requested = False
 
+    def _preferred_binary(self) -> str:
+        """Current Tab 2 'Binary:' choice, with sane fallbacks.
+
+        Priority: the last start() config (when present) > the live mirror
+        of the GUI field maintained by AppContext > plain name lookup.
+        """
+        cfg = self.config
+        if cfg is not None and getattr(cfg, "binary", ""):
+            return cfg.binary
+        pref = getattr(self, "preferred_binary", "") or ""
+        return pref or "llama-server"
+
     # -- discovery ----------------------------------------------------------
     def find_binary(self) -> str | None:
         """Locate a runnable llama-server honouring the user's Tab 2 choice.
 
         Delegates to :mod:`app.core.llamacpp` so discovery, ranking and the
         "preferred path wins" logic live in one place (also used by the
-        'Autodetect' button and startup autoconfiguration).
+        'Autodetect' button and startup autoconfiguration).  Honours the
+        user's Binary: selection even *before* the first ``start()`` - when
+        ``self.config`` is still ``None`` - by consulting the live
+        ``preferred_binary`` mirror kept in sync by :class:`AppContext`.
         """
         from app.core import llamacpp
-        cfg = self.config
-        preferred = cfg.binary if cfg else "llama-server"
-        best = llamacpp.pick_best(preferred)
+        best = llamacpp.pick_best(self._preferred_binary())
         return best["path"] if best else None
 
     def describe_binary_search(self) -> str:
         """Verbose explanation of where we looked - used in error reports."""
         from app.core import llamacpp
-        cfg = self.config
-        cand = (cfg.binary if cfg else "llama-server")
+        cand = self._preferred_binary()
         return (f"preferred='{cand}' plus " +
                 llamacpp.describe_search().replace("\n", "\n             "))
 
