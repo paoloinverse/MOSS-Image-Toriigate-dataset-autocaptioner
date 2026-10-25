@@ -384,17 +384,35 @@ class StorageManager:
         """Locate an already-downloaded copy (Unsloth reuse + own cache)."""
         for d in self.search_dirs(repo_id):
             cand = d / filename
-            if cand.is_file():
-                return cand
+            try:
+                if cand.is_file():
+                    return cand
+            except OSError:
+                # Exotic/FUSE filesystems can raise on stat(); treat this
+                # candidate as absent and keep looking rather than aborting.
+                continue
         if self.mode == STORAGE_UNSLOTH and self.unsloth_root.strip():
             # Last resort: recursive scan of the Unsloth tree (some builds
-            # nest by quant shard folders).  Bounded depth to stay snappy.
+            # nest by quant shard folders).  We walk directories manually
+            # instead of rglob("**/name") because several FUSE-backed mounts
+            # (exFAT/NTFS under /run/media) do not implement the recursive
+            # glob protocol and raise ENOTSUP - previously that made present
+            # files look "missing".  Bounded depth keeps the scan snappy.
+            import os as _os
             for r in self.unsloth_search_roots():
                 try:
-                    for pattern in ("*/*/" + filename, "**/" + filename):
-                        for p in r.glob(pattern):
-                            if p.is_file():
-                                return p
+                    base_depth = str(r).rstrip("/").count("/")
+                    for dirpath, dirnames, filenames_ in _os.walk(
+                            r, topdown=True, onerror=None, followlinks=False):
+                        if dirpath.count("/") - base_depth >= 4:
+                            dirnames[:] = []      # prune deeper levels
+                        if filename in filenames_:
+                            p = Path(dirpath) / filename
+                            try:
+                                if p.is_file():
+                                    return p
+                            except OSError:
+                                continue
                 except OSError:
                     continue
         return None
@@ -416,8 +434,17 @@ class StorageManager:
         seen: set[str] = set()
         for mf in files:
             names = [mf.filename]
-            if mf.mmproj_filename:
-                names.append(mf.mmproj_filename)
+            # Use the fuzzy companion resolver: Unsloth folders often store
+            # the projector under a *different* name than our hardwired
+            # default (e.g. 'mmproj-Model-Q8_0.gguf' vs
+            # 'Model-Q8_0.mmproj.gguf'); matching only the fixed name made
+            # present files look "missing" after switching storage location.
+            try:
+                _, mm_name = mf.resolve_mmproj_companion()
+            except Exception:
+                mm_name = mf.mmproj_filename
+            if mm_name:
+                names.append(mm_name)
             for n in names:
                 if n in seen:
                     continue
@@ -506,18 +533,110 @@ class ModelFile:
             return hit
         return STORAGE.primary_download_dir(self.repo_id) / self.filename
 
-    def mmproj_local_path(self) -> Path | None:
-        if not self.mmproj_filename:
-            return None
-        hit = STORAGE.find_existing(self.repo_id, self.mmproj_filename)
+    def resolve_mmproj_companion(self) -> "tuple[Path | None, str | None]":
+        """Locate this file's vision projector on disk.
+
+        Returns ``(path, filename)`` - ``path`` is an existing file when one
+        can be found, ``filename`` is the best-guess companion name for
+        reporting/downloading even when nothing was found locally.
+
+        Robust to real-world Unsloth layouts where the *projector* is stored
+        under a different name than the hardwired default (e.g. Unsloth
+        ships ``mmproj-ToriiGate-0.5-Q8_0.gguf`` while our registry expects
+        ``ToriiGate-0.5-Q8_0.mmproj.gguf``).  Search order:
+
+        1. the fixed ``mmproj_filename`` via ``find_existing``,
+        2. any already-present ``*mmproj*.gguf`` inside this repo's folders
+           in the active storage (preferring same-quant, then F16/BF16),
+        3. recursive scan of the Unsloth tree (same preference),
+        4. fallback candidate name from the spec (for download planning).
+        """
+        # 1. exact expected name
+        if self.mmproj_filename:
+            hit = STORAGE.find_existing(self.repo_id, self.mmproj_filename)
+            if hit is not None:
+                return hit, self.mmproj_filename
+
+        want = self.quant.upper()
+
+        def _pick(cands: list[Path]) -> Path | None:
+            ggufs = [p for p in cands
+                     if "mmproj" in p.name.lower()
+                     and p.name.lower().endswith(".gguf")]
+            for m in ggufs:                       # same quant first
+                if want and want in m.name.upper():
+                    return m
+            for m in ggufs:                       # then full-precision
+                if "F16" in m.name.upper() or "BF16" in m.name.upper():
+                    return m
+            return ggufs[0] if ggufs else None
+
+        # 2. same folder(s) as the main GGUF / repo dirs in active storage
+        dirs: list[Path] = []
+        main = STORAGE.find_existing(self.repo_id, self.filename)
+        if main is not None:
+            dirs.append(main.parent)
+        for d in STORAGE.search_dirs(self.repo_id):
+            if d not in dirs:
+                dirs.append(d)
+        cands: list[Path] = []
+        for d in dirs:
+            try:
+                if d.is_dir():
+                    cands.extend(sorted(d.glob("*.gguf")))
+            except OSError:
+                continue
+        hit = _pick(cands)
         if hit is not None:
-            return hit
-        return STORAGE.primary_download_dir(self.repo_id) / self.mmproj_filename
+            return hit, hit.name
+
+        # 3. bounded recursive scan of the Unsloth tree (different nesting)
+        if STORAGE.mode == STORAGE_UNSLOTH and STORAGE.unsloth_root.strip():
+            import os as _os
+            all_ggufs: list[Path] = []
+            for r in STORAGE.unsloth_search_roots():
+                try:
+                    base_depth = str(r).rstrip("/").count("/")
+                    for dirpath, dirnames, fnames in _os.walk(
+                            r, topdown=True, followlinks=False):
+                        if dirpath.count("/") - base_depth >= 4:
+                            dirnames[:] = []
+                        for fn in fnames:
+                            if fn.lower().endswith(".gguf"):
+                                all_ggufs.append(Path(dirpath) / fn)
+                except OSError:
+                    continue
+            hit = _pick(all_ggufs)
+            if hit is not None:
+                return hit, hit.name
+
+        # 4. nothing on disk - report the expected name so downloads fetch it
+        expected = self.mmproj_filename
+        if expected is None:
+            specs = _all_specs()
+            spec = next((s for s in specs if s.source_repo == self.repo_id), None)
+            if spec is not None:
+                expected = resolve_mmproj(spec, self)
+        return None, expected
+
+    def mmproj_local_path(self) -> Path | None:
+        path, name = self.resolve_mmproj_companion()
+        if name is not None:
+            # adopt the discovered/expected name so downstream code
+            # (verify_downloaded, server launch, status labels) stays aligned
+            self.mmproj_filename = name
+        return path
 
     def is_downloaded(self) -> bool:
-        ok = self.local_path().is_file()
-        if ok and self.mmproj_filename:
-            mp = self.mmproj_local_path()
+        try:
+            ok = self.local_path().is_file()
+        except OSError:
+            ok = False
+        if ok:
+            # resolve_mmproj_companion searches the whole active storage, so
+            # it finds Unsloth-named projectors even when mmproj_filename is
+            # still unset (BF16 quants) or mismatched.
+            mp, _name = self.resolve_mmproj_companion()
             ok = mp is not None and mp.is_file()
         return ok
 
@@ -581,6 +700,24 @@ def build_registry() -> dict[str, ModelSpec]:
         abliterated=True,
     )
     return {torii.key: torii, qwen.key: qwen}
+
+
+# Process-wide registry.  ModelFile.resolve_mmproj_companion() needs to look
+# up a file's owning spec for fallback naming; AppContext builds its own copy
+# (mutable presets live there), so we expose a shared read-only view here.
+REGISTRY: dict[str, ModelSpec] = build_registry()
+
+
+def _all_specs() -> list[ModelSpec]:
+    """All known specs, preferring the live AppContext registry if present."""
+    try:
+        import app.core.models as _m
+        ctx = getattr(_m, "_ACTIVE_CTX", None)
+        if ctx is not None and getattr(ctx, "registry", None):
+            return list(ctx.registry.values())
+    except Exception:
+        pass
+    return list(REGISTRY.values())
 
 
 # --------------------------------------------------------------------------
