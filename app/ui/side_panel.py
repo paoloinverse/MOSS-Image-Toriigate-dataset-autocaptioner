@@ -22,8 +22,14 @@ class CaptionSidePanel(QWidget):
 
     caption_saved = Signal(str)          # path of the written caption file
 
-    def __init__(self, parent=None):
+    def __init__(self, ctx=None, parent=None):
+        # Accept the AppContext as first positional argument (consistent with
+        # the other tabs); QWidget itself only receives the parent.
+        if ctx is not None and not hasattr(ctx, "log"):
+            # Called as CaptionSidePanel(parent) with a QWidget — treat as parent.
+            ctx, parent = None, ctx
         super().__init__(parent)
+        self.ctx = ctx
         self.current_path: str | None = None
         self.setMinimumWidth(320)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -113,8 +119,34 @@ class CaptionSidePanel(QWidget):
                 written = target + ".txt"
             self.status_label.setText(f"Saved -> {os.path.basename(written)}")
             self.caption_saved.emit(written)
+        except json.JSONDecodeError as exc:
+            msg = (f"Caption looks like JSON but is invalid: {exc}. "
+                   "Fix the syntax or save it as plain text.")
+            self.status_label.setText("Save failed: invalid JSON")
+            if self.ctx is not None:
+                self.ctx.report_error(msg, context="Caption Editor / Save",
+                                      dialog=False)
+            else:
+                self.ctx_log(msg)
+        except OSError as exc:
+            msg = (f"Could not write caption file next to "
+                   f"'{os.path.basename(self.current_path)}': {exc}. "
+                   "Check disk space and folder permissions.")
+            self.status_label.setText("Save failed: I/O error")
+            if self.ctx is not None:
+                self.ctx.report_error(msg, context="Caption Editor / Save",
+                                      dialog=False)
+            else:
+                self.ctx_log(msg)
         except Exception as exc:
             self.status_label.setText(f"Save failed: {exc}")
+            if self.ctx is not None:
+                self.ctx.report_error(exc, context="Caption Editor / Save",
+                                      dialog=False)
+
+    def ctx_log(self, msg: str):
+        if self.ctx is not None:
+            self.ctx.log.emit(f"[panel] {msg}")
 
     # ------------------------------------------------------------------ utils
     @staticmethod
