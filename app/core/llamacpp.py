@@ -121,6 +121,101 @@ def probe_version(path: Path, timeout: float = 4.0) -> str:
     return ""
 
 
+#: Cache of per-binary capability probes (help-output based).  Keyed by
+#: (resolved path, mtime_ns) so recompiles at the same path invalidate it.
+_CAP_CACHE: dict[tuple[str, int], dict[str, bool]] = {}
+
+
+def _run_help(path: str | Path, timeout: float = 8.0) -> str:
+    """Combined stdout+stderr of ``<path> --help`` ('' when unprovable)."""
+    try:
+        r = subprocess.run([str(path), "--help"], capture_output=True,
+                           text=True, timeout=timeout)
+        return (r.stdout or "") + "\n" + (r.stderr or "")
+    except Exception:
+        return ""
+
+
+def _build_info_lines(path: str | Path) -> str:
+    """Version/build-info output lines that list compiled features."""
+    try:
+        r = subprocess.run([str(path), "--version"], capture_output=True,
+                           text=True, timeout=8.0)
+        blob = (r.stdout or "") + "\n" + (r.stderr or "")
+    except Exception:
+        return ""
+    # llama.cpp prints 'feature: BLAS OPENMP CUDA ...' / 'CUDA RR = ...'
+    # style lines; keep only those (the plain version line is not useful).
+    return "\n".join(l for l in blob.splitlines() if ":" in l).lower()
+
+
+def probe_capabilities(path: str | Path) -> dict[str, bool]:
+    """Introspect a llama-server binary before launching it.
+
+    Fixes two classes of launch failures seen in the wild:
+
+    * ``error: invalid argument: --api`` - old llama.cpp builds never had
+      ``--api-key`` (and some builds print exactly this message); passing
+      ``--api`` blindly crashed the server with exit code 1.
+    * ``no usable GPU found, --gpu-layers option will be ignored`` - a build
+      compiled without CUDA silently ran CPU-only.
+
+    Returns ``{"has_api_key": bool, "has_reasoning_budget": bool,
+               "cuda": bool}``.  Every check is conservative: when the
+    binary cannot be probed at all we assume the modern feature exists and
+    GPU support does not, so startup never breaks harder than before.
+    """
+    p = Path(str(path))
+    key: tuple[str, int] | None = None
+    try:
+        key = (str(p.resolve()), p.stat().st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None and key in _CAP_CACHE:
+        return _CAP_CACHE[key]
+
+    help_txt = _run_help(p).lower()
+    info = _build_info_lines(p)
+    if not help_txt and not info:
+        caps = {"has_api_key": True, "has_reasoning_budget": True,
+                "cuda": False}
+    else:
+        def supported(flag: str) -> bool:
+            """True unless --help explicitly lists the flag as unsupported."""
+            for ln in help_txt.splitlines():
+                low = ln.lower()
+                if ("unsupported" in low or "not supported" in low
+                        or "unrecognized" in low):
+                    if flag in low:
+                        return False
+            return True
+
+        has_api_key = ("--api-key" in help_txt) or supported("--api-key")
+        has_rb = ("reasoning-budget" in help_txt) or \
+                 supported("--reasoning-budget")
+        # GPU detection: prefer the explicit feature list printed by
+        # `llama-server --version` ("ggml CUDA_blas", "feature: ... CUDA").
+        # Fall back to linked libraries via ldd (catches older builds whose
+        # version banner omits the feature list).
+        cuda = ("cuda" in info) or ("cuda" in help_txt)
+        if not cuda:
+            ldd = shutil.which("ldd")
+            if ldd:
+                try:
+                    r = subprocess.run([ldd, str(p)], capture_output=True,
+                                       text=True, timeout=8.0)
+                    out = ((r.stdout or "") + (r.stderr or "")).lower()
+                    cuda = ("libcudart" in out or "libcuda.so" in out
+                            or "cublas" in out)
+                except Exception:
+                    pass
+        caps = {"has_api_key": has_api_key, "has_reasoning_budget": has_rb,
+                "cuda": cuda}
+    if key is not None:
+        _CAP_CACHE[key] = caps
+    return caps
+
+
 def classify_backend(version_line: str, path: Path) -> str:
     """Rough 'cuda' | 'rocm' | 'vulkan' | 'metal' | 'cpu' guess."""
     blob = (version_line + " " + str(path)).lower()
@@ -313,11 +408,28 @@ class InstallRunner(QObject):
                            detail="git stage completed; build not started.")
 
         # ---- backend selection ----------------------------------------
+        # Robust GPU-toolchain discovery (the old `shutil.which("nvcc")`-only
+        # check silently produced CPU builds on machines with CUDA installed
+        # outside PATH - e.g. "llama sees none" despite three RTX GPUs).
+        cuda_root = self._find_cuda_root()
+        has_nvcc = self._has_nvcc(cuda_root)
+        has_driver = self._has_nvidia_driver()
         backend = self.backend
         if backend == "auto":
-            backend = "cuda" if self._has_nvcc() else \
-                      ("rocm" if self._has_rocm() else "cpu")
+            if has_nvcc:
+                backend = "cuda"
+            elif self._has_rocm():
+                backend = "rocm"
+            elif self._has_vulkan():
+                backend = "vulkan"
+            else:
+                backend = "cpu"
             self.log.emit(f"[install] auto-detected GPU backend: {backend}")
+        if backend == "cpu" and has_driver:
+            self.log.emit(
+                "[install] WARNING: NVIDIA GPU(s) present but no CUDA "
+                "compiler (nvcc) found -> building CPU-only llama-server; "
+                "GPU offload (-ngl) will be IGNORED by that binary.")
 
         build_flags = {
             "cuda": ["-DGGML_CUDA=ON"],
@@ -325,7 +437,7 @@ class InstallRunner(QObject):
             "vulkan": ["-DGGML_VULKAN=ON"],
             "cpu": [],
         }[backend]
-        if backend == "cuda" and not self._has_nvcc():
+        if backend == "cuda" and not has_nvcc:
             self.log.emit("[install] WARNING: nvcc not found - CUDA-enabled "
                           "build will fail. Falling back to CPU flags would "
                           "lose GPU offload; trying anyway because some distro "
@@ -333,9 +445,15 @@ class InstallRunner(QObject):
 
         build_dir = src / "build"
         jobs = max(1, (os.cpu_count() or 4) // 2)
+        configure_cmd = ["cmake", "-S", str(src), "-B", str(build_dir),
+                        "-DCMAKE_BUILD_TYPE=Release"] + build_flags
+        if backend == "cuda" and cuda_root and \
+                not shutil.which("nvcc"):
+            # nvcc exists only inside the CUDA toolkit root: hand it to cmake.
+            configure_cmd.append(f"-DCMAKE_CUDA_COMPILER="
+                                 f"{cuda_root / 'bin' / 'nvcc'}")
         self.log.emit(f"[install] configuring ({' '.join(build_flags) or 'CPU'}) …")
-        self._stream(["cmake", "-S", str(src), "-B", str(build_dir),
-                      "-DCMAKE_BUILD_TYPE=Release"] + build_flags)
+        self._stream(configure_cmd)
         if self._cancel.is_set():
             raise AppError("Installation cancelled by user",
                            detail="configure completed; compile skipped.")
@@ -358,17 +476,88 @@ class InstallRunner(QObject):
                              "ROCm), RAM exhaustion during parallel compile "
                              "(retry with fewer jobs), or cmake too old."])
         ver = probe_version(bin_path)
+        caps = probe_capabilities(bin_path)
         self.log.emit(f"[install] SUCCESS: {bin_path}"
                       + (f"  [{ver}]" if ver else ""))
+        # ---- verify the compiled binary really has the requested backend --
+        if backend in ("cuda", "rocm", "vulkan") and not caps["cuda"]:
+            self.log.emit(
+                f"[install] WARNING: the compiled llama-server does NOT list "
+                f"{backend.upper()} support (see the 'ggml ...' feature lines "
+                "above). It will run CPU-only and ignore -ngl.")
+            self.log.emit(
+                "[install] hint: install the CUDA toolkit (e.g. "
+                "'sudo apt install nvidia-cuda-toolkit' or from developer.nvidia.com) "
+                "and press 'Auto-install / build' again; the existing checkout "
+                "is re-used so only the compile step repeats.")
+        elif backend == "cuda":
+            self.log.emit("[install] verified: binary advertises CUDA support "
+                          "- GPU offload (-ngl) will work.")
         self.finished.emit(True, str(bin_path))
 
     # ------------------------------------------------------------- helpers
-    def _has_nvcc(self) -> bool:
-        return shutil.which("nvcc") is not None or \
-            Path("/usr/local/cuda/bin/nvcc").exists()
+    def _find_cuda_root(self) -> Path | None:
+        """First plausible CUDA toolkit root (contains bin/nvcc)."""
+        candidates: list[str] = []
+        for env in ("CUDA_PATH", "CUDAHOME", "CUDA_HOME"):
+            v = os.environ.get(env)
+            if v:
+                candidates.append(v)
+        candidates.append("/usr/local/cuda")
+        try:
+            base = Path("/usr/local")
+            if base.is_dir():
+                candidates += sorted((str(d) for d in base.glob("cuda-*")),
+                                     reverse=True)   # newest first
+        except OSError:
+            pass
+        for c in candidates:
+            p = Path(c)
+            if (p / "bin" / _exe("nvcc")).is_file():
+                return p
+        return None
+
+    def _has_nvcc(self, cuda_root: Path | None = None) -> bool:
+        """nvcc anywhere: on PATH *or* inside a discovered CUDA toolkit root.
+
+        The previous implementation only checked ``shutil.which('nvcc')`` and
+        a hard-coded ``/usr/local/cuda/bin/nvcc``, so toolkits installed at
+        ``/usr/local/cuda-12.x`` or outside PATH were missed and the guided
+        build silently fell back to CPU-only compilation.
+        """
+        if shutil.which("nvcc") is not None:
+            return True
+        if cuda_root is None:
+            cuda_root = self._find_cuda_root()
+        return cuda_root is not None
+
+    def _has_nvidia_driver(self) -> bool:
+        """True when an NVIDIA kernel driver is loaded (GPU actually usable)."""
+        if shutil.which("nvidia-smi") is not None:
+            return True
+        try:
+            return Path("/proc/driver/nvidia/version").exists()
+        except OSError:
+            return False
 
     def _has_rocm(self) -> bool:
         return shutil.which("hipcc") is not None or Path("/opt/rocm").is_dir()
+
+    def _has_vulkan(self) -> bool:
+        """Vulkan loader availability (fallback GPU path when CUDA is absent)."""
+        try:
+            r = subprocess.run(["vulkaninfo", "--summary"], capture_output=True,
+                               text=True, timeout=8.0)
+            if "device" in ((r.stdout or "") + (r.stderr or "")).lower():
+                return True
+        except Exception:
+            pass
+        for lib in ("/lib/x86_64-linux-gnu/libvulkan.so.1",
+                    "/usr/lib64/libvulkan.so.1",
+                    "/usr/lib/libvulkan.so.1"):
+            if Path(lib).exists():
+                return True
+        return False
 
     def _run_capture(self, cmd: list[str], timeout: float = 8.0) -> str:
         try:
