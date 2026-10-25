@@ -206,6 +206,74 @@ QUANT_BITS = {
 
 
 # ---------------------------------------------------------------------------
+# Per-model run-out-of-the-box profiles
+# ---------------------------------------------------------------------------
+#: Valid llama.cpp ``--cache-type-k/-v`` values surfaced in Tab 2 (incl. bf16).
+KV_CACHE_TYPES = ("f16", "bf16", "q8_0", "fp8", "q4_0", "iq4_nl")
+
+
+@dataclass(frozen=True)
+class ThinkingLevel:
+    """One named reasoning/thinking option for a model family."""
+    key: str                 # "" = disabled | "low" | "medium" | "high"
+    label: str               # GUI text
+    budget: int              # reasoning-budget tokens (server + payload)
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    """Run-out-of-the-box configuration preset for one supported model.
+
+    Holds the model-specific defaults Tab 2 used to lack: recommended KV
+    cache type, per-quant context hard limits (the KV-cache size cap),
+    thinking-level options and sane sampling defaults.
+    """
+    max_context_by_quant: dict = field(default_factory=dict)
+    default_cache_type: str = "q8_0"
+    thinking_levels: tuple = ()
+    default_thinking: str = ""
+    temperature: float = 1.0
+    top_p: float = 0.95
+    top_k: int = 40
+    min_p: float = 0.05
+    note: str = ""
+
+
+_QWEN_THINKING_LEVELS = (
+    ThinkingLevel("", "Off (no thinking)", 0),
+    ThinkingLevel("low", "Low  (~1K reasoning tokens)", 1024),
+    ThinkingLevel("medium", "Medium  (~4K reasoning tokens)", 4096),
+    ThinkingLevel("high", "High  (~16K reasoning tokens)", 16384),
+)
+
+MODEL_PROFILES: dict[str, ModelProfile] = {
+    "toriigate": ModelProfile(
+        max_context_by_quant={"BF16": 16384, "Q8_0": 32768},
+        default_cache_type="q8_0",
+        thinking_levels=_QWEN_THINKING_LEVELS,
+        default_thinking="low",
+        temperature=1.0, top_p=0.95, top_k=40, min_p=0.05,
+        note="ToriiGate-0.5 is a Qwen3-VL-based captioner: thinking levels "
+             "map to --reasoning-budget; its chat template honours "
+             "enable_thinking."),
+    "qwen3.8-27b": ModelProfile(
+        max_context_by_quant={"Q8_0": 32768, "Q6_K": 65536,
+                              "UD-IQ4_XS": 131072},
+        default_cache_type="q8_0",
+        thinking_levels=_QWEN_THINKING_LEVELS,
+        default_thinking="medium",
+        temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
+        note="Qwen3-family hybrid thinker: 'thinking' needs enable_thinking "
+             "in the request plus --reasoning-budget on the server."),
+}
+
+
+def get_model_profile(key: str | None) -> ModelProfile:
+    """Profile for a registry key; neutral fallback for unknown models."""
+    return MODEL_PROFILES.get(key or "", ModelProfile())
+
+
+# ---------------------------------------------------------------------------
 # Storage-location management (default app cache vs Unsloth-desktop folder)
 # ---------------------------------------------------------------------------
 STORAGE_DEFAULT = "default"
@@ -1086,7 +1154,12 @@ class ArchInfo:
         return max(1, self.num_kv_heads)
 
     def kv_bytes_per_token(self, cache_type: str) -> int:
-        """Per-token KV footprint after quantisation (f16/q8_0/q4_0/fp8)."""
+        """Per-token KV footprint after quantisation.
+
+        Supported llama.cpp cache types: f16 / bf16 (both 16-bit), fp8,
+        q8_0, q4_0, q4_1, iq4_nl.  Unknown names fall back to the f16 size
+        (conservative - plans more VRAM usage, never less).
+        """
         base = self.kv_bytes_per_token_f16
         factor = {
             "f16": 1.0, "bf16": 1.0,
@@ -1095,7 +1168,7 @@ class ArchInfo:
             "q4_0": 0.265,    # 4.5 bits effective
             "q4_1": 0.289,
             "iq4_nl": 0.26,
-        }.get(cache_type.lower(), 1.0)
+        }.get((cache_type or "f16").lower(), 1.0)
         return int(base * factor)
 
 

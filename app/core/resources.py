@@ -105,15 +105,21 @@ def _file_size_mb(path) -> float:
 
 def plan_resources(hw: HardwareManager, model_file: ModelFile,
                    arch: ArchInfo, cache_type: str = "q8_0",
-                   mmproj_path=None) -> ResourcePlan:
+                   mmproj_path=None, max_context: int | None = None) -> ResourcePlan:
     """Compute ``-c`` and ``-ngl`` for the current hardware/model selection.
+
+    ``max_context`` is the per-model/per-quant hard cap coming from the
+    model profile (see app.core.models.MODEL_PROFILES); when given it wins
+    over the global :data:`MAX_CONTEXT_CAP`, so each model gets its own
+    KV-cache size limit instead of one generic ceiling.
 
     Raises :class:`ResourcePlanError` (with verbose detail + fix suggestions)
     when the inputs are invalid so callers can report actionable messages
     instead of crashing or silently producing nonsense plans.
     """
     try:
-        return _plan_resources_inner(hw, model_file, arch, cache_type, mmproj_path)
+        return _plan_resources_inner(hw, model_file, arch, cache_type,
+                                     mmproj_path, max_context)
     except ResourcePlanError:
         raise
     except Exception as exc:
@@ -124,7 +130,7 @@ def plan_resources(hw: HardwareManager, model_file: ModelFile,
 
 def _plan_resources_inner(hw: HardwareManager, model_file: ModelFile,
                           arch: ArchInfo, cache_type: str,
-                          mmproj_path) -> ResourcePlan:
+                          mmproj_path, max_context: int | None = None) -> ResourcePlan:
     # ---- input validation (verbose, actionable) ---------------------------
     if model_file is None:
         raise ResourcePlanError(
@@ -234,7 +240,13 @@ def _plan_resources_inner(hw: HardwareManager, model_file: ModelFile,
 
     max_tokens = int(remaining * 1024 * 1024 // kv_bpt)
     ctx = (max_tokens // 1024) * 1024   # largest multiple of 1024 that fits
-    ctx = max(MIN_CONTEXT, min(ctx, MAX_CONTEXT_CAP))
+    cap = MAX_CONTEXT_CAP
+    if max_context and max_context > 0:
+        cap = min(cap, int(max_context))
+        plan.notes.append(
+            f"Model-profile context cap for this quant: {int(max_context)} "
+            f"tokens (-c will not exceed it).")
+    ctx = max(MIN_CONTEXT, min(ctx, cap))
     plan.context_tokens = ctx
     plan.notes.append(
         f"Available VRAM after weights+{KV_OVERHEAD_MB}MB overhead: "

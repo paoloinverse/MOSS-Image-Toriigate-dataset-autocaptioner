@@ -41,6 +41,7 @@ class ServerConfig:
     tensor_split: str = ""           # e.g. "50,50"
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
+    reasoning_budget: int = 0        # --reasoning-budget (thinking level)
     extra_args: str = ""             # raw passthrough from Tab 2
     explicit_mode: bool = False      # disables safety-system prompts
     binary: str = "llama-server"
@@ -112,6 +113,7 @@ class ServerManager(QObject):
     # -- argv construction ---------------------------------------------------
     def build_args(self, cfg: ServerConfig) -> list[str]:
         binary = self.find_binary() or cfg.binary
+        caps = llamacpp.probe_capabilities(binary)
         args = [binary]
         if cfg.model:
             args += ["-m", str(cfg.model.local_path())]
@@ -135,13 +137,32 @@ class ServerManager(QObject):
         if selected:
             args += ["--cache-type-k", cfg.cache_type_k,
                      "--cache-type-v", cfg.cache_type_v]
+        # Thinking level -> server-side reasoning budget (Qwen3-family);
+        # skipped when the binary predates the flag (older llama.cpp builds
+        # reject it with 'invalid argument' and exit 1).
+        if getattr(cfg, "reasoning_budget", 0) > 0:
+            if caps["has_reasoning_budget"]:
+                args += ["--reasoning-budget", str(cfg.reasoning_budget)]
+            else:
+                self.log.emit("[server] WARNING: this llama-server does not "
+                              "support --reasoning-budget - thinking levels "
+                              "are request-only (enable_thinking in payload).")
         if cfg.explicit_mode:
             # Disable safety-system prompts server-side; the explicit trigger
             # sentence itself is injected into the system prompt by presets.
             args += ["-sp", ""]      # empty built-in system prompt
         args += ["--host", cfg.host, "--port", str(cfg.port)]
-        args += ["--api", "-af"]      # enable /completions API + autoplay flash attn
-
+        # Auth token for the API endpoints: the real flag is --api-key.
+        # Bare `--api` was rejected by older builds ("error: invalid
+        # argument: --api" -> exit code 1), so probe before passing it.
+        if caps["has_api_key"]:
+            args += ["--api-key", ""]
+        else:
+            self.log.emit("[server] NOTE: this llama-server has no --api-key "
+                          "option (old build) - starting without an API "
+                          "token; consider re-building via 'Auto-install / "
+                          "build' for security updates.")
+        args += ["-af"]      # autoplay flash attention
         if cfg.extra_args.strip():
             args += cfg.extra_args.split()
         return args
