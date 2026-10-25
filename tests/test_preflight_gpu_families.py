@@ -40,6 +40,9 @@ def scenario(name, *, pci_map, nv_driver, amdgpu, has_nvcc=True, has_hipcc=False
     type(r)._amdgpu_driver_loaded = staticmethod(lambda self_=None, _v=amdgpu: _v)
     r._find_cuda_root = lambda: Path("/usr/local/cuda") if has_nvcc else None
     r._has_nvcc = lambda root=None: has_nvcc
+    # The new cuBLAS-dev verification must not touch the real filesystem in
+    # these GPU-family scenarios (covered separately by test_cublas_preflight).
+    r._missing_cuda_libs = lambda root: []
     r._find_rocm_root = lambda: Path("/opt/rocm")
     import shutil as _sh
     _orig_which=_sh.which
