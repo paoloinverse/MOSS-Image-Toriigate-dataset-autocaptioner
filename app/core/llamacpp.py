@@ -9,9 +9,15 @@ the full path into Tab 2 - error-prone when it is not on PATH.  This module:
 * :func:`pick_best_binary`   - ranks discoveries (explicit user choice wins,
   then CUDA > ROCm/Vulkan > plain-CPU builds).
 * :class:`InstallRunner`     - QObject worker that clones + compiles llama.cpp
-  in a QThread with live log streaming, so the GUI never freezes during the
-  (minutes-long) build.  Everything heavy is behind an explicit user click
-  with a confirmation dialog - nothing here downloads or compiles silently.
+  in a background thread with live log streaming, so the GUI never freezes
+  during the (minutes-long) build.  Its :meth:`preflight` enforces the staged
+  order: base build tools first, GPU family via PCI enumeration (/sys/bus/pci)
+  second, vendor toolchain (nvcc / ROCm / Vulkan SDK) third; only when every
+  stage passes does the GUI ask for an install folder and start the clone ->
+  configure -> compile sequence.  Missing toolchains HALT with copy-pasteable
+  distro commands instead of silently degrading to CPU-only builds.
+  Everything heavy is behind an explicit user click with a confirmation
+  dialog - nothing here downloads or compiles silently.
 
 No huge allocations, no network access at import time; every failure surfaces
 as :class:`~app.core.models.AppError` with a verbose reason + fix report.
@@ -360,6 +366,24 @@ def detect_pkg_manager() -> str | None:
     return None
 
 
+#: Ubuntu-family ids in /etc/os-release ID / ID_LIKE (copy-pasteable apt lines
+#: are only promised for these; other distros get per-manager commands too).
+_UBUNTU_FAMILY = ("ubuntu", "xubuntu", "kubuntu", "lubuntu", "mint", "pop",
+                  "zorin", "elementary", "linuxmint")
+
+
+def is_ubuntu_family() -> bool:
+    """True when the OS identifies as Ubuntu (or an Ubuntu derivative)."""
+    try:
+        txt = Path("/etc/os-release").read_text(errors="replace").lower()
+    except OSError:
+        return False
+    ids: list[str] = []
+    for m in re.finditer(r'^(?:ID|ID_LIKE)=(.*)$', txt, re.M):
+        ids += m.group(1).strip('"').split()
+    return any(i in _UBUNTU_FAMILY for i in ids)
+
+
 def _install_verb(mgr: str) -> str:
     return {"apt": "sudo apt install",
             "dnf": "sudo dnf install",
@@ -387,6 +411,114 @@ def fix_command(group: str, mgr: str | None = None) -> str:
             f"(sudo …): {listed}")
 
 
+def manual_hint(group: str) -> str:
+    """Software names to install manually when no package manager was found."""
+    listed = ", ".join(sorted({p for lst in _FIX_PACKAGES.get(group, {}).values()
+                               for p in lst}))
+    return (f"No supported package manager detected - install these manually "
+            f"for your distro: {listed}")
+
+
+# ---------------------------------------------------------------------------
+# Preflight: base build tools, GPU family (PCI enumeration), vendor toolchains
+# ---------------------------------------------------------------------------
+#: PCI class prefix for display controllers ("0x0300xx": VGA-compatible and
+#: 3D controller) - used by /sys/bus/pci enumeration below.
+_PCI_DISPLAY_CLASS_PREFIX = "0x03"
+#: Well-known GPU vendor PCI IDs: 0x10de NVIDIA, 0x1002 AMD/ATI,
+#: 0x8086 Intel (iGPU - usable through the Vulkan backend).
+_GPU_VENDOR_IDS = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}
+
+
+def enumerate_gpu_families() -> set[str]:
+    """Hardware-level GPU vendor enumeration - *not* toolkit based.
+
+    Walks ``/sys/bus/pci/devices/*/class`` + ``vendor`` and maps display
+    controllers to 'nvidia' | 'amd' | 'intel'.  This works even when no
+    driver, CUDA toolkit or ROCm stack is installed (which is precisely the
+    case where the old ``shutil.which('nvcc')``-style probing silently
+    degraded the guided build to CPU-only).  Non-Linux / unreadable sysfs
+    yields an empty set; callers then fall back to toolkit-based detection.
+    """
+    families: set[str] = set()
+    base = Path("/sys/bus/pci/devices")
+    try:
+        devs = sorted(base.iterdir()) if base.is_dir() else []
+    except OSError:
+        return families
+    for d in devs:
+        try:
+            cls = (d / "class").read_text().strip().lower()
+            if not cls.startswith(_PCI_DISPLAY_CLASS_PREFIX):
+                continue
+            ven = (d / "vendor").read_text().strip().lower()
+            fam = _GPU_VENDOR_IDS.get(ven)
+            if fam:
+                families.add(fam)
+        except OSError:
+            continue
+    return families
+
+
+class PreflightError(AppError):
+    """Raised by :meth:`InstallRunner.preflight` - carries ready-to-run fixes.
+
+    ``commands`` holds copy-pasteable shell lines (they need sudo/root, so we
+    only *offer* them); ``manual`` holds software names for systems without a
+    supported package manager.  The Tab 2 handler renders both verbatim.
+    """
+
+    prefix = "[install]"
+
+    def __init__(self, message: str, detail: str = "", suggestions=None,
+                 commands=None, manual=None):
+        super().__init__(message, detail=detail, suggestions=suggestions)
+        self.commands: list[str] = list(commands or [])
+        self.manual: list[str] = list(manual or [])
+
+    def report(self) -> str:
+        base = super().report()
+        if self.commands:
+            base += ("\n    run    : copy-paste into a terminal (needs "
+                     "sudo/root):"
+                     + "".join(f"\n             $ {c}" for c in self.commands))
+        for hint in self.manual:
+            base += f"\n    note   : {hint}"
+        return base
+
+
+class PreflightResult:
+    """Outcome of :meth:`InstallRunner.preflight` (all cheap checks, no I/O).
+
+    Attributes:
+        ok: True when a build can proceed.
+        error: :class:`PreflightError` describing what blocks the build.
+        gpu_families: hardware-enumerated vendors ('nvidia'/'amd'/'intel').
+        backend: validated backend to build ('cuda'|'rocm'|'vulkan'|'cpu').
+        reason: one-line human summary of how ``backend`` was chosen.
+    """
+
+    def __init__(self):
+        self.ok = False
+        self.error: PreflightError | None = None
+        self.gpu_families: set[str] = set()
+        self.backend = "cpu"
+        self.reason = ""
+
+    @property
+    def commands(self) -> list[str]:
+        return self.error.commands if self.error else []
+
+    @property
+    def manual(self) -> list[str]:
+        return self.error.manual if self.error else []
+
+
+#: Disk footprint per backend (GiB): shallow clone ~0.4 + build tree.  CUDA
+#: compiles far larger objects (ptxas embeds per-arch cubins) than CPU.
+_DISK_GB_BY_BACKEND = {"cuda": 8.0, "rocm": 5.0, "vulkan": 4.0, "cpu": 3.0}
+
+
 # ---------------------------------------------------------------------------
 # Guided installation (clone + cmake build) - runs inside a QThread
 # ---------------------------------------------------------------------------
@@ -396,6 +528,11 @@ class InstallRunner(QObject):
     Signals:
         log(str)         - progress lines for the GUI log box
         finished(bool, str) - success flag + final message (report on failure)
+
+    Usage contract (Tab 2 'Auto-install / build'): the GUI calls
+    :meth:`preflight` *before* asking the user anything; only when it returns
+    ``ok`` does it prompt for the install folder and start :meth:`start`.
+    ``preflight`` never raises - inspect ``result.ok`` / ``result.error``.
     """
 
     log = Signal(str)
@@ -409,6 +546,7 @@ class InstallRunner(QObject):
         self.dest = Path(os.path.expanduser(str(dest_root)))
         self.backend = backend          # auto | cuda | rocm | vulkan | cpu
         self._cancel = threading.Event()
+        self._preflight: PreflightResult | None = None
 
     # ------------------------------------------------------------- public
     def cancel(self):
@@ -416,44 +554,193 @@ class InstallRunner(QObject):
         self.log.emit("[install] cancellation requested - stopping after the "
                       "current build step finishes.")
 
-    def check_prerequisites(self) -> tuple[bool, list[str]]:
-        """Verify git/cmake/compiler availability (no heavy work).
+    # -------------------------------------------------------- preflight
+    def preflight(self) -> PreflightResult:
+        """Run the full staged pre-install validation *without* side effects.
 
-        Each missing tool is reported together with a copy-pasteable install
-        command for the detected distro's package manager - the caller (and
-        the GUI preflight dialog) can surface these directly to the user,
-        who most likely needs privileged access to run them.
+        Stage order (each stage halts hard before the next one runs, so the
+        user is never asked for a folder while the toolchain is broken):
+
+        1. Base build tools: git, cmake (>= 3.14) and a C++ compiler.
+           Missing -> stop with distro-specific copy-pasteable commands.
+        2. GPU family by PCI enumeration (/sys/bus/pci), NOT by toolkit
+           presence - a bare NVIDIA machine with no CUDA SDK still gets
+           detected as 'nvidia' instead of silently building CPU-only.
+        3. Vendor toolchain for the detected family (nvcc for NVIDIA,
+           hipcc/ROCm for AMD, full Vulkan SDK for Intel/AMD iGPUs).
+           Missing -> stop with guidance; NO silent degradation to CPU.
+        4. Backend selection + disk estimate based on the validated backend.
+
+        The result is cached on ``self._preflight`` and reused by :meth:`run`
+        (re-call explicitly to refresh after the user installs packages).
         """
+        res = PreflightResult()
+        err = self._check_base_tools()
+        if err:
+            res.error = err
+            self._preflight = res
+            return res
+
+        # -- Stage 2: hardware GPU family (PCI IDs, driver-independent) -----
+        hw = enumerate_gpu_families()
+        has_nv_driver = self._has_nvidia_driver()
+        rocm_present = self._has_rocm()
+        # On non-Linux (or empty sysfs) fall back to toolkit/driver evidence.
+        if not hw:
+            if has_nv_driver:
+                hw.add("nvidia")
+            if rocm_present:
+                hw.add("amd")
+        res.gpu_families = hw
+
+        # -- Stage 3: vendor-specific toolchain must match the hardware -----
+        cuda_root = self._find_cuda_root()
+        has_nvcc = self._has_nvcc(cuda_root)
+        vulkan_ready = self._has_vulkan()
+        want = self.backend if self.backend != "auto" else None
+
+        blocked: list[tuple[str, str]] = []     # (reason, fix package group)
+        forced_cpu = os.environ.get("APPCAP_LLAMA_FORCE_CPU") == "1"
+        if "nvidia" in hw and not has_nvcc and not forced_cpu:
+            # Hardware present but no CUDA compiler anywhere -> HALT.  The old
+            # behaviour silently built a CPU-only binary whose -ngl flags were
+            # ignored; users only noticed hours later via out-of-RAM runs.
+            detail = ("no kernel driver detected either (nvidia-smi / "
+                      "/proc/driver/nvidia absent), so the GPU is unusable "
+                      "as-is" if not has_nv_driver else
+                      "the NVIDIA driver is loaded, only the toolkit is "
+                      "missing")
+            blocked.append((
+                f"NVIDIA GPU(s) present but no CUDA compiler (nvcc) found - "
+                f"{detail}", "cuda"))
+        if "amd" in hw and not rocm_present and not forced_cpu:
+            blocked.append((
+                "AMD GPU(s) present but no ROCm/HIP toolchain found "
+                "(hipcc missing, /opt/rocm absent)", "rocm"))
+        if want == "vulkan" and not vulkan_ready and not forced_cpu:
+            blocked.append((
+                "Vulkan backend requested but the development SDK is "
+                "incomplete (needs libvulkan.so, vulkan/vulkan.h, glslc)",
+                "vulkan"))
+
+        if blocked:
+            groups = list(dict.fromkeys(g for _, g in blocked))
+            mgr = detect_pkg_manager()
+            cmds = [fix_command(g, mgr) for g in groups]
+            manuals = ([manual_hint(g) for g in groups] if mgr is None
+                       else ([] if is_ubuntu_family() else
+                             [f"Package manager detected: {mgr}"]))
+            res.error = PreflightError(
+                "Vendor GPU toolchain incomplete - refusing to build",
+                detail="; ".join(r for r, _ in blocked)
+                       + ". Building CPU-only would silently ignore -ngl, "
+                         "so the install was stopped before any download.",
+                suggestions=["Install the packages above (requires "
+                             "sudo/root), then press 'Auto-install / build' "
+                             "again.",
+                             "Or point the 'Binary:' field at an existing "
+                             "llama-server ('Autodetect' / 'Browse…') and "
+                             "skip building entirely.",
+                             "Only if you really want a CPU-only build: set "
+                             "APPCAP_LLAMA_FORCE_CPU=1 before launching."],
+                commands=cmds,
+                manual=manuals if mgr is None else [])
+            self._preflight = res
+            return res
+
+        # -- Stage 4: choose the backend -------------------------------------
+        if os.environ.get("APPCAP_LLAMA_FORCE_CPU") == "1":
+            res.backend, res.reason = "cpu", "CPU forced via APPCAP_LLAMA_FORCE_CPU=1"
+        elif want:
+            res.backend, res.reason = want, f"explicitly requested {want.upper()}"
+        elif "nvidia" in hw and has_nvcc:
+            res.backend, res.reason = "cuda", "NVIDIA GPU + CUDA toolkit (nvcc)"
+        elif "amd" in hw and rocm_present:
+            res.backend, res.reason = "rocm", "AMD GPU + ROCm/HIP toolchain"
+        elif hw and vulkan_ready:
+            res.backend, res.reason = "vulkan", "GPU present, Vulkan SDK complete"
+        elif not hw:
+            res.backend, res.reason = "cpu", "no GPU detected in /sys/bus/pci"
+        else:
+            # Unreachable: `blocked` above already stops this case.
+            res.error = PreflightError(
+                f"No usable toolchain for the detected GPU family "
+                f"({', '.join(sorted(hw))})",
+                detail="Stage-3 verification unexpectedly passed anyway.",
+                suggestions=["Report this as a bug - include the '[install]' "
+                             "log lines."])
+            self._preflight = res
+            return res
+        res.ok = True
+        self._preflight = res
+        return res
+
+    # ------------------------------------------------------ stage-1 helper
+    def _check_base_tools(self) -> "PreflightError | None":
+        """Verify git, cmake (>=3.14) and a C++ compiler; no heavy work."""
         mgr = detect_pkg_manager()
-        verb = _install_verb(mgr) if mgr else "sudo apt install"
-        missing = []
-        for tool, pkg in (("git", "git"), ("cmake", "cmake"),
-                          ("g++", "build-essential")):
+        missing: list[str] = []
+        for tool in ("git", "cmake"):
             if shutil.which(tool) is None:
-                # 'g++' lives in build-essential/gcc-c++, not a package named
-                # 'g++' on every distro - map it through the buildtools group.
-                if tool == "g++":
-                    pkgs = (_FIX_PACKAGES["buildtools"].get(mgr)
-                            if mgr else ["build-essential"]) or []
-                    compilers = [p for p in pkgs
-                                 if p in ("build-essential", "gcc-c++", "gcc")]
-                    inst = f"{verb} {' '.join(compilers)}" if compilers \
-                        else fix_command("buildtools", mgr)
-                else:
-                    inst = f"{verb} {pkg}"
-                missing.append(f"{tool}  (fix: {inst})")
+                missing.append(tool)
+        # Accept either g++ or clang++ as the C++ compiler.
+        if shutil.which("g++") is None and shutil.which("clang++") is None:
+            missing.append("g++ (or clang++)")
         if missing:
-            return False, missing
+            cmds = [fix_command("buildtools", mgr)] if mgr else []
+            return PreflightError(
+                "Base build tools missing: " + ", ".join(missing),
+                detail=("llama.cpp is compiled from source, so git, cmake and "
+                        "a C++ compiler are mandatory before anything else."),
+                suggestions=(["Install them with the command above, then "
+                              "press 'Auto-install / build' again."] if mgr
+                             else ["Install git, cmake and a C++ compiler "
+                                   "manually for your system, then retry."]),
+                commands=cmds,
+                manual=[] if mgr else [manual_hint("buildtools")])
         v = self._run_capture(["cmake", "--version"])
         m = re.search(r"(\d+)\.(\d+)", v)
         if m and (int(m.group(1)), int(m.group(2))) < (3, 14):
-            return False, [f"cmake {m.group(0)} is too old (need >= 3.14); "
-                           "upgrade via pip or Kitware's APT repo"]
-        return True, []
+            return PreflightError(
+                f"cmake {m.group(0)} is too old (llama.cpp needs >= 3.14)",
+                detail="newer cmake required for the GGML_* build options",
+                suggestions=["Upgrade cmake, e.g.: pip install --user "
+                             "--upgrade cmake  (then make sure ~/.local/bin "
+                             "is on PATH), or use your distro's updated "
+                             "package / Kitware's APT repo."])
+        return None
+
+    #: Backwards-compatible alias (older call sites / tests).
+    def check_prerequisites(self) -> tuple[bool, list[str]]:
+        """Legacy two-value form of :meth:`preflight` (stage 1 only)."""
+        err = self._check_base_tools()
+        if err is None:
+            return True, []
+        items = [f"{t}  (fix: {c})" for t, c in
+                 zip(self._missing_tool_names(), err.commands or ["see hint"])]
+        return False, items
+
+    @staticmethod
+    def _missing_tool_names() -> list[str]:
+        out = []
+        for tool in ("git", "cmake"):
+            if shutil.which(tool) is None:
+                out.append(tool)
+        if shutil.which("g++") is None and shutil.which("clang++") is None:
+            out.append("g++ (or clang++)")
+        return out
 
     def required_disk_gb(self) -> float:
-        """Rough free space needed: shallow clone (~0.4 GiB) + build tree."""
-        return 3.0
+        """Free space needed for the *validated* backend (default: worst case).
+
+        Called after :meth:`preflight` in the GUI flow, so the confirmation
+        dialog shows the number that matches the backend actually about to be
+        built (CUDA trees dwarf CPU ones); before preflight it conservatively
+        reports the largest value.
+        """
+        if self._preflight is not None and self._preflight.ok:
+            return _DISK_GB_BY_BACKEND.get(self._preflight.backend, 3.0)
+        return max(_DISK_GB_BY_BACKEND.values())
 
     # ------------------------------------------------------------- worker
     def start(self):
@@ -474,17 +761,22 @@ class InstallRunner(QObject):
     def _run(self):
         self.log.emit(f"[install] guided llama.cpp install -> {self.dest}")
 
-        ok, missing = self.check_prerequisites()
-        if not ok:
-            raise AppError(
-                "Build toolchain incomplete - cannot compile llama.cpp",
-                detail="missing: " + "; ".join(missing),
-                suggestions=["Install the listed packages (sudo apt install …) "
-                             "and press 'Auto-install / build' again.",
-                             "Or point Tab 2 'Binary:' at an existing "
-                             "llama-server and skip building entirely."])
+        # ---- preflight (stages 1-4) ---------------------------------------
+        # Re-run it here even though the GUI already did: this thread is also
+        # the safety net for any caller that skipped the dialog-side checks,
+        # and it re-validates the environment after possible user changes.
+        pf = self.preflight()
+        if not pf.ok:
+            assert pf.error is not None
+            raise pf.error
+        backend = pf.backend
+        cuda_root = self._find_cuda_root()   # reused for -DCMAKE_CUDA_COMPILER
+        self.log.emit(f"[install] backend: {backend} "
+                      f"({pf.reason}; GPU families seen: "
+                      f"{', '.join(sorted(pf.gpu_families)) or 'none'})")
 
-        # Disk-space preflight BEFORE any bytes hit the wire.
+        # Disk-space preflight BEFORE any bytes hit the wire; the estimate now
+        # matches the backend that was just validated (CUDA needs ~8 GiB).
         probe_dir = self.dest.parent if self.dest.parent.exists() else Path("/")
         try:
             free_gb = shutil.disk_usage(probe_dir).free / 1024 ** 3
@@ -522,117 +814,12 @@ class InstallRunner(QObject):
             raise AppError("Installation cancelled by user",
                            detail="git stage completed; build not started.")
 
-        # ---- backend selection + missing-package detection --------------
-        # Robust GPU-toolchain discovery (the old `shutil.which("nvcc")`-only
-        # check silently produced CPU builds on machines with CUDA installed
-        # outside PATH - e.g. "llama sees none" despite three RTX GPUs).
-        cuda_root = self._find_cuda_root()
-        has_nvcc = self._has_nvcc(cuda_root)
-        has_driver = self._has_nvidia_driver()
-        rocm_ready = self._has_rocm()
-        vulkan_ready = self._has_vulkan()
-        backend = self.backend
-        if backend == "auto":
-            if has_nvcc:
-                backend = "cuda"
-            elif rocm_ready:
-                backend = "rocm"
-            elif vulkan_ready:
-                backend = "vulkan"
-            else:
-                backend = "cpu"
-            self.log.emit(f"[install] auto-detected GPU backend: {backend}")
-
-        # Collect every *missing development package* that blocks a GPU
-        # backend, so the user gets copy-pasteable 'sudo …' command lines
-        # instead of a cascaded cmake compile error (e.g. NVIDIA GPUs present
-        # but nvcc absent, or a Vulkan runtime loader without its SDK).
-        missing_gpu_pkgs: list[tuple[str, str]] = []   # (reason, fix group)
-        if has_driver and not has_nvcc:
-            missing_gpu_pkgs.append(
-                ("NVIDIA GPU(s) detected but no CUDA compiler (nvcc) found",
-                 "cuda"))
-        if has_driver and not vulkan_ready:
-            vk_missing = [name for name, ok in (
-                    ("Vulkan SDK library (libvulkan.so)",
-                     self._vulkan_lib_dir() is not None),
-                    ("Vulkan headers (vulkan/vulkan.h)",
-                     self._vulkan_header_dir() is not None),
-                    ("shader compiler (glslc/glslangValidator)",
-                     self._vulkan_shaderc() is not None))
-                if not ok]
-            if vk_missing:
-                missing_gpu_pkgs.append(
-                    ("a Vulkan driver/loader is present but the development "
-                     "packages are missing: " + ", ".join(vk_missing),
-                     "vulkan"))
-
-        # Explain why the requested/auto backend degraded to CPU, with the
-        # exact privileged commands needed to enable GPU offload.
-        if backend == "cpu":
-            if missing_gpu_pkgs:
-                for reason, group in missing_gpu_pkgs:
-                    self.log.emit(
-                        f"[install] WARNING: {reason} -> building CPU-only "
-                        "llama-server; GPU offload (-ngl) will be IGNORED by "
-                        "that binary.")
-                self.log.emit("[install] To enable GPU offload, install the "
-                              "missing packages (requires sudo/root) and "
-                              "press 'Auto-install / build' again:")
-                seen: set[str] = set()
-                for _, group in missing_gpu_pkgs:
-                    if group not in seen:
-                        seen.add(group)
-                        self.log.emit("[install]   " + fix_command(group))
-            elif has_driver:
-                self.log.emit(
-                    "[install] WARNING: NVIDIA GPU(s) present but no CUDA "
-                    "compiler (nvcc) found -> building CPU-only llama-server; "
-                    "GPU offload (-ngl) will be IGNORED by that binary.")
-                self.log.emit("[install] hint: "
-                              + fix_command("cuda") + "  (or grab the toolkit "
-                              "from developer.nvidia.com), then press "
-                              "'Auto-install / build' again.")
-
-        # A manually-requested GPU backend whose toolchain is incomplete must
-        # never reach cmake (it would abort mid-configure with a disorienting
-        # 'Could NOT find …' error).  Fail early with the fix commands.
-        backend_group = {"cuda": "cuda", "rocm": "rocm", "vulkan": "vulkan"}
-        if backend in backend_group:
-            ready = {"cuda": has_nvcc, "rocm": rocm_ready,
-                     "vulkan": vulkan_ready}[backend]
-            if not ready:
-                grp = backend_group[backend]
-                cmds = [fix_command(grp)]
-                if grp == "cuda" and "vulkan" in [g for _, g
-                                                  in missing_gpu_pkgs]:
-                    cmds.append(fix_command("vulkan"))
-                raise AppError(
-                    f"Cannot build the {backend.upper()} backend: required "
-                    "development packages are missing",
-                    detail="Detected your hardware, but the toolchain for "
-                           f"'{backend}' is incomplete, so cmake would fail "
-                           "partway through the build.",
-                    suggestions=[f"Install the missing packages (needs "
-                                 f"privileged access): {cmds[0]}"
-                                 + (f" ; {cmds[1]}" if len(cmds) > 1 else ""),
-                                 "Then press 'Auto-install / build' again - "
-                                 "the existing checkout is re-used so only "
-                                 "the compile step repeats.",
-                                 "Or choose the 'cpu' backend to build now "
-                                 "without GPU offload."])
-
         build_flags = {
             "cuda": ["-DGGML_CUDA=ON"],
             "rocm": ["-DGGML_HIP=ON"],
             "vulkan": ["-DGGML_VULKAN=ON"],
             "cpu": [],
         }[backend]
-        if backend == "cuda" and not has_nvcc:
-            self.log.emit("[install] WARNING: nvcc not found - CUDA-enabled "
-                          "build will fail. Falling back to CPU flags would "
-                          "lose GPU offload; trying anyway because some distro "
-                          "packaging provides nvcc outside PATH.")
 
         build_dir = src / "build"
         jobs = max(1, (os.cpu_count() or 4) // 2)
@@ -674,14 +861,17 @@ class InstallRunner(QObject):
         self.log.emit(f"[install] SUCCESS: {bin_path}"
                       + (f"  [{ver}]" if ver else ""))
         # ---- verify the compiled binary really has the requested backend --
-        if backend in ("cuda", "rocm", "vulkan") and not caps["cuda"]:
+        # caps keys are cuda/gpu only, so map the chosen backend onto them.
+        gpu_ok = {"cuda": caps["cuda"], "rocm": caps["gpu"],
+                  "vulkan": caps["gpu"]}.get(backend, True)
+        if backend in ("cuda", "rocm", "vulkan") and not gpu_ok:
             self.log.emit(
                 f"[install] WARNING: the compiled llama-server does NOT list "
                 f"{backend.upper()} support (see the 'ggml ...' feature lines "
                 "above). It will run CPU-only and ignore -ngl.")
             self.log.emit(
                 f"[install] hint: install/repair the {backend.upper()} "
-                "toolchain, e.g. '" + fix_command(backend_group[backend]) +
+                "toolchain, e.g. '" + fix_command(backend) +
                 "' (or the CUDA toolkit from developer.nvidia.com), then "
                 "press 'Auto-install / build' again; the existing checkout "
                 "is re-used so only the compile step repeats.")

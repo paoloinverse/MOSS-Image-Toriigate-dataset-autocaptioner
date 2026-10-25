@@ -4,7 +4,9 @@
 * Binary row: 'Autodetect' (searches PATH/common build dirs, ranks CUDA >
   ROCm > Vulkan > CPU), 'Browse…' (pick an existing install) and
   'Auto-install / build' (guided clone+compile in a background thread with
-  live log streaming, explicit folder choice, disk/toolchain preflight).
+  live log streaming).  The install flow is strictly staged: existing-binary
+  check -> toolchain/GPU preflight (halts with copy-pasteable fix commands
+  *before* any dialog) -> only then folder choice + confirmation -> build.
 * Generation sliders (Temperature, Top-P, Top-K, Min-P); per-model profile
   defaults are re-applied whenever the selected model changes.
 * "Thinking level" combo (Off/Low/Medium/High -> --reasoning-budget +
@@ -84,8 +86,11 @@ class InferenceTab(QWidget):
         self.install_btn = QPushButton("Auto-install / build")
         self.install_btn.setToolTip(
             "Guided installer: clones llama.cpp and compiles llama-server in\n"
-            "a background thread with live logs. Asks for confirmation and\n"
-            "an install folder first; nothing heavy runs silently.")
+            "a background thread with live logs.  Runs a staged preflight\n"
+            "first (build tools -> GPU hardware via PCI IDs -> vendor CUDA/\n"
+            "ROCm/Vulkan toolchain) and halts with copy-pasteable fix\n"
+            "commands before any dialog; only then asks for confirmation and\n"
+            "an install folder.  Nothing heavy runs silently.")
         bin_row.addWidget(self.autodetect_btn)
         bin_row.addWidget(self.browse_binary_btn)
         bin_row.addWidget(self.install_btn)
@@ -435,57 +440,96 @@ class InferenceTab(QWidget):
 
     # ------------------------------------------------------- guided install
     def autoinstall(self):
+        """Staged guided install - see app.core.llamacpp.InstallRunner.
+
+        Order matters and is enforced here (nothing heavy, and no folder
+        dialog, runs until every preflight stage passed):
+
+        A. Existing-binary check: if a usable llama-server was already
+           detected, ask whether to keep it or build a different copy.
+        B. Preflight stages 1-4 (base tools -> GPU family via PCI IDs ->
+           vendor toolchain -> backend choice).  Any failure halts with
+           copy-pasteable fix commands *before* any dialog.
+        C. Only then: folder picker + confirmation (with the disk estimate
+           matching the validated backend), then the background build.
+        """
         if self._installer is not None:
             self.ctx.log.emit("[install] an installation is already running - "
-                              "see the '[install]' lines in Tab 5.")
+                              "see the '[install]' lines in the log.")
             return
-        # 1) Toolchain preflight BEFORE bothering the user with dialogs.
-        runner_probe = llamacpp.InstallRunner(llamacpp.suggested_install_root())
-        ok, missing = runner_probe.check_prerequisites()
-        mgr = llamacpp.detect_pkg_manager()
-        tool_msg = ("Build tools detected (git, cmake, g++)." if ok else
-                    "MISSING build tools:\n  - " + "\n  - ".join(missing))
-        if not ok:
-            tool_msg += ("\n\nCopy-paste these commands into a terminal "
-                         "(they need sudo/root):\n"
-                         + "\n".join(f"  $ {m.split('fix: ', 1)[1].rstrip(')')}"
-                                     for m in missing if "fix: " in m))
-        # 2) Ask where to install (default folder pre-filled & editable).
+
+        # ---- A) llama-server may already be present ----------------------
+        existing = llamacpp.pick_best(self.binary_edit.text().strip())
+        if existing:
+            reply = QMessageBox.question(
+                self, "llama-server already detected",
+                f"A usable llama-server was found:\n\n  {existing['path']}\n"
+                f"  backend: {existing['backend']}"
+                + (f"\n  version: {existing['version']}"
+                   if existing.get("version") else "")
+                + "\n\nUse this existing binary (recommended), or continue to"
+                "\nbuild a different copy in another location?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.binary_edit.setText(existing["path"])
+                self.ctx.save_settings()
+                self.ctx.binary_changed.emit()
+                self.ctx.log.emit(
+                    f"[install] kept existing llama-server: {existing['path']} "
+                    f"(backend {existing['backend']}) - nothing was built.")
+                self._refresh_binary_status()
+                return
+            # Explicitly wants another copy -> fall through to preflight.
+
+        # ---- B) full preflight BEFORE any folder dialog ------------------
+        probe = llamacpp.InstallRunner(llamacpp.suggested_install_root(),
+                                       backend="auto")
+        pf = probe.preflight()
+        if not pf.ok:
+            err = pf.error
+            assert err is not None
+            self.ctx.log.emit(err.report())
+            detail = err.message + "\n    reason : " + err.detail \
+                if err.detail else err.message
+            fixes = "".join(f"\n    run    : $ {c}" for c in err.commands)
+            notes = "".join(f"\n    note   : {m}" for m in err.manual)
+            sugg = "".join(f"\n    alt    : {s}" for s in err.suggestions)
+            self.ctx.report_error("[install] preflight failed - nothing was "
+                                  "downloaded or compiled.\n" + detail
+                                  + fixes + notes + sugg,
+                                  context="guided llama.cpp install",
+                                  dialog=True)
+            return
+
+        backend = pf.backend
+        need_gb = probe.required_disk_gb()   # now matches the validated backend
+        gpu_desc = ", ".join(sorted(pf.gpu_families)) or "none detected"
+
+        # ---- C) only now: choose WHERE to install ------------------------
         folder = QFileDialog.getExistingDirectory(
             self, "Choose the llama.cpp install folder (cancel = default)",
             llamacpp.suggested_install_root())
         dest = folder or llamacpp.suggested_install_root()
         reply = QMessageBox.question(
             self, "Confirm guided llama.cpp install",
-            "The guided installer will now:\n"
+            "Preflight passed. The guided installer will now:\n"
             "  1. clone llama.cpp (~400 MB shallow git clone)\n"
             "  2. configure + compile llama-server (several minutes)\n\n"
             f"Install folder : {dest}\n"
-            f"GPU backend    : auto-detect (CUDA/ROCm/Vulkan/CPU)\n"
-            f"Free disk need : ~{runner_probe.required_disk_gb():.0f} GiB\n\n"
-            f"{tool_msg}\n\nProceed?",
+            f"GPU hardware   : {gpu_desc}\n"
+            f"Build backend  : {backend.upper()} ({pf.reason})\n"
+            f"Free disk need : ~{need_gb:.0f} GiB\n\nProceed?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             self.status_note = "Guided install cancelled by user."
             self.ctx.log.emit("[install] " + self.status_note)
             return
-        if not ok:
-            # Surface ready-to-run command lines (they need privileged
-            # access, so we only *offer* them - the user pastes into a shell).
-            cmds = [m.split("fix: ", 1)[1].rstrip(")")
-                    for m in missing if "fix: " in m]
-            self.ctx.report_error(
-                "[install] cannot start the guided build - missing tools:\n  - "
-                + "\n  - ".join(missing) + "\n"
-                "    fix    : run these commands in a terminal (requires "
-                "sudo/root):\n"
-                + "\n".join(f"             $ {c}" for c in cmds)
-                + "\n             then press 'Auto-install / build' again.",
-                context="guided llama.cpp install", dialog=True)
-            return
-        # 3) Run in background with live logs.
-        runner = llamacpp.InstallRunner(dest, backend="auto")
+
+        # ---- D) run in background with live logs -------------------------
+        runner = llamacpp.InstallRunner(dest, backend=backend)
+        runner._preflight = pf          # reuse validation; _run re-checks anyway
         runner.log.connect(self.ctx.log.emit)
         runner.finished.connect(self._on_install_done)
         self.install_btn.setEnabled(False)
