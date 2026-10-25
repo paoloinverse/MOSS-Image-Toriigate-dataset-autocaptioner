@@ -58,7 +58,24 @@ or directly:
 python -m app.main
 ```
 
-The app stores downloaded GGUF models and multimodal projectors under `~/.cache/app_models/`. The first model download can be very large (multi-GB); the app shows a preflight check of available disk space and asks for confirmation before starting downloads.
+The app stores downloaded GGUF models and multimodal projectors under `~/.cache/app_models/` by default, or in an Unsloth-compatible folder you pick in **Tab 1 → Model Storage**. The first model download can be very large (multi-GB); the app shows a preflight check of available disk space and asks for confirmation before starting downloads.
+
+## Updating
+
+No need to re-clone or rebuild your installation. From the project folder run:
+
+```bash
+./update.sh            # checks GitHub for new commits, previews them, then fast-forwards
+./update.sh --check    # only report whether an update is available (changes nothing)
+```
+
+The updater:
+- fetches `origin` and lists the incoming commits and changed files **before** touching anything, and asks for confirmation;
+- refuses to proceed (with clear instructions) if you have uncommitted edits or diverged local commits — your work is never overwritten;
+- refreshes Python dependencies inside `.venv` **only if `requirements.txt` actually changed** between versions — no unnecessary reinstalls;
+- leaves your virtual environment, downloaded models (default cache or Unsloth folder) and app configuration untouched.
+
+Afterwards just start the app again with `./run.sh`.
 
 ## Usage Overview
 
