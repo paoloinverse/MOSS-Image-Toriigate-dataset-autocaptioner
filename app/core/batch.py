@@ -66,7 +66,7 @@ class BatchWorker(QThread):
         self.finished_all.emit(ok and not self.cancel_event.is_set())
 
     async def _run_async(self) -> bool:
-        client = CaptionClient(self.base_url)
+        client = CaptionClient(self.base_url, log_cb=self.log.emit)
         total = len(self.images)
         fmt = self.preset.output_format
         done = 0
@@ -90,14 +90,31 @@ class BatchWorker(QThread):
                 if self.cancel_event.is_set():
                     break
                 if not text.strip():
-                    raise RuntimeError("empty response from server")
+                    raise RuntimeError(
+                        "empty response from server"
+                        + (f" (finish_reason={client.last_finish_reason})"
+                           if client.last_finish_reason else ""))
                 target = save_caption(img, text, fmt)
                 done += 1
                 self.image_done.emit(img, target)
                 self.log.emit(f"[batch] ({i}/{total}) {name} -> "
                               f"{Path(target).name}")
             except Exception as exc:
-                self.image_failed.emit(img, str(exc))
-                self.log.emit(f"[batch] ({i}/{total}) FAILED {name}: {exc}")
+                # Attach a one-line diagnosis so users are not left staring at
+                # opaque errors like "'str' object has no attribute 'get'".
+                detail = str(exc)
+                hint = ""
+                if isinstance(exc, ValueError) or "MOSS caption JSON" in detail:
+                    hint = ("\n    hint   : model reply did not contain valid MOSS "
+                            "JSON - enable verbose logging\n"
+                            "             (MOSS_VERBOSE_LOG=1) and check the "
+                            "[request]/[response] lines in the log;\n"
+                            "             consider raising max_tokens or the "
+                            "thinking budget for this preset.")
+                elif "finish_reason=length" in detail or "truncated" in detail:
+                    hint = ("\n    hint   : generation hit max_tokens before "
+                            "finishing - raise it in Tab 2/3.")
+                self.image_failed.emit(img, detail + hint)
+                self.log.emit(f"[batch] ({i}/{total}) FAILED {name}: {detail}{hint}")
         self.progress.emit(done, total)
         return not self.cancel_event.is_set()

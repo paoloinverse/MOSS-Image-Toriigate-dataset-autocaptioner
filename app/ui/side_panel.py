@@ -14,7 +14,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QPushButton,
                                QSizePolicy, QTextEdit, QVBoxLayout, QWidget)
 
-from app.core.presets import load_existing_caption
+from app.core.presets import load_existing_caption, normalize_moss_obj
 
 
 class CaptionSidePanel(QWidget):
@@ -110,8 +110,11 @@ class CaptionSidePanel(QWidget):
         try:
             if text.startswith("{"):
                 obj = json.loads(text)          # validate before writing
+                # Normalize model-shaped quirks (e.g. caption as a plain
+                # string) so re-reads of this file never hit str.get().
                 with open(target + ".json", "w", encoding="utf-8") as fh:
-                    json.dump(obj, fh, ensure_ascii=False, indent=2)
+                    json.dump(normalize_moss_obj(obj), fh,
+                              ensure_ascii=False, indent=2)
                 written = target + ".json"
             else:
                 with open(target + ".txt", "w", encoding="utf-8") as fh:
@@ -156,6 +159,11 @@ class CaptionSidePanel(QWidget):
         if kind == "json":
             try:
                 obj = json.loads(text)
+                # Never trust the shape coming out of a model: normalize_moss_obj
+                # guarantees dict caption / list watermark / list borders, which
+                # fixes "'str' object has no attribute 'get'" on string-caption
+                # sidecars.
+                obj = normalize_moss_obj(obj)
                 cap = obj.get("caption", {})
                 parts = []
                 for lvl in ("short", "medium", "long"):

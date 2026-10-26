@@ -168,6 +168,47 @@ def parse_moss_json(raw: str) -> dict:
     raise ValueError("Model response did not contain a valid MOSS caption JSON object")
 
 
+def normalize_moss_obj(obj: dict) -> dict:
+    """Normalize an *already parsed* MOSS-schema dict for safe consumption.
+
+    Unlike :func:`parse_moss_json` this never raises: unknown/extra keys are
+    preserved, but anything that could make downstream ``.get()`` calls crash
+    is coerced to the expected shape:
+
+    * ``caption`` emitted as a plain string (common with instruct-style
+      responses) becomes ``{"long": <string>, ...}``;
+    * non-dict ``caption`` / non-list ``watermark`` / ``borders`` fall back to
+      empty defaults;
+    * non-dict watermark entries are dropped.
+
+    Used by every code path that json.loads()s a model-produced caption file
+    (batch save validation, side-panel preview), which is where
+    "'str' object has no attribute 'get'" originated when a raw string-caption
+    file was re-read after saving.
+    """
+    if not isinstance(obj, dict):
+        return {}
+    out = dict(obj)
+    cap = obj.get("caption")
+    if isinstance(cap, str):
+        cap = {"long": cap}
+    if isinstance(cap, dict):
+        out["caption"] = {
+            "long": str(cap.get("long", "")).strip(),
+            "medium": str(cap.get("medium", "")).strip(),
+            "short": str(cap.get("short", "")).strip(),
+        }
+    else:
+        out["caption"] = {"long": "", "medium": "", "short": ""}
+    wms = obj.get("watermark")
+    out["watermark"] = [w for w in (wms if isinstance(wms, list) else [])
+                        if isinstance(w, dict)]
+    b = obj.get("borders")
+    if not isinstance(b, list):
+        out["borders"] = ["none"]
+    return out
+
+
 def clean_booru_tags(raw: str) -> str:
     """Collapse a tag-model response into one tidy comma-separated line."""
     text = raw.strip()
@@ -204,6 +245,37 @@ def save_caption(image_path: str, text: str, fmt: str) -> str:
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(cleaned + "\n")
     return target
+
+
+def load_caption_obj(image_path: str) -> tuple[str, dict]:
+    """Read an existing sidecar caption and return it as a *normalized* dict.
+
+    Never raises on model-shaped quirks (string captions, missing keys): the
+    result always has dict ``caption`` / list ``watermark`` / list ``borders``
+    so callers can chain ``.get()`` safely.  Returns ("", {}) when no usable
+    JSON sidecar exists; a plain-text sidecar is surfaced as a string-caption
+    under kind "txt".
+    """
+    root = os.path.splitext(image_path)[0]
+    p = root + ".json"
+    if os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+        except (OSError, ValueError):
+            return "", {}
+        return "json", normalize_moss_obj(obj if isinstance(obj, dict)
+                                          else {"caption": obj})
+    p = root + ".txt"
+    if os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                return "txt", {"caption": {"long": fh.read().strip(),
+                                           "medium": "", "short": ""},
+                               "watermark": [], "borders": ["none"]}
+        except OSError:
+            pass
+    return "", {}
 
 
 def load_existing_caption(image_path: str) -> tuple[str, str]:

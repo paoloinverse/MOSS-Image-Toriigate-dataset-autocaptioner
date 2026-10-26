@@ -32,6 +32,11 @@ class InferenceSettings:
     min_p: float = 0.05
     reasoning_budget: int = 0
     thinking_level: str = ""         # Tab 2 combo key ("" = off) - persisted
+    # Verbose llama-server traffic logging: when True the batch client logs
+    # the exact request payload (prompts + redacted image) and the full raw
+    # response incl. streamed thinking to the global log.  None = auto
+    # (honours the MOSS_VERBOSE_LOG env var), True/False = explicit override.
+    verbose_logging: bool | None = None
     cache_type: str = "q8_0"
     split_mode: str = "layer"        # row | layer | graph (see ServerConfig)
     host: str = "127.0.0.1"
