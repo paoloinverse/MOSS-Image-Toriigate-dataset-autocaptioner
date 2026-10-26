@@ -335,11 +335,21 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
       compiled without CUDA silently ran CPU-only.
 
     Returns ``{"has_api_key": bool, "has_reasoning_budget": bool,
+               "flash_attn_auto": bool, "flash_attn_on_off": bool,
                "cuda": bool, "gpu": bool}``.  Every check is conservative:
     when the binary cannot be probed at all we assume the modern features
     exist and GPU support does not, so startup never breaks harder than
     before.  ``gpu`` is True when *any* GPU backend (CUDA/ROCm/Vulkan/Metal)
     was detected.
+
+    Flash-attention spelling matters: ``-af`` / ``--flash-attn`` (plain
+    boolean) was deprecated and then *removed* from llama.cpp - current
+    builds reject it with "invalid argument" and exit 1, which is exactly
+    what used to block launches here.  The supported spellings today are
+    ``--flash-attn auto|on|off`` (very recent builds; ``auto`` is the new
+    default) or the older ``--flash-attn`` / ``-fa`` boolean flags.  We
+    detect which one the probed binary understands so :mod:`app.core.server`
+    can pass the right thing (or nothing, for ancient builds).
     """
     p = Path(str(path))
     key: tuple[str, int] | None = None
@@ -354,6 +364,7 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
     info = _build_info_lines(p)
     if not help_txt and not info:
         caps = {"has_api_key": True, "has_reasoning_budget": True,
+                "flash_attn_auto": True, "flash_attn_on_off": False,
                 "cuda": False, "gpu": False}
     else:
         def supported(flag: str) -> bool:
@@ -369,6 +380,27 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
         has_api_key = ("--api-key" in help_txt) or supported("--api-key")
         has_rb = ("reasoning-budget" in help_txt) or \
                  supported("--reasoning-budget")
+        # Flash-attention spelling (see docstring): modern llama.cpp builds
+        # take `--flash-attn auto|on|off`; older ones only the boolean
+        # `--flash-attn` / `-fa`; ancient ones have nothing.  Detect from the
+        # --help text; when the help is unparseable assume the modern form so
+        # we never re-introduce the removed '-af' flag.
+        fa_auto = False
+        fa_on_off = False
+        if "--flash-attn" in help_txt:
+            idx = help_txt.find("--flash-attn")
+            window = help_txt[idx:idx + 120]
+            fa_auto = ("{auto" in window.replace(" ", "")
+                       or "auto," in window
+                       or re.search(r"\bauto\b.*\bon\b.*\boff\b", window)
+                           is not None)
+            if not fa_auto:
+                fa_on_off = ("-fa" in help_txt or "{on" in window.replace(" ", "")
+                             or "on, off" in window or "bool" in window)
+        if not fa_auto and not fa_on_off:
+            # No usable hint in --help: be conservative *forward* - assume the
+            # current auto|on|off spelling rather than the removed boolean.
+            fa_auto = True
         # GPU detection: prefer the explicit feature list printed by
         # `llama-server --version` ("ggml CUDA_blas", "feature: ... CUDA").
         # Fall back to linked libraries via ldd (catches older builds whose
@@ -390,6 +422,7 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
                    or "metal" in info or "vulkan" in help_txt
                    or "metal" in help_txt)
         caps = {"has_api_key": has_api_key, "has_reasoning_budget": has_rb,
+                "flash_attn_auto": fa_auto, "flash_attn_on_off": fa_on_off,
                 "cuda": cuda, "gpu": gpu_any}
     if key is not None:
         _CAP_CACHE[key] = caps

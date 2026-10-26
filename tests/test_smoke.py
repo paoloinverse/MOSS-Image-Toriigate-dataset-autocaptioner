@@ -271,10 +271,69 @@ def test_server_args():
     check("extra passthrough", "--flash-attn" in args)
     # Regression: the old code appended a bare '--api' which llama.cpp never
     # had ('error: invalid argument: --api' -> exit 1).  The flag must now be
-    # the real --api-key (probed), and '-af' must survive.
+    # the real --api-key (probed).
     check("no bogus --api flag", "--api" not in args)
     check("--api-key present", "--api-key" in args)
-    check("-af flash attn", "-af" in args)
+    # '-af' was deprecated and removed from llama.cpp - passing it made every
+    # launch die with "invalid argument".  It must never appear again; flash
+    # attention is a GUI switch mapped to the modern spelling instead.
+    check("no removed -af flag", "-af" not in args)
+    # Modern spelling: the probed test binary (nonexistent path -> assumed
+    # up-to-date) gets '--flash-attn <value>' from the GUI switch, defaulting
+    # to 'auto'.
+    fa_i = args.index("--flash-attn")
+    check("--flash-attn value passed",
+          args[fa_i + 1] == "auto")
+    cfg_fa = ServerConfig(model=cfg.model, plan=cfg.plan, flash_attn="on",
+                          binary="/usr/bin/llama-server")
+    args_fa = sm.build_args(cfg_fa)
+    check("GUI switch 'on' honoured",
+          args_fa[args_fa.index("--flash-attn") + 1] == "on")
+    cfg_fa_off = ServerConfig(model=cfg.model, plan=cfg.plan, flash_attn="off",
+                              binary="/usr/bin/llama-server")
+    args_fa_off = sm.build_args(cfg_fa_off)
+    check("GUI switch 'off' honoured",
+          args_fa_off[args_fa_off.index("--flash-attn") + 1] == "off")
+
+    # Older boolean-only build (-fa supported, no auto|on|off): the switch
+    # must degrade to '-fa' when FA is wanted, and add nothing when off.
+    # The nonexistent test path cannot be stat()'ed, so probe_capabilities()
+    # never caches under a key - monkeypatch it for these two cases instead.
+    import app.core.llamacpp as _lc
+    legacy_caps = {"has_api_key": True, "has_reasoning_budget": True,
+                   "flash_attn_auto": False, "flash_attn_on_off": True,
+                   "cuda": False, "gpu": False}
+    none_caps = {"has_api_key": True, "has_reasoning_budget": True,
+                 "flash_attn_auto": False, "flash_attn_on_off": False,
+                 "cuda": False, "gpu": False}
+    orig_probe = _lc.probe_capabilities
+    try:
+        _lc.probe_capabilities = lambda *a, **k: dict(legacy_caps)
+        cfg_fa_old = ServerConfig(model=cfg.model, plan=cfg.plan,
+                                  flash_attn="on",
+                                  binary="/usr/bin/llama-server")
+        args_fa_old = sm.build_args(cfg_fa_old)
+        check("legacy build uses -fa", "-fa" in args_fa_old
+              and "--flash-attn" not in args_fa_old
+              and "-af" not in args_fa_old)
+        cfg_fa_old_off = ServerConfig(model=cfg.model, plan=cfg.plan,
+                                      flash_attn="off",
+                                      binary="/usr/bin/llama-server")
+        args_fa_old_off = sm.build_args(cfg_fa_old_off)
+        check("legacy build omits fa when off",
+              "-fa" not in args_fa_old_off and "-af" not in args_fa_old_off
+              and "--flash-attn" not in args_fa_old_off)
+        # Ancient build without any flash-attn flag: launch must still work,
+        # just without FA arguments (never fall back to the removed '-af').
+        _lc.probe_capabilities = lambda *a, **k: dict(none_caps)
+        args_none = sm.build_args(ServerConfig(
+            model=cfg.model, plan=cfg.plan, flash_attn="auto",
+            binary="/usr/bin/llama-server"))
+        check("no-fa build skips fa entirely",
+              "-af" not in args_none and "-fa" not in args_none
+              and "--flash-attn" not in args_none)
+    finally:
+        _lc.probe_capabilities = orig_probe
     # Reasoning budget flows through only when the binary supports it.
     cfg2 = ServerConfig(model=cfg.model, plan=cfg.plan,
                         reasoning_budget=4096, binary="/usr/bin/llama-server")

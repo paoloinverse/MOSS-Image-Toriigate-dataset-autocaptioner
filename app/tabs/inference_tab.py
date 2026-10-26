@@ -27,6 +27,11 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QHBoxLayout, QLabel,
                                QLineEdit, QMessageBox, QPushButton, QSlider,
                                QSpinBox, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                               QPushButton, QSlider, QSpinBox, QTextEdit,
+                               QVBoxLayout, QWidget)
 
 from app.context import AppContext
 from app.core import llamacpp
@@ -117,6 +122,24 @@ class InferenceTab(QWidget):
         form.addRow("Host:", self.host_edit)
         form.addRow("Port:", self.port_spin)
         form.addRow("Split mode (multi-GPU):", self.split_combo)
+        # Flash-attention GUI switch.  Replaces the hardcoded '-af' flag that
+        # used to be appended on every launch: '-af' was deprecated and has
+        # been removed from llama.cpp, so current builds rejected it with
+        # "invalid argument" and refused to start.  The server now maps this
+        # choice onto the modern '--flash-attn auto|on|off' spelling (with a
+        # probed fallback to the boolean '-fa' on slightly older builds).
+        self.fa_combo = QComboBox()
+        self.fa_combo.addItems(["auto", "on", "off"])
+        self.fa_combo.setCurrentText(
+            st.flash_attn if st.flash_attn in ("auto", "on", "off") else "auto")
+        self.fa_combo.setToolTip(
+            "Flash attention (--flash-attn auto|on|off).\n"
+            "auto : let llama-server decide per model/backend (recommended)\n"
+            "on   : force flash attention on (faster, lower KV memory)\n"
+            "off  : disable flash attention\n"
+            "The old '-af' alias is gone from llama.cpp - this switch uses\n"
+            "the supported flag and adapts to the probed binary version.")
+        form.addRow("Flash Attention:", self.fa_combo)
         root.addWidget(srv_box)
 
         # ---- Raw args ---------------------------------------------------------
@@ -226,6 +249,8 @@ class InferenceTab(QWidget):
             lambda t: setattr(self.ctx.settings, "cache_type", t))
         self.split_combo.currentTextChanged.connect(
             lambda t: setattr(self.ctx.settings, "split_mode", t))
+        self.fa_combo.currentTextChanged.connect(
+            lambda t: setattr(self.ctx.settings, "flash_attn", t))
         self.extra_args.textChanged.connect(
             lambda: setattr(self.ctx.settings, "extra_args",
                             self.extra_args.toPlainText()))
@@ -668,6 +693,7 @@ class InferenceTab(QWidget):
             tensor_split=self.ctx.hw.tensor_split_string(),
             cache_type_k=ctx.settings.cache_type,
             cache_type_v=ctx.settings.cache_type,
+            flash_attn=self.fa_combo.currentText().strip().lower() or "auto",
             reasoning_budget=int(ctx.settings.reasoning_budget),
             extra_args=self.extra_args.toPlainText().strip(),
             explicit_mode=ctx.explicit_mode,

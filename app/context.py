@@ -38,7 +38,8 @@ class InferenceSettings:
     # (honours the MOSS_VERBOSE_LOG env var), True/False = explicit override.
     verbose_logging: bool | None = None
     cache_type: str = "q8_0"
-    split_mode: str = "layer"        # row | layer | graph (see ServerConfig)
+    split_mode: str = "row"
+    flash_attn: str = "auto"         # Tab 2 switch: auto | on | off (--flash-attn)
     host: str = "127.0.0.1"
     port: int = 8080
     binary: str = "llama-server"     # Tab 2 'Binary:' (autodetected / chosen)
