@@ -22,8 +22,9 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog,
-                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QGroupBox,
+                               QHBoxLayout, QLabel,
                                QLineEdit, QMessageBox, QPushButton, QSlider,
                                QSpinBox, QTextEdit, QVBoxLayout, QWidget)
 
@@ -160,6 +161,21 @@ class InferenceTab(QWidget):
         hint.setStyleSheet("color: gray;")
         hint.setWordWrap(True)
         gf.addRow(hint)
+        # Verbose llama-server traffic logging: dumps the exact prompt sent
+        # and the full raw reply (incl. streamed 'thinking') into the global
+        # log for debugging odd responses.  Also settable via MOSS_VERBOSE_LOG=1.
+        self.verbose_check = QCheckBox(
+            "Verbose request/response logging (prompts + raw replies)")
+        self.verbose_check.setToolTip(
+            "Logs every llama-server request payload (system/user prompts,\n"
+            "image redacted) and the complete response - including the model's\n"
+            "streamed thinking (delta.reasoning_content) - to the main log.\n"
+            "Equivalent to launching with MOSS_VERBOSE_LOG=1.")
+        from app.core.api_client import verbose_log_enabled
+        self.verbose_check.setChecked(verbose_log_enabled(st))
+        self.verbose_check.toggled.connect(
+            lambda on: setattr(self.ctx.settings, "verbose_logging", bool(on)))
+        gf.addRow(self.verbose_check)
         root.addWidget(gen_box)
 
         # ---- KV cache -----------------------------------------------------------

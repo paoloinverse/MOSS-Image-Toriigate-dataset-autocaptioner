@@ -150,6 +150,21 @@ def test_presets_and_postproc():
     check("booru dedupe+join", tags == "1girl, smile, looking at viewer, brown hair",
           tags)
 
+    # normalize_moss_obj: never raises, keeps extra keys, str-caption safe
+    from app.core.presets import normalize_moss_obj, load_caption_obj
+    n = normalize_moss_obj({"caption": "just a string", "extra": 1})
+    check("normalize str caption -> long",
+          n["caption"]["long"] == "just a string" and n["extra"] == 1)
+    n = normalize_moss_obj({"caption": {"long": " L ", "medium": None}})
+    check("normalize strips/defaults levels",
+          n["caption"]["long"] == "L" and n["caption"]["medium"] == "")
+    n = normalize_moss_obj({"caption": ["weird"], "watermark": "junk",
+                            "borders": "none"})
+    check("normalize garbage shapes fall back",
+          isinstance(n["caption"], dict) and n["watermark"] == []
+          and n["borders"] == ["none"])
+    check("normalize non-dict -> {}", normalize_moss_obj(["x"]) == {})
+
     with tempfile.TemporaryDirectory() as td:
         img = os.path.join(td, "a.png")
         open(img, "wb").close()
@@ -160,6 +175,24 @@ def test_presets_and_postproc():
         open(os.path.join(td, "b.png"), "wb").close()
         t2 = save_caption(os.path.join(td, "b.png"), "1girl, solo", "txt")
         check("txt sidecar written", t2.endswith(".txt") and "solo" in open(t2).read())
+
+        # load_caption_obj must survive a hand-made string-caption .json -
+        # this was the exact shape that crashed re-reads with
+        # "'str' object has no attribute 'get'".
+        cimg = os.path.join(td, "c.png")
+        open(cimg, "wb").close()
+        with open(os.path.join(td, "c.json"), "w") as fh:
+            json.dump({"caption": "string caption", "watermark": [],
+                       "borders": ["none"]}, fh)
+        kind, obj = load_caption_obj(cimg)
+        check("load_caption_obj normalizes string caption",
+              kind == "json" and obj["caption"]["long"] == "string caption"
+              and obj["caption"].get("short") == "")
+        kind, obj = load_caption_obj(os.path.join(td, "b.png"))
+        check("load_caption_obj txt fallback",
+              kind == "txt" and obj["caption"]["long"] == "1girl, solo")
+        kind, obj = load_caption_obj(os.path.join(td, "missing.png"))
+        check("load_caption_obj missing -> empty", kind == "" and obj == {})
 
     # explicit-mode injection only for abliterated models
     p = _clone(moss)
@@ -389,7 +422,116 @@ def test_payload():
               "reasoning_budget_tokens" not in pl3)
 
 
-# ------------------------------------------------------------------ batch collect
+# ------------------------------------------------- streaming response handling
+def test_stream_delta_parsing():
+    """CaptionClient must survive every llama-server delta shape.
+
+    Regression for "'str' object has no attribute 'get'": older code did
+    (obj.get('choices') or [{}])[0] and crashed when the server emitted
+    choices: [] / null, or a non-dict choice.  Also verifies thinking
+    deltas (delta.reasoning_content) are captured separately from content.
+    """
+    import asyncio
+    from app.core.api_client import CaptionClient
+
+    class _Resp:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for s in self.lines:
+                yield s
+
+    class _Ctx:
+        def __init__(self, lines): self.lines = lines
+        async def __aenter__(self): return _Resp_ctx(self.lines)
+        async def __aexit__(self, *a): return False
+
+    class _Resp_ctx(_Resp):
+        def __init__(self, lines): self.lines = lines
+
+    class _Client:
+        def __init__(self, lines): self.lines = lines
+        def stream(self, *a, **k): return _Ctx(self.lines)
+
+    def make_lines(events):
+        out = []
+        for e in events:
+            if isinstance(e, str):
+                out.append("data: " + e)
+            else:
+                out.append("data: " + json.dumps(e))
+        out.append("data: [DONE]")
+        return out
+
+    img_dir = tempfile.mkdtemp()
+    img = os.path.join(img_dir, "x.png")
+    Path(img).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+
+    # 1) empty choices list + null choices -> tolerated, content still parsed
+    lines = make_lines([
+        {"choices": []},
+        {"choices": None},
+        {"choices": ["not-a-dict"]},
+        {"choices": [{"delta": {"content": "AB"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "text": "CD", "finish_reason": "stop"}]},
+    ])
+    c = CaptionClient("http://127.0.0.1:1")
+    c._test_lines = lines
+    orig_async = __import__("httpx").AsyncClient
+    __import__("httpx").AsyncClient = lambda *a, **k: _Client(lines)
+    try:
+        got = asyncio.run(c.caption(img, DEFAULT_PRESETS["moss"], "SYS"))
+    finally:
+        __import__("httpx").AsyncClient = orig_async
+    check("empty/null/non-dict choices tolerated", got == "ABCD", got)
+    check("finish_reason captured", c.last_finish_reason == "stop")
+
+    # 2) reasoning_content is NOT part of the caption but lands in last_reasoning
+    lines2 = make_lines([
+        {"choices": [{"delta": {"reasoning_content": "think1"}}]},
+        {"choices": [{"delta": {"reasoning_content": "think2"}}]},
+        {"choices": [{"delta": {"content": "{\"caption\":"}}]},
+        {"choices": [{"delta": {"content": "\"ok\"}"}}]},
+    ])
+    c2 = CaptionClient("http://127.0.0.1:1")
+    __import__("httpx").AsyncClient = lambda *a, **k: _Client(lines2)
+    try:
+        got2 = asyncio.run(c2.caption(img, DEFAULT_PRESETS["moss"], "SYS"))
+    finally:
+        __import__("httpx").AsyncClient = orig_async
+    check("reasoning kept out of answer", got2 == '{"caption":"ok"}', got2)
+    check("reasoning captured separately", c2.last_reasoning == "think1think2")
+
+    # 3) verbose logging emits request payload + raw response to the log sink
+    logged = []
+    c3 = CaptionClient("http://127.0.0.1:1", log_cb=logged.append)
+    __import__("httpx").AsyncClient = lambda *a, **k: _Client(lines2)
+    try:
+        from app.context import InferenceSettings
+        asyncio.run(c3.caption(img, DEFAULT_PRESETS["moss"], "SYS PROMPT TEXT",
+                               settings=InferenceSettings(verbose_logging=True)))
+    finally:
+        __import__("httpx").AsyncClient = orig_async
+    joined = "\n".join(logged)
+    check("verbose logs request", "[request]" in joined
+          and "SYS PROMPT TEXT" in joined)
+    check("verbose redacts image blob", "base64," not in joined.replace(
+        "data:image/png;base64,", ""))
+    check("verbose logs thinking + answer",
+          "[response] thinking" in joined and "think1think2" in joined
+          and "[response] answer" in joined)
+    # and stays silent when disabled
+    logged.clear()
+    c4 = CaptionClient("http://127.0.0.1:1", log_cb=logged.append)
+    __import__("httpx").AsyncClient = lambda *a, **k: _Client(lines2)
+    try:
+        asyncio.run(c4.caption(img, DEFAULT_PRESETS["moss"], "SYS",
+                               settings=InferenceSettings(verbose_logging=False)))
+    finally:
+        __import__("httpx").AsyncClient = orig_async
+    check("quiet mode logs nothing", logged == [], str(logged))
+
+
 def test_batch_tab_cursor_streaming():
     """Regression: on_chunk used cursor.End (AttributeError spam in PySide6).
 
@@ -433,6 +575,7 @@ if __name__ == "__main__":
     test_server_args()
     test_model_profiles()
     test_payload()
+    test_stream_delta_parsing()
     test_batch_tab_cursor_streaming()
     test_collect_images()
     print("\n%d failure(s): %s" % (len(FAILURES), FAILURES or "none"))
