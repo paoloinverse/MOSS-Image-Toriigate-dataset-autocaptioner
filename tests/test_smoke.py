@@ -189,7 +189,24 @@ def test_server_args():
     # build_args logs capability warnings through the Qt signal; with the
     # QObject never properly initialised (and no event loop) emitting would
     # raise "Signal source has been deleted", so capture notes instead.
-    sm.log = type("LogCapture", (), {"emit": staticmethod(lambda *a, **k: None)})()
+    captured: list[str] = []
+    sm.log = type("LogCapture", (), {"emit": staticmethod(
+        lambda msg, _c=captured: _c.append(str(msg)))})()
+    # The split-buffer probe must never spawn a real llama-server in tests;
+    # stub it at module level (build_args calls it via `llamacpp.` attribute
+    # lookup, so monkeypatching the module is enough).  None == inconclusive,
+    # i.e. exactly what an unknown binary yields - behaviour stays unchanged.
+    from app.core import llamacpp as L
+    orig_probe = L.probe_split_buffer_support
+    L.probe_split_buffer_support = lambda *a, **k: None
+    # The GPU-backend warning in build_args probes --help/--version of the
+    # binary; with a fake stub here that would flood the log capture, so pin
+    # "GPU-capable" for the whole test (the real detection is covered by the
+    # preflight/installer suites).
+    orig_caps = L.probe_capabilities
+    L.probe_capabilities = lambda *a, **k: {"has_api_key": True,
+                                            "has_reasoning_budget": True,
+                                            "cuda": True, "gpu": True}
     cfg = ServerConfig(
         model=ModelFile("q.gguf", "Q8_0", "r/s", 27),
         mmproj_path="/cache/mm.gguf",
@@ -222,6 +239,82 @@ def test_server_args():
     check("reasoning budget passed",
           "--reasoning-budget" in args2
           and args2[args2.index("--reasoning-budget") + 1] == "4096")
+
+    # ---- split-buffer probe integration (ServerManager._check_split_support)
+    # Default preset must be the universally supported 'layer' mode: builds
+    # or driver stacks without CUDA VMM die on '-sm row' with
+    # "device CUDAxx does not support split buffers".
+    from app.core.server import ServerConfig as SC
+    check("default split mode is layer", SC().split_mode == "layer")
+    try:
+        from app.context import InferenceSettings
+        check("GUI default split mode is layer",
+              InferenceSettings().split_mode == "layer")
+    except Exception as exc:                       # GUI import must not break
+        check("GUI default split mode is layer", False, str(exc))
+
+    with tempfile.TemporaryDirectory() as td:
+        fake_bin = Path(td) / "llama-server"
+        fake_bin.write_bytes(b"#!/bin/sh\nexit 0\n")
+        fake_bin.chmod(0o755)
+        calls: list[tuple] = []
+        L.probe_split_buffer_support = \
+            lambda b, *a, **k: (calls.append((str(b),)), False)[1]
+        sm.find_binary = lambda: str(fake_bin)
+        sm._SPLIT_CACHE = {}
+        captured.clear()
+        cfg_row = ServerConfig(model=cfg.model, plan=cfg.plan,
+                               split_mode="row", binary=str(fake_bin))
+        a = sm.build_args(cfg_row)
+        check("probe fires for multi-GPU row mode",
+              calls and calls[0][0] == str(fake_bin)
+              and a[a.index("-sm") + 1] == "row")
+        check("unsupported split warns with fix hint",
+              any("split-buffer" in m and "layer" in m for m in captured),
+              str(captured))
+        # Second call for the same (path, mtime) must hit the cache.
+        n_before = len(calls)
+        sm.build_args(cfg_row)
+        check("probe result cached per binary", len(calls) == n_before)
+        # 'layer' never triggers the probe; single-GPU runs force -sm none.
+        calls.clear(); captured.clear()
+        sm.build_args(ServerConfig(model=cfg.model, plan=cfg.plan,
+                                   split_mode="layer", binary=str(fake_bin)))
+        check("layer mode skips probe", not calls and not captured)
+        one = HWStub(); one.gpus = [gpu(0, "A", 24576, w=50)]
+        sm.hw = one
+        a = sm.build_args(cfg_row)
+        check("single GPU forces -sm none, no probe",
+              a[a.index("-sm") + 1] == "none" and not calls)
+        sm.hw = HWStub()
+        # Inconclusive verdict (None) must NOT warn (never block the user).
+        L.probe_split_buffer_support = lambda b, *a, **k: None
+        sm._SPLIT_CACHE = {}
+        captured.clear()
+        sm.build_args(cfg_row)
+        check("inconclusive probe stays silent", not captured, str(captured))
+        # Live-log hint: the reader thread must translate llama.cpp's own
+        # complaint into exactly one actionable '[server] HINT' line.
+        _lines = iter([
+            "0.01 E llama_model_load: error loading model: device CUDA0 "
+            "does not support split buffers\n",
+            "0.01 E llama_model_load: error loading model: device CUDA0 "
+            "does not support split buffers\n"])
+
+        class _P:
+            stdout = type("S", (), {"readline": staticmethod(
+                lambda: next(_lines, ""))})()
+        sm.proc = _P(); sm._stop_reader = threading.Event()
+        sm._shutdown_requested = False
+        sm._split_hint_shown = False
+        captured.clear()
+        sm._read_output()
+        hints = [m for m in captured if "[server] HINT" in m]
+        check("live log split hint fires once", len(hints) == 1,
+              str(captured))
+        check("hint carries the fix text", "Split mode" in (hints[0] if hints else ""))
+    L.probe_split_buffer_support = orig_probe
+    L.probe_capabilities = orig_caps
 
 
 # ------------------------------------------------------------------ profiles

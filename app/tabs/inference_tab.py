@@ -105,6 +105,14 @@ class InferenceTab(QWidget):
         self.port_spin.setValue(st.port)
         self.split_combo = QComboBox()
         self.split_combo.addItems(["row", "layer", "graph"])
+        # Initialise from the persisted setting (default is "layer" - see
+        # InferenceSettings) so the GUI never silently diverges from what
+        # build_args() would actually pass; unknown values fall back to it.
+        if st.split_mode in ("row", "layer", "graph"):
+            self.split_combo.setCurrentText(st.split_mode)
+        else:
+            self.split_combo.setCurrentText("layer")
+            st.split_mode = "layer"
         form.addRow("Host:", self.host_edit)
         form.addRow("Port:", self.port_spin)
         form.addRow("Split mode (multi-GPU):", self.split_combo)

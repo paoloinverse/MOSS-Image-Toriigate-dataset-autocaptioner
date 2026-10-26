@@ -30,6 +30,22 @@ OOM_PATTERNS = (
     "hipoutofmemory", "hip out of memory", "kv buffer",
 )
 
+#: Split modes that need ggml's *split buffer* device type (CUDA VMM under
+#: the hood).  Single-GPU runs never touch it, so the capability probe below
+#: only applies when more than one GPU is selected with one of these modes.
+SPLIT_BUFFER_MODES = ("row", "graph")
+
+#: One-line advice appended whenever llama.cpp reports missing split-buffer
+#: support (live log tail and pre-launch probe share this text).
+SPLIT_FIX_HINT = (
+    "    fix    : switch 'Split mode' in Tab 2 to 'layer' (works on every "
+    "backend),\n"
+    "             or rebuild llama.cpp against a CUDA >= 12.8 / R570+ driver "
+    "stack\n"
+    "             ('Auto-install / build' now passes -DCMAKE_CUDA_ARCHITECTURES=native).\n"
+    "             The GPU hardware itself supports splitting - this is a "
+    "build/driver limitation.")
+
 
 @dataclass
 class ServerConfig:
@@ -80,6 +96,7 @@ class ServerManager(QObject):
         self._lock = threading.RLock()
         self.ready = False
         self._shutdown_requested = False
+        self._split_hint_shown = False
 
     def _preferred_binary(self) -> str:
         """Current Tab 2 'Binary:' choice, with sane fallbacks.
@@ -114,6 +131,51 @@ class ServerManager(QObject):
         cand = self._preferred_binary()
         return (f"preferred='{cand}' plus " +
                 llamacpp.describe_search().replace("\n", "\n             "))
+
+    # -- split-buffer capability probe ----------------------------------------
+    _SPLIT_CACHE: dict[tuple[str, int], bool | None] = {}
+
+    def _check_split_support(self, binary: str, mode: str) -> None:
+        """Warn when `-sm row`/`-sm graph` would abort model loading.
+
+        ggml only registers its split-buffer device type when CUDA VMM works
+        for the *build + driver* stack; otherwise llama.cpp accepts the flag
+        on the command line and dies during model load with
+        "device CUDAxx does not support split buffers" (the exact failure
+        seen with RTX 50-series / sm_120 cards on older toolchains).  Since
+        no static introspection can reveal this, we ask the binary itself via
+        :func:`app.core.llamacpp.probe_split_buffer_support`, cache the
+        verdict per (resolved path, mtime) so recompiles invalidate it, and
+        NEVER silently change the user's settings - a warning only.
+        """
+        if mode not in SPLIT_BUFFER_MODES:
+            return
+        try:
+            p = Path(binary)
+            key: tuple[str, int] | None = (str(p.resolve()),
+                                           p.stat().st_mtime_ns)
+        except OSError:
+            key = None
+        if key is not None and key in self._SPLIT_CACHE:
+            supported = self._SPLIT_CACHE[key]
+        else:
+            supported = llamacpp.probe_split_buffer_support(binary)
+            if key is not None:
+                self._SPLIT_CACHE[key] = supported
+        if supported is False:
+            arch = ""
+            try:
+                arch = self.hw.cuda_arch_summary()
+            except Exception:
+                arch = ""
+            self.log.emit(
+                f"[server] WARNING: this llama-server build reports NO "
+                f"split-buffer support - '-sm {mode}' on multiple GPUs will "
+                "abort model loading ('device CUDAxx does not support split "
+                "buffers')."
+                + (f"  Detected CUDA arch: {arch}." if arch else "")
+                + "\n" + SPLIT_FIX_HINT)
+        # supported is True or None (inconclusive): proceed as before.
 
     # -- argv construction ---------------------------------------------------
     def build_args(self, cfg: ServerConfig) -> list[str]:
@@ -152,6 +214,9 @@ class ServerManager(QObject):
             ts = cfg.tensor_split or self.hw.tensor_split_string()
             if ts:
                 args += ["-ts", ts]
+            # Pre-launch capability check for row/graph splitting (warn-only;
+            # see _check_split_support for why this cannot be a static check).
+            self._check_split_support(binary, cfg.split_mode)
         elif len(selected) == 1:
             args += ["-sm", "none"]
 
@@ -271,6 +336,7 @@ class ServerManager(QObject):
                 return False
 
             self._shutdown_requested = False
+            self._split_hint_shown = False    # fresh hint per launch attempt
             args = self.build_args(cfg)
             self.log.emit("[server] exec: " + " ".join(args))
             binary = args[0]
@@ -355,6 +421,19 @@ class ServerManager(QObject):
                 low = line.lower()
                 if any(p in low for p in OOM_PATTERNS):
                     self._handle_oom(line)
+                # Live hint for the split-buffer failure mode: even when the
+                # pre-launch probe was inconclusive (no local GGUF, CPU-only
+                # box), the moment llama.cpp itself complains we print the
+                # actionable fix right under the offending line.  Guarded so
+                # the hint fires once per launch, not once per log line.
+                if llamacpp.detect_split_buffer_error(low) \
+                        and not self._split_hint_shown:
+                    self._split_hint_shown = True
+                    self.log.emit(
+                        "[server] HINT: llama.cpp rejected the requested "
+                        "split mode - this build/driver cannot do '-sm "
+                        "row'/'-sm graph' tensor splitting.\n"
+                        + SPLIT_FIX_HINT)
         try:
             proc.stdout.close()
         except Exception:
