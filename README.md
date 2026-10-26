@@ -14,7 +14,7 @@ Dataset auto-captioner for MOSS-Image, using the Minthy/ToriiGate-0.5 model (and
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/paoloinverse/MOSS-Image-Toriigate-dataset-autocaptioner.git
+   git clone https://github.com/<your-user>/MOSS-Image-Toriigate-dataset-autocaptioner.git
    cd MOSS-Image-Toriigate-dataset-autocaptioner
    ```
 

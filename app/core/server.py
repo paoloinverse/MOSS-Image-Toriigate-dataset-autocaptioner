@@ -38,7 +38,7 @@ class ServerConfig:
     plan: ResourcePlan | None = None
     host: str = "127.0.0.1"
     port: int = 8080
-    split_mode: str = "row"          # row | layer | graph
+    split_mode: str = "layer"          # row | layer | graph
     tensor_split: str = ""           # e.g. "50,50"
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
