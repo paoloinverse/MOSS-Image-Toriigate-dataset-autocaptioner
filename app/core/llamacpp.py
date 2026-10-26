@@ -921,6 +921,10 @@ class InstallRunner(QObject):
         #: can name the exact cuda-toolkit-X-Y metapackage to install.
         self._cuda_root: Path | None = None
         self._configure_retried = False
+        #: The configure command currently owned by run(); set so _stream()
+        #: can recognise "this failure came from the CUDA configure with the
+        #: native-arch flag" and offer its automatic fallback retry.
+        self._last_configure_cmd: list[str] | None = None
 
     # ------------------------------------------------------------- public
     def cancel(self):
@@ -1321,27 +1325,52 @@ class InstallRunner(QObject):
         jobs = max(1, (os.cpu_count() or 4) // 2)
         configure_cmd = ["cmake", "-S", str(src), "-B", str(build_dir),
                         "-DCMAKE_BUILD_TYPE=Release"] + build_flags
+        if backend == "cuda":
+            # Compile kernels for the GPU actually present instead of
+            # llama.cpp's default arch list.  Two practical benefits:
+            #  * brand-new architectures (e.g. Blackwell sm_100/sm_120 -
+            #    RTX 50-series) are only in `native` when nvcc is recent
+            #    enough, which is exactly the toolkit that also provides the
+            #    VMM support ggml needs for `-sm row`/`-sm graph` split
+            #    buffers; a mismatch otherwise yields binaries that die with
+            #    "device CUDAxx does not support split buffers";
+            #  * much faster builds (one target arch instead of dozens).
+            # `native` asks nvcc about the local device, so this stays
+            # hardware-generic.  Older CMake (< 3.24) errors on the keyword,
+            # and multi-GPU boxes with mixed architectures can make nvcc
+            # reject it as well - both cases fall back to the default arch
+            # list via _stream()'s retry hook (see _configure_retry_cmd).
+            configure_cmd.append("-DCMAKE_CUDA_ARCHITECTURES=native")
         if backend == "cuda" and cuda_root and \
                 not shutil.which("nvcc"):
             # nvcc exists only inside the CUDA toolkit root: hand it to cmake.
             configure_cmd.append(f"-DCMAKE_CUDA_COMPILER="
                                  f"{cuda_root / 'bin' / 'nvcc'}")
         self.log.emit(f"[install] configuring ({' '.join(build_flags) or 'CPU-only'}) …")
+        # Remember the exact configure command so _stream() can retry it with
+        # '-DCMAKE_CUDA_ARCHITECTURES=native' removed (old cmake / mixed GPU
+        # archs reject that keyword); cleared once configure succeeded.
+        self._last_configure_cmd = list(configure_cmd)
         try:
             self._stream(configure_cmd)
         except AppError:
             # A stale CMakeCache.txt from an earlier attempt makes cmake
             # replay detection with the previous flags; wipe the build dir
-            # and retry exactly once before giving up.
+            # and retry exactly once before giving up.  The cache is only
+            # *known* to be fresh when the native-arch fallback already ran
+            # (_configure_retried set inside _stream), otherwise a stale
+            # cache must still trigger one clean retry below.
+            if not (build_dir / "CMakeCache.txt").exists():
+                raise
             if self._configure_retried:
                 raise
             self._configure_retried = True
-            if not (build_dir / "CMakeCache.txt").exists():
-                raise
             self.log.emit("[install] configure failed - clearing the "
                           "stale CMake cache and retrying once …")
             shutil.rmtree(build_dir, ignore_errors=True)
             self._stream(configure_cmd)
+        finally:
+            self._last_configure_cmd = None
         if self._cancel.is_set():
             raise AppError("Installation cancelled by user",
                            detail="configure completed; compile skipped.")
@@ -1736,6 +1765,42 @@ class InstallRunner(QObject):
                     0, "A required development package is missing. Install "
                        "it (needs sudo/root), then press the button again: "
                        + ";  then ".join(dict.fromkeys(fixes)))
+            # Graceful degradation for the '-DCMAKE_CUDA_ARCHITECTURES=native'
+            # flag added to CUDA configures: CMake < 3.24 does not know the
+            # 'native' keyword ("Cannot find variable CMAKE_CUDA_ARCHITECTURES_native" /
+            # "supported features may be empty"), and boxes with *mixed* GPU
+            # architectures make nvcc reject it too.  Retry the identical
+            # configure once without the flag - llama.cpp's default arch list
+            # still compiles, just slower and less targeted.
+            if self._last_configure_cmd is cmd \
+                    and any(tok in blob for tok in
+                            ("cuda_architectures", "arch=native",
+                             "nvcc fatal")) \
+                    and "-DCMAKE_CUDA_ARCHITECTURES=native" in cmd:
+                fallback = [c for c in cmd
+                            if c != "-DCMAKE_CUDA_ARCHITECTURES=native"]
+                self.log.emit(
+                    "[install] NOTE: cmake/nvcc rejected "
+                    "'-DCMAKE_CUDA_ARCHITECTURES=native' (CMake < 3.24 or "
+                    "mixed GPU architectures) - retrying configure with "
+                    "llama.cpp's default architecture list.")
+                build_dir = Path(cmd[cmd.index("-B") + 1])
+                shutil.rmtree(build_dir, ignore_errors=True)
+                self._configure_retried = True   # cache is now genuinely fresh
+                try:
+                    self._stream(fallback)
+                    return
+                except AppError as exc2:
+                    blob2 = ((exc2.detail or "") + " " +
+                             (exc2.message or "")).lower()
+                    if "stop-test" not in blob2:
+                        raise AppError(
+                            "CUDA configure failed both with and without "
+                            "'-DCMAKE_CUDA_ARCHITECTURES=native'",
+                            detail=(f"first error: {blob[:400]}\n"
+                                    f"fallback error: {blob2[:400]}"),
+                            suggestions=suggestions) from exc2
+                    raise
             raise AppError(
                 f"Step failed with exit code {rc}: {' '.join(cmd[:3])} …",
                 detail="See the '[install]' log lines above for the tool's own "
