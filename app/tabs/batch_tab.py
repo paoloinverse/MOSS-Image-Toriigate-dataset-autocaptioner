@@ -56,9 +56,25 @@ class BatchTab(QWidget):
         self.save_all_btn.setToolTip(
             "Flush every sidecar caption already written to disk "
             "(files are saved per-image as they complete).")
+        # Verbose llama-server conversation logging: when ticked, every
+        # request/response exchange is dumped into the Log Output below -
+        # full prompts sent (images elided), streamed answers, thinking /
+        # reasoning deltas, raw SSE chunks, finish reason and usage stats.
+        self.verbose_check = QCheckBox("Verbose conversation log")
+        self.verbose_check.setToolTip(
+            "Log the full llama-server conversation for every request:\n"
+            "- the exact prompt sent (system + user text; base64 images\n"
+            "  shown as size placeholders)\n"
+            "- streaming answer deltas and any thinking/reasoning output\n"
+            "- raw SSE chunks, finish reason and token usage\n"
+            "Lines appear prefixed with '[llama]' in the Log Output.")
+        self.verbose_check.setChecked(bool(self.ctx.settings.verbose_logging))
+        self.verbose_check.toggled.connect(
+            lambda v: setattr(self.ctx.settings, "verbose_logging", bool(v)))
         controls.addWidget(self.start_btn)
         controls.addWidget(self.stop_btn)
         controls.addWidget(self.save_all_btn)
+        controls.addWidget(self.verbose_check)
         controls.addStretch(1)
         root.addLayout(controls)
 
@@ -159,7 +175,8 @@ class BatchTab(QWidget):
                              if self.ctx.server.config else
                              f"http://{self.ctx.settings.host}:{self.ctx.settings.port}",
                              preset, self.ctx.effective_system_prompt(),
-                             images, self, settings=self.ctx.settings)
+                             images, self, settings=self.ctx.settings,
+                             verbose=bool(self.ctx.settings.verbose_logging))
         worker.log.connect(self.append_log)
         worker.progress.connect(self.on_progress)
         worker.chunk.connect(self.on_chunk)
@@ -201,6 +218,11 @@ class BatchTab(QWidget):
         self.progress_label.setText(f"{done}/{total} captioned")
 
     def on_chunk(self, img: str, delta: str):
+        # Verbose mode already prints every answer delta as a '[llama] <<<
+        # [answer]' log line; skip the inline '>>>' stream to avoid double
+        # output (the full caption is still reported by the batch lines).
+        if self.ctx.settings.verbose_logging:
+            return
         # Live-stream the currently processing image into the log box.
         name = os.path.basename(img)
         if self._stream_marker != name:

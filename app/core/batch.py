@@ -42,7 +42,7 @@ class BatchWorker(QThread):
 
     def __init__(self, base_url: str, preset: CaptionPreset,
                  system_prompt: str, images: list[str], parent=None,
-                 settings=None):
+                 settings=None, verbose: bool = False):
         super().__init__(parent)
         self.base_url = base_url
         self.preset = preset
@@ -51,6 +51,9 @@ class BatchWorker(QThread):
         # Live Tab 2 InferenceSettings (temperature/top_k/... + thinking
         # budget); None keeps the pure preset behaviour.
         self.settings = settings
+        # Verbose llama-server conversation logging: full prompts sent,
+        # streamed answers AND thinking/reasoning deltas land on self.log.
+        self.verbose = verbose
         self.cancel_event = threading.Event()
 
     def stop(self):
@@ -83,10 +86,14 @@ class BatchWorker(QThread):
                 def on_chunk(delta: str, _img=img):
                     self.chunk.emit(_img, delta)
 
+                def on_log(line: str):
+                    self.log.emit(line)
+
                 text = await client.caption(
                     img, self.preset, self.system_prompt,
                     on_chunk=on_chunk, cancel_event=self.cancel_event,
-                    settings=self.settings)
+                    settings=self.settings,
+                    log_cb=on_log if self.verbose else None)
                 if self.cancel_event.is_set():
                     break
                 if not text.strip():

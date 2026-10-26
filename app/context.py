@@ -38,6 +38,9 @@ class InferenceSettings:
     host: str = "127.0.0.1"
     port: int = 8080
     binary: str = "llama-server"     # Tab 2 'Binary:' (autodetected / chosen)
+    verbose_logging: bool = False    # dump llama-server conversation detail
+                                     # (prompts sent, answers + thinking) to
+                                     # the Log Output panel
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -55,6 +58,8 @@ class InferenceSettings:
                     setattr(self, k, int(v))
                 elif f.type in ("str", str):
                     setattr(self, k, str(v))
+                elif f.type in ("bool", bool):
+                    setattr(self, k, bool(v))
                 else:
                     setattr(self, k, v)
             except (TypeError, ValueError):
