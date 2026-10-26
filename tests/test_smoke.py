@@ -136,6 +136,16 @@ def test_presets_and_postproc():
     check("watermark box clamped 0-1000",
           obj["watermark"][0]["box_2d"] == [10, 20, 1000, 30])
 
+    # robustness: model variants that must not crash the batch worker
+    obj = parse_moss_json('{"caption": "plain string caption", "borders": ["none"]}')
+    check("moss json caption-as-string normalized",
+          obj["caption"]["long"] == "plain string caption"
+          and obj["caption"]["short"] == "")
+    obj = parse_moss_json('{"caption": {"long": "L"}, "watermark": ["junk", '
+                          '{"box_2d": [1,2,3,4], "label": "x"}]}')
+    check("moss json malformed watermark tolerated",
+          len(obj["watermark"]) == 1 and obj["watermark"][0]["box_2d"] == [1, 2, 3, 4])
+
     tags = clean_booru_tags("1girl, smile, 1girl, looking at viewer\nbrown hair")
     check("booru dedupe+join", tags == "1girl, smile, looking at viewer, brown hair",
           tags)
@@ -380,6 +390,29 @@ def test_payload():
 
 
 # ------------------------------------------------------------------ batch collect
+def test_batch_tab_cursor_streaming():
+    """Regression: on_chunk used cursor.End (AttributeError spam in PySide6).
+
+    Verified statically because the sandbox may lack Qt libs; additionally
+    executed against real QTextCursor when PySide6 imports succeed.
+    """
+    import re as _re
+    src = open(os.path.join(os.path.dirname(__file__), "..",
+                            "app", "tabs", "batch_tab.py"), encoding="utf-8").read()
+    check("on_chunk avoids instance cursor.End",
+          "cursor.movePosition(cursor.End)" not in src)
+    check("on_chunk uses QTextCursor.MoveOperation.End",
+          "QTextCursor.MoveOperation.End" in src)
+    check("batch_tab imports QTextCursor",
+          _re.search(r"from PySide6\.QtGui import .*QTextCursor", src) is not None)
+    try:
+        from PySide6.QtGui import QTextCursor  # noqa: F401
+        check("QTextCursor.MoveOperation.End exists at runtime",
+              hasattr(QTextCursor.MoveOperation, "End"))
+    except Exception:
+        pass  # Qt not importable in this environment; static checks suffice
+
+
 def test_collect_images():
     from app.core.batch import collect_images
     with tempfile.TemporaryDirectory() as td:
@@ -400,6 +433,7 @@ if __name__ == "__main__":
     test_server_args()
     test_model_profiles()
     test_payload()
+    test_batch_tab_cursor_streaming()
     test_collect_images()
     print("\n%d failure(s): %s" % (len(FAILURES), FAILURES or "none"))
     sys.exit(1 if FAILURES else 0)

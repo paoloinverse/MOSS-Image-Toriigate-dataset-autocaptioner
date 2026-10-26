@@ -134,6 +134,13 @@ def parse_moss_json(raw: str) -> dict:
             continue
         if isinstance(obj, dict) and "caption" in obj:
             cap = obj.get("caption") or {}
+            # Some models emit caption as a plain string instead of the
+            # expected {"long","medium","short"} object.  Normalize both
+            # shapes so downstream .get() calls never hit a str.
+            if isinstance(cap, str):
+                cap = {"long": cap}
+            if not isinstance(cap, dict):
+                cap = {}
             norm = {
                 "caption": {
                     "long": str(cap.get("long", "")).strip(),
@@ -144,6 +151,8 @@ def parse_moss_json(raw: str) -> dict:
                 "borders": obj.get("borders", ["none"]),
             }
             for wm in obj.get("watermark", []) or []:
+                if not isinstance(wm, dict):
+                    continue    # tolerate malformed watermark entries
                 box = wm.get("box_2d")
                 if isinstance(box, (list, tuple)) and len(box) == 4:
                     try:
