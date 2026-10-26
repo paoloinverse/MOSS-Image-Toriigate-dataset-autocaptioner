@@ -28,9 +28,11 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -154,6 +156,171 @@ def _build_info_lines(path: str | Path) -> str:
     # llama.cpp prints 'feature: BLAS OPENMP CUDA ...' / 'CUDA RR = ...'
     # style lines; keep only those (the plain version line is not useful).
     return "\n".join(l for l in blob.splitlines() if ":" in l).lower()
+
+
+#: ggml/llama.cpp diagnostics proving the CUDA backend could NOT register its
+#: split-buffer ("tensor split") device - i.e. `-sm row`/`-sm graph` aborts
+#: during model load with "device CUDAxx does not support split buffers".
+#: Matched against the *lower-cased* llama-server output of a throwaway probe
+#: run, or of the real launch log tail (see ServerManager._read_output).
+_SPLIT_UNSUPPORTED_MARKERS = (
+    "does not support split",           # "... does not support split buffers"
+    "split buffer",                     # generic fallback wording
+    "vmm is not supported",             # ggml-cuda's own VMM rejection line
+)
+
+#: Errors that mean "the probe never reached the device init stage", so the
+#: absence of a split-buffer complaint says nothing about actual support.
+_PROBE_ABORT_MARKERS = (
+    "failed to load model",
+    "model not found",
+    "no such file",
+    "invalid argument",
+    "unrecognized option",
+    "unknown argument",
+)
+
+
+def _find_probe_model() -> Path | None:
+    """Smallest usable *.gguf on disk for a throwaway device-capability probe.
+
+    The probe must get llama-server past ``llama_init_from_model`` (where the
+    backends are initialised and split buffers registered), so it needs *some*
+    loadable GGUF; a tiny one is enough.  Search order: the user-configured
+    storage root (Tab 1), the app-managed cache and the usual Hugging Face
+    locations.  Returns None when nothing plausible exists - callers then skip
+    the probe entirely instead of failing.
+    """
+    import glob
+    roots: list[str] = []
+    try:                                    # honour Tab 1 storage selection
+        from app.core.models import STORAGE, default_cache_dir
+        if getattr(STORAGE, "unsloth_root", "").strip():
+            roots.append(STORAGE.unsloth_root.strip())
+        roots.append(str(default_cache_dir()))
+    except Exception:
+        roots.append(str(Path(os.environ.get(
+            "APPCAP_CACHE_DIR",
+            os.path.expanduser("~/.cache/app_models")))))
+    roots.append(str(Path.home() / ".cache" / "huggingface"))
+    candidates: list[Path] = []
+    for root in roots:
+        try:
+            if not Path(root).is_dir():
+                continue
+            for pat in ("**/*q2_k*.gguf", "**/*q2_K*.gguf", "**/*tiny*.gguf",
+                        "**/*gpt2*.gguf", "**/*.gguf"):
+                for p in glob.glob(str(Path(root) / pat), recursive=True):
+                    pp = Path(p)
+                    if "mmproj" in pp.name.lower():
+                        continue
+                    try:
+                        if pp.stat().st_size > 1_000_000:
+                            candidates.append(pp)
+                    except OSError:
+                        continue
+                if candidates:
+                    break
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    # Smallest file wins: fastest possible load for a capability probe.
+    try:
+        return min(candidates, key=lambda p: p.stat().st_size)
+    except OSError:
+        return candidates[0]
+
+
+def detect_split_buffer_error(line: str) -> bool:
+    """True when a llama-server log line reports missing split-buffer support.
+
+    Used both by the pre-launch probe below and by the live log tail in
+    :class:`app.core.server.ServerManager`, so the fix hint fires regardless
+    of whether the failure could be predicted beforehand.
+    """
+    low = line.lower()
+    return any(m in low for m in _SPLIT_UNSUPPORTED_MARKERS)
+
+
+def probe_split_buffer_support(binary: str | Path,
+                               timeout: float = 30.0) -> bool | None:
+    """Runtime check: can this build actually do `-sm row`/`-sm graph`?
+
+    Background: ggml's CUDA backend only registers the split-buffer device
+    type when the Virtual-Management-API works, which depends on the *driver*
+    (and toolkit) supporting the GPU's compute capability - e.g. Blackwell
+    sm_120 cards need R570+/CUDA 12.8+.  A binary built without that support
+    accepts `-sm row` on the command line and then dies during model load
+    with "device CUDA0 does not support split buffers", which no amount of
+    --help parsing can reveal.  So we ask the binary itself: launch it once
+    with a small local GGUF plus `-sm row`, and inspect what the startup log
+    says before killing it.
+
+    Returns True (split buffers OK) / False (explicitly unsupported) or
+    None when inconclusive (probe impossible, no local GGUF, CPU-only build,
+    unrelated failure).  Callers MUST treat None as "assume modern behaviour":
+    the result is used only to warn, never to silently change user settings.
+    """
+    p = Path(str(binary))
+    if not p.is_file():
+        return None
+    model = _find_probe_model()
+    if model is None:
+        return None
+    try:
+        proc = subprocess.Popen(
+            [str(p), "-m", str(model), "-ngl", "1", "-c", "512",
+             "-sm", "row", "--host", "127.0.0.1", "--port", "0"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
+            start_new_session=True,
+        )
+    except Exception:
+        return None
+    lines: list[str] = []
+    verdict: bool | None = None
+    deadline = time.monotonic() + max(5.0, timeout)
+    try:
+        out = proc.stdout
+        assert out is not None
+        for raw in out:
+            lines.append(raw)
+            low = raw.lower()
+            if detect_split_buffer_error(low):
+                verdict = False
+                break
+            if any(m in low for m in _PROBE_ABORT_MARKERS):
+                verdict = None      # never reached device init: inconclusive
+                break
+            if "init: using" in low or "server_config" in low \
+                    or "model loaded" in low:
+                # All devices were initialised and the model got at least
+                # started with -sm row: had split buffers been missing, the
+                # error above would already have fired (it happens during
+                # device setup / first alloc).
+                verdict = True
+                break
+            if time.monotonic() > deadline:
+                verdict = None
+                break
+    except Exception:
+        verdict = None
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    if verdict is None and not lines:
+        return None
+    return verdict
 
 
 def probe_capabilities(path: str | Path) -> dict[str, bool]:

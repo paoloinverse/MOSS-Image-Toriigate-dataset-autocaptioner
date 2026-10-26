@@ -38,7 +38,11 @@ class ServerConfig:
     plan: ResourcePlan | None = None
     host: str = "127.0.0.1"
     port: int = 8080
-    split_mode: str = "row"          # row | layer | graph
+    # "layer" is the default split mode: it works on every ggml backend,
+    # while "row"/"graph" need CUDA VMM/split-buffer support in the *build +
+    # driver* stack (see llamacpp.probe_split_buffer_support - a missing one
+    # aborts model load with "device CUDAxx does not support split buffers").
+    split_mode: str = "layer"        # row | layer | graph
     tensor_split: str = ""           # e.g. "50,50"
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
