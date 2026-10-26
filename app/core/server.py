@@ -42,6 +42,7 @@ class ServerConfig:
     tensor_split: str = ""           # e.g. "50,50"
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
+    flash_attn: str = "auto"         # GUI switch: auto | on | off ("" = leave to server)
     reasoning_budget: int = 0        # --reasoning-budget (thinking level)
     extra_args: str = ""             # raw passthrough from Tab 2
     explicit_mode: bool = False      # disables safety-system prompts
@@ -115,6 +116,13 @@ class ServerManager(QObject):
     def build_args(self, cfg: ServerConfig) -> list[str]:
         binary = self.find_binary() or cfg.binary
         caps = llamacpp.probe_capabilities(binary)
+        # Older stubs / cached probes may lack newer keys - default them so
+        # build_args never raises KeyError on a partial dict.
+        def _cap(name: str, default: bool = False) -> bool:
+            try:
+                return bool(caps.get(name, default))
+            except Exception:
+                return default
         # Warn *before* spawning when the user selected GPUs but the binary
         # was compiled without any GPU backend (the silent CPU-only run that
         # produced "no usable GPU found, --gpu-layers option will be ignored"
@@ -123,7 +131,7 @@ class ServerManager(QObject):
             want_gpu = bool(self.hw.selected_gpus)
         except Exception:
             want_gpu = False
-        if want_gpu and not caps.get("gpu", False):
+        if want_gpu and not _cap("gpu", False):
             self.log.emit(
                 "[server] WARNING: this llama-server binary does NOT advertise "
                 "CUDA/ROCm/Vulkan support - GPU offload (-ngl/-sm/-ts) will be "
@@ -159,7 +167,7 @@ class ServerManager(QObject):
         # skipped when the binary predates the flag (older llama.cpp builds
         # reject it with 'invalid argument' and exit 1).
         if getattr(cfg, "reasoning_budget", 0) > 0:
-            if caps["has_reasoning_budget"]:
+            if _cap("has_reasoning_budget", True):
                 args += ["--reasoning-budget", str(cfg.reasoning_budget)]
             else:
                 self.log.emit("[server] WARNING: this llama-server does not "
@@ -173,14 +181,41 @@ class ServerManager(QObject):
         # Auth token for the API endpoints: the real flag is --api-key.
         # Bare `--api` was rejected by older builds ("error: invalid
         # argument: --api" -> exit code 1), so probe before passing it.
-        if caps["has_api_key"]:
+        if _cap("has_api_key", True):
             args += ["--api-key", ""]
         else:
             self.log.emit("[server] NOTE: this llama-server has no --api-key "
                           "option (old build) - starting without an API "
                           "token; consider re-building via 'Auto-install / "
                           "build' for security updates.")
-        args += ["-af"]      # autoplay flash attention
+        # Flash attention: GUI switch (Tab 2 'Flash Attention': Auto/On/Off).
+        # The old '-af' alias was deprecated and has been REMOVED from
+        # llama.cpp - passing it makes current builds exit with
+        # "error: invalid argument: -af", which blocked every launch.
+        # Modern spelling is '--flash-attn auto|on|off'; slightly older
+        # builds only understand the boolean '--flash-attn' / '-fa'.  We
+        # probe the binary and translate accordingly; when the user left
+        # the switch on "auto" and the server already defaults to flash
+        # attention, passing nothing is the safest choice.
+        fa = str(getattr(cfg, "flash_attn", "auto") or "auto").strip().lower()
+        if fa not in ("auto", "on", "off"):
+            fa = "auto"
+        if _cap("flash_attn_auto", True):
+            args += ["--flash-attn", fa]
+        elif _cap("flash_attn_on_off"):
+            # Boolean-era build: no per-value control; enable FA unless the
+            # user explicitly turned it off.
+            if fa != "off":
+                args += ["-fa"]
+            else:
+                self.log.emit("[server] NOTE: this llama-server predates "
+                              "'--flash-attn auto|on|off'; flash attention "
+                              "will stay at the build default (off request "
+                              "ignored).")
+        else:
+            self.log.emit("[server] NOTE: this llama-server has no flash-"
+                          "attention option at all - skipping it; consider "
+                          "re-building via 'Auto-install / build' in Tab 2.")
         if cfg.extra_args.strip():
             args += cfg.extra_args.split()
         return args

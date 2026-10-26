@@ -34,6 +34,7 @@ class InferenceSettings:
     thinking_level: str = ""         # Tab 2 combo key ("" = off) - persisted
     cache_type: str = "q8_0"
     split_mode: str = "row"
+    flash_attn: str = "auto"         # Tab 2 switch: auto | on | off (--flash-attn)
     host: str = "127.0.0.1"
     port: int = 8080
     binary: str = "llama-server"     # Tab 2 'Binary:' (autodetected / chosen)
