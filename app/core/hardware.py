@@ -24,6 +24,30 @@ from PySide6.QtCore import QThread, Signal
 POLL_INTERVAL_MS = 1000
 
 
+#: CUDA compute capabilities that need a driver/toolkit recent enough to
+#: expose the Virtual-Management-API (cuMemCreate & co).  ggml's CUDA backend
+#: registers its tensor-split ("split buffer") type only when VMM is usable,
+#: so llama.cpp aborts multi-GPU row splitting with
+#:   "device CUDA0 does not support split buffers"
+#: on Blackwell (sm_120) cards driven by pre-12.8 stacks.  The card itself is
+#: never the problem - the software stack is - hence this table stays purely
+#: informational and capability probing must never *assume* it.
+_MIN_CUDA_DRIVER_FOR_VMM = {
+    (10, 0): (570, 26),     # sm_100 / Blackwell datacenter
+    (12, 0): (570, 26),     # sm_120 / RTX 50 (e.g. 5060 Ti)
+}
+
+
+def min_driver_for_vmm(major: int, minor: int) -> tuple[int, int] | None:
+    """Minimum NVIDIA driver (major, minor) needed for CUDA VMM on an arch.
+
+    Returns ``None`` when the architecture is known to work with any driver
+    (i.e. everything below compute capability 10.0), so callers can stay
+    generic instead of special-casing one GPU generation.
+    """
+    return _MIN_CUDA_DRIVER_FOR_VMM.get((major, minor))
+
+
 @dataclass
 class GPUInfo:
     """Snapshot of one physical GPU."""
@@ -35,6 +59,9 @@ class GPUInfo:
     backend: str = "nvidia"          # "nvidia" | "amd"
     selected: bool = False           # included in the inference pool
     split_weight: int = 50           # relative weight for --tensor-split
+    #: CUDA compute capability as reported by the *driver* (NVML), e.g.
+    #: (12, 0) for an RTX 5060 Ti.  None when unknown / non-CUDA backend.
+    compute_capability: tuple[int, int] | None = None
 
     @property
     def free_vram_mb(self) -> int:
@@ -86,6 +113,17 @@ class NvidiaProber:
                     util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
                 except Exception:
                     util = 0
+                # Compute capability straight from the driver (NVML): this is
+                # what CUDA will actually run on, independent of any toolkit.
+                cc: tuple[int, int] | None = None
+                try:
+                    cv = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+                    if isinstance(cv, tuple) and len(cv) == 2:
+                        major, minor = int(cv[0]), int(cv[1])
+                        if major > 0:
+                            cc = (major, minor)
+                except Exception:
+                    cc = None
                 out.append(GPUInfo(
                     index=i,
                     name=str(gname),
@@ -93,6 +131,7 @@ class NvidiaProber:
                     used_vram_mb=int(mem.used // (1024 * 1024)),
                     util_percent=float(util),
                     backend="nvidia",
+                    compute_capability=cc,
                 ))
             except Exception:
                 continue
@@ -259,6 +298,19 @@ class HardwareManager(QThread):
     @property
     def selected_gpus(self) -> list[GPUInfo]:
         return [g for g in self.gpus if g.selected]
+
+    def cuda_arch_summary(self) -> str:
+        """Human-readable list of CUDA compute capabilities in the pool.
+
+        Returns '' when nothing is known (no NVIDIA GPU selected, or an older
+        pynvml without the capability call) so callers can simply skip the
+        extra log line instead of printing "unknown" noise.
+        """
+        pairs = sorted({g.compute_capability for g in self.selected_gpus
+                        if g.backend == "nvidia" and g.compute_capability})
+        if not pairs:
+            return ""
+        return ", ".join(f"sm_{maj}{minr}" for maj, minr in pairs)
 
     @property
     def selected_vram_total_mb(self) -> int:
