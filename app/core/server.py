@@ -180,7 +180,16 @@ class ServerManager(QObject):
                           "option (old build) - starting without an API "
                           "token; consider re-building via 'Auto-install / "
                           "build' for security updates.")
-        args += ["-af"]      # autoplay flash attention
+        # Flash attention: recent llama.cpp builds removed the '-af' short
+        # alias ('error: invalid argument: -af' -> exit 1), so pass it only
+        # when --help actually advertises it.  FA is an optimisation, not a
+        # requirement: skipping it merely reverts to the default attention.
+        if caps.get("has_flash_attn", True):
+            args += ["-af"]
+        else:
+            self.log.emit("[server] NOTE: this llama-server does not "
+                          "recognise '-af' (flash-attn alias) - starting "
+                          "without it; attention runs in default mode.")
         if cfg.extra_args.strip():
             args += cfg.extra_args.split()
         return args

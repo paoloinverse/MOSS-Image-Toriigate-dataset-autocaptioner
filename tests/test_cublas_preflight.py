@@ -60,6 +60,15 @@ def build_runner(pci_fams, cuda_root, missing_libs_real=True):
     r._has_nvcc = lambda root=None: cuda_root is not None and (cuda_root/"bin"/"nvcc").is_file()
     r._find_rocm_root = lambda: Path("/nonexistent-rocm")
     r._has_vulkan = lambda: False
+    # The dynamic apt-cache lookup must not depend on this sandbox's real
+    # repos: simulate the user's Ubuntu 'resolute' cache, which carries the
+    # version-suffixed multiverse packages (libcublas-dev-13-1 etc.).
+    # NOTE: _apt_cache_search is a staticmethod *class attribute*, so it is
+    # looked up on the class - instance assignment would be shadowed.
+    type(r)._apt_cache_search = staticmethod(
+        lambda pats: {"libcublas-dev-13-1",
+                      "libcurand-dev-13-1",
+                      "cuda-toolkit-13-1"})
     # ldconfig lookup must not depend on the sandbox's real libraries:
     if missing_libs_real:
         r._has_cuda_dev_lib = lambda name, root: (root is not None and
@@ -86,6 +95,8 @@ try:
 
     # ---- 2. preflight halts BEFORE download on incomplete toolkit ----------
     r, orig_enum = build_runner({"nvidia"}, bare)
+    L.detect_pkg_manager = lambda: "apt"
+    L.is_ubuntu_family = lambda: True
     try:
         res = r.preflight()
     finally:
@@ -96,9 +107,16 @@ try:
     assert "ROCm" not in d, "must blame cuBLAS, not ROCm"
     joined = "\n".join(res.error.commands)
     assert "libcublas-dev" in joined, f"commands wrong: {joined}"
+    # the suggestion must carry the *versioned* spelling resolved from the
+    # (simulated) apt cache - exactly what exists in Ubuntu repos today
+    assert "libcublas-dev-13-1" in joined, f"versioned split pkg missing: {joined}"
     assert "cuda-toolkit-13-1" in joined, f"versioned metapackage missing: {joined}"
+    assert "sudo apt install libcublas-dev \n" not in joined + "\n", "unversioned guess"
+    assert "sudo apt install libcublas-dev-13-1 libcurand" not in joined, \
+        f"primary line must stay minimal (cublas only): {joined}"
     rep = res.error.report()
     assert "You do NOT need to reinstall CUDA itself" in rep, rep
+    assert "resolved live from your apt cache" in rep, rep
     print("2 preflight halt + fix commands:", *res.error.commands, sep="\n   ")
 
     # ---- 3. complete toolkit proceeds to cuda backend ----------------------
@@ -122,6 +140,7 @@ try:
 
     # ---- 5. late cmake error translated by _stream -------------------------
     logs = []
+    r0, _ = build_runner({"nvidia"}, bare)
 
     class _FakeStdout:
         def __init__(self, lines):
@@ -129,6 +148,13 @@ try:
 
         def readline(self):
             return next(self._it, "")
+
+    # Force the apt path: this sandbox has no apt-cache binary and a
+    # Debian-ish os-release, so without these stubs we could not exercise
+    # the real resolution logic here at all.  The cache itself is already
+    # simulated by build_runner().
+    L.detect_pkg_manager = lambda: "apt"
+    L.is_ubuntu_family = lambda: True
 
     fake_proc = types.SimpleNamespace(
         stdout=_FakeStdout([l+"\n" for l in [
@@ -142,7 +168,8 @@ try:
         ]]),
         wait=lambda: 1)
     L.subprocess.Popen = lambda *a, **k: fake_proc
-    r, _ = build_runner({"nvidia"}, bare)
+    r = r0
+    r._cuda_root = bare   # normally set by preflight(); _stream reads it
     # PySide6 SignalInstance.connect is read-only on instances; patch the
     # class-level descriptor so emit() records into our list instead.
     sig_cls = type(r.log)
@@ -157,12 +184,42 @@ try:
     finally:
         sig_cls.connect, sig_cls.emit = orig_connect, orig_emit
     blob = "\n".join(logs)
-    assert "FIX: sudo apt install libcublas-dev" in blob, blob
-    assert "cuda-toolkit-13-1" in blob or "cuda-toolkit-" in blob, blob
+    # primary line must be the minimal cublas-only split package resolved
+    # from the (simulated) cache; the fat metapackage only as alternative.
+    assert "FIX: sudo apt install libcublas-dev-13-1\n" in blob + "\n", blob
+    assert "FIX: sudo apt install libcublas-dev \n" not in blob + "\n", blob
+    assert "cuda-toolkit-13-1" in blob, blob
+    assert "alternative" in blob, blob
     assert "math libraries" in blob, blob
     assert ("cuBLAS dev files" in err.suggestions[0]
             or "libcublas-dev" in err.suggestions[0]), err.suggestions
-    print("5 _stream translation: OK")
+    print("5 _stream translation:", *[f for f in logs if f.startswith("[install] FIX")], sep="\n   ")
+
+    # ---- 6. apt cache empty -> discovery recipe, never a guessed name ------
+    cmds, notes = L.apt_cuda_libs_fix_command(
+        "13.1", search_fn=lambda pats: set())
+    joined = "\n".join(cmds + notes)
+    assert "apt-cache search" in joined, joined
+    assert "sudo apt install libcublas-dev " not in joined, \
+        f"must not guess unversioned names: {joined}"
+    assert "multiverse" in joined and "NVIDIA CUDA" in joined, \
+        f"repo guidance missing: {joined}"
+    print("6 empty-cache fallback: OK")
+
+    # ---- 7. future CUDA release (14.0) resolves automatically -------------
+    hits14 = {"libcublas-dev-14-0", "libcurand-dev-14-0", "cuda-toolkit-14-0"}
+    cmds, _ = L.apt_cuda_libs_fix_command(
+        "14.0", search_fn=lambda pats: {n for n in hits14})
+    joined = "\n".join(cmds)
+    assert "sudo apt install libcublas-dev-14-0 libcurand-dev-14-0" in joined, joined
+    assert "cuda-toolkit-14-0" in joined, joined
+    assert "13" not in joined.replace("cuda", ""), f"stale version leaked: {joined}"
+    # NVIDIA-repo-only spelling (no multiverse split packages cached):
+    hits_nv = {"cuda-libraries-dev-14-0"}
+    cmds, _ = L.apt_cuda_libs_fix_command(
+        "14.0", search_fn=lambda pats: hits_nv)
+    assert any("cuda-libraries-dev-14-0" in c for c in cmds), cmds
+    print("7 future-proofing (CUDA 14.0):", *cmds, sep="\n   ")
 
     print("ALL CUBLAS PREFLIGHT TESTS PASS")
 finally:
