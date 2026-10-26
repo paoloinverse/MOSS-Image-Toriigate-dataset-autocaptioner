@@ -136,6 +136,28 @@ def test_presets_and_postproc():
     check("watermark box clamped 0-1000",
           obj["watermark"][0]["box_2d"] == [10, 20, 1000, 30])
 
+    # Regression: models often emit a single watermark as a bare object
+    # instead of a list -- must not crash with "'str' object has no
+    # attribute 'get'" during batch save.
+    bare = ('{"caption": {"long": "L", "medium": "M", "short": "S"},'
+            ' "watermark": {"box_2d": [767, 695, 852, 765],'
+            ' "label": "Signature and date"}, "borders": ["none"]}')
+    try:
+        obj2 = parse_moss_json(bare)
+        check("bare-dict watermark coerced to list",
+              obj2["watermark"] == [{"box_2d": [767, 695, 852, 765],
+                                     "label": "Signature and date"}])
+    except Exception as exc:      # noqa: BLE001
+        check("bare-dict watermark coerced to list", False, str(exc))
+    junk = ('{"caption": "stringified", "watermark": ["nope",'
+            ' {"box_2d": [1, 2, 3]}], "borders": "none"}')
+    try:
+        obj3 = parse_moss_json(junk)
+        check("junk watermark entries skipped",
+              obj3["watermark"] == [] and obj3["borders"] == ["none"])
+    except Exception as exc:      # noqa: BLE001
+        check("junk watermark entries skipped", False, str(exc))
+
     tags = clean_booru_tags("1girl, smile, 1girl, looking at viewer\nbrown hair")
     check("booru dedupe+join", tags == "1girl, smile, looking at viewer, brown hair",
           tags)

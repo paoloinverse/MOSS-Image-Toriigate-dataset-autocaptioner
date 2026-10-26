@@ -117,6 +117,48 @@ DEFAULT_PRESETS: dict[str, CaptionPreset] = {
 _JSON_BLOCK = re.compile(r"\{.*\}", re.S)
 
 
+def _coerce_dict(value) -> dict:
+    """Return ``value`` as a dict.
+
+    Models sometimes emit a single object where the schema expects a list
+    (e.g. ``"watermark": {...}``); iterating such a value would yield its
+    string *keys*, so we wrap lone mappings into a one-element list instead.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+        return value[0]
+    return {}
+
+
+def _normalize_watermarks(value) -> list:
+    """Coerce the 'watermark' field into a list of ``{box_2d, label}`` dicts.
+
+    Accepts either a list of entries or a single entry emitted bare (not
+    wrapped in an array), which llama-server models do frequently.
+    """
+    if isinstance(value, dict):
+        entries = [value]
+    elif isinstance(value, (list, tuple)):
+        entries = list(value)
+    else:
+        entries = []
+    out: list = []
+    for wm in entries:
+        if not isinstance(wm, dict):
+            continue          # skip stray strings/numbers instead of crashing
+        box = wm.get("box_2d")
+        if isinstance(box, (list, tuple)) and len(box) == 4:
+            try:
+                out.append({
+                    "box_2d": [max(0, min(1000, int(v))) for v in box],
+                    "label": str(wm.get("label", "")),
+                })
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
 def parse_moss_json(raw: str) -> dict:
     """Extract & validate the MOSS schema object from a model response.
 
@@ -133,26 +175,16 @@ def parse_moss_json(raw: str) -> dict:
         except Exception:
             continue
         if isinstance(obj, dict) and "caption" in obj:
-            cap = obj.get("caption") or {}
+            cap = _coerce_dict(obj.get("caption"))
             norm = {
                 "caption": {
                     "long": str(cap.get("long", "")).strip(),
                     "medium": str(cap.get("medium", "")).strip(),
                     "short": str(cap.get("short", "")).strip(),
                 },
-                "watermark": [],
+                "watermark": _normalize_watermarks(obj.get("watermark")),
                 "borders": obj.get("borders", ["none"]),
             }
-            for wm in obj.get("watermark", []) or []:
-                box = wm.get("box_2d")
-                if isinstance(box, (list, tuple)) and len(box) == 4:
-                    try:
-                        norm["watermark"].append({
-                            "box_2d": [max(0, min(1000, int(v))) for v in box],
-                            "label": str(wm.get("label", "")),
-                        })
-                    except (TypeError, ValueError):
-                        pass
             if not isinstance(norm["borders"], list):
                 norm["borders"] = ["none"]
             return norm
