@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
@@ -30,9 +30,35 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox,
 
 from app.context import AppContext
 from app.core import llamacpp
-from app.core.models import (KV_CACHE_TYPES, get_model_profile, read_arch_info,
-                             resolve_mmproj)
+from app.core.models import (KV_CACHE_TYPES, ensure_mmproj_downloaded,
+                             get_model_profile, plan_mmproj_download,
+                             read_arch_info)
 from app.core.resources import ResourcePlanError, plan_resources
+
+
+class MmprojFetchWorker(QThread):
+    """Background 'Fetch mmproj' action for the run-target model (Tab 2).
+
+    Wraps the unified planner in :mod:`app.core.models` so both tabs share
+    exactly one discovery pipeline (local scan -> live Hub listing ->
+    companion repo -> offline fallback).  Emits its log lines straight into
+    the shared GUI log; never blocks the UI thread on network or disk I/O.
+    """
+
+    log = Signal(str)
+    done = Signal(bool, str)            # ok, final message
+
+    def __init__(self, mf, parent=None):
+        super().__init__(parent)
+        self.mf = mf
+
+    def run(self):
+        try:
+            ok, msg = ensure_mmproj_downloaded(
+                self.mf, log_cb=lambda line: self.log.emit(line))
+        except Exception as exc:                        # pragma: no cover
+            ok, msg = False, f"mmproj fetch failed: {exc}"
+        self.done.emit(ok, msg)
 
 
 def _slider(row_label: str, vmin: float, vmax: float, value: float,
@@ -54,6 +80,7 @@ class InferenceTab(QWidget):
         self._last_file = None
         self._profiled_key: str | None = None   # model key whose defaults were applied
         self._installer: llamacpp.InstallRunner | None = None
+        self._mmproj_worker: MmprojFetchWorker | None = None
 
         root = QVBoxLayout(self)
 
@@ -128,6 +155,21 @@ class InferenceTab(QWidget):
             "discovered live from the repository listing.")
         form.addRow("Model to run:", self.run_model_combo)
         form.addRow("Quant / file:", self.run_quant_combo)
+        # Explicit on-demand projector fetch for the *run target* - Tab 2 no
+        # longer has to bounce the user through Tab 1 when e.g. Qwen's
+        # 'mmproj-*.gguf' is missing after a model switch.
+        self.mmproj_btn = QPushButton("Fetch mmproj")
+        self.mmproj_btn.setToolTip(
+            "Locate and download the vision projector (mmproj GGUF) that\n"
+            "belongs to the selected run-target model, using the same\n"
+            "unified pipeline as Tab 1: cached local file -> live Hub\n"
+            "listing (exact filenames, never composed) -> companion repo.\n"
+            "Runs in the background; progress goes to the Log Output.")
+        self.mmproj_btn.clicked.connect(self.fetch_mmproj)
+        mmproj_row = QHBoxLayout()
+        mmproj_row.addWidget(self.mmproj_btn)
+        mmproj_row.addStretch(1)
+        form.addRow("", mmproj_row)
         self.follow_label = QLabel("")
         self.follow_label.setWordWrap(True)
         self.follow_label.setStyleSheet("color: gray; font-family: monospace;")
@@ -409,22 +451,80 @@ class InferenceTab(QWidget):
         self.refresh_plan()
 
     def _update_follow_label(self):
-        """Show exactly which main GGUF llama-server will launch with."""
+        """Show exactly which main GGUF llama-server will launch with,
+        plus the vision-projector status for that same run target."""
         mf = self.ctx.run_model_file
         if mf is None:
             self.follow_label.setText(
                 "Run target: none available - download a model in Tab 1.")
+            if hasattr(self, "mmproj_btn"):
+                self.mmproj_btn.setEnabled(False)
             return
+        if hasattr(self, "mmproj_btn") and not self.mmproj_btn.isEnabled() \
+                and self._mmproj_worker is None:
+            self.mmproj_btn.setEnabled(True)
         mode = ("explicit" if self.ctx.settings.run_model_key
                 else "follows Tab 1")
         try:
             here = mf.local_path().is_file()
         except OSError:
             here = False
+        # Projector line: prefer the already-resolved local companion; only
+        # fall back to the (cheap, cached) plan when it is missing, so this
+        # label never triggers network I/O by itself.
+        mm_path, _mm_name = mf.resolve_mmproj_companion()
+        if mm_path is not None and mm_path.is_file():
+            mm_line = f"  mmproj: {mm_path.name} [OK]"
+        else:
+            try:
+                needed, msg, _p = plan_mmproj_download(mf)
+            except Exception as exc:                    # pragma: no cover
+                needed, msg = False, f"planner error: {exc}"
+            if needed:
+                mm_line = f"  mmproj: MISSING ({msg}) - press 'Fetch mmproj'"
+            else:
+                mm_line = f"  mmproj: {msg}"
         self.follow_label.setText(
             f"Run target ({mode}): {mf.repo_id} / {mf.quant}\n"
             f"  file: {mf.filename}"
-            + ("" if here else "   [NOT downloaded - see Tab 1]"))
+            + ("" if here else "   [NOT downloaded - see Tab 1]")
+            + "\n" + mm_line)
+
+    # ----------------------------------------------------- mmproj on-demand
+    def fetch_mmproj(self):
+        """Download/locate the run-target's vision projector in background."""
+        if self._mmproj_worker is not None:
+            self.ctx.log.emit("[mmproj] a fetch is already running - wait "
+                              "for it to finish (see Log Output).")
+            return
+        mf = self.ctx.run_model_file
+        if mf is None:
+            QMessageBox.warning(self, "No run target",
+                                "Select a model first (Tab 2 'Model to run' "
+                                "or Tab 1).")
+            return
+        self._mmproj_worker = MmprojFetchWorker(mf, parent=self)
+        self._mmproj_worker.log.connect(self.ctx.log.emit)
+        self._mmproj_worker.done.connect(self._on_mmproj_done)
+        self.mmproj_btn.setEnabled(False)
+        self.mmproj_btn.setText("Fetching…")
+        self.ctx.log.emit(f"[mmproj] fetching projector for "
+                          f"'{mf.filename}' ({mf.repo_id}) ...")
+        self._mmproj_worker.start()
+
+    def _on_mmproj_done(self, ok: bool, message: str):
+        w = self._mmproj_worker
+        self._mmproj_worker = None
+        if w is not None:
+            w.deleteLater()
+        self.mmproj_btn.setEnabled(True)
+        self.mmproj_btn.setText("Fetch mmproj")
+        if ok:
+            self.ctx.log.emit(f"[mmproj] OK: {message}")
+        else:
+            self.ctx.log.emit(f"[mmproj] FAILED: {message}")
+            QMessageBox.warning(self, "mmproj fetch failed", message)
+        self._update_follow_label()
 
     def _populate_thinking_levels(self, select):
         """Fill the Thinking-level combo from the active model profile.
