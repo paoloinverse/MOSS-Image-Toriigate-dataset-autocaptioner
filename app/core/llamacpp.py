@@ -143,6 +143,66 @@ def _run_help(path: str | Path, timeout: float = 8.0) -> str:
         return ""
 
 
+#: Cache for accepts_flag() results, keyed like _CAP_CACHE.
+_FLAG_CACHE: dict[tuple[str, int], dict[str, bool]] = {}
+
+
+def accepts_flag(path: str | Path, flag: str, value: str = "",
+                 timeout: float = 8.0) -> bool | None:
+    """Ask the binary itself whether it accepts ``flag`` (optional ``value``).
+
+    Runs ``<path> <flag> [<value>] --help``: llama.cpp parses its arguments
+    *before* printing help, so an unsupported option exits early with
+    ``error: invalid argument: ...`` instead of the usage text.  This is far
+    more reliable than grepping ``--help`` output, which does not always
+    list every accepted flag (e.g. ``--api-key`` was assumed present on a
+    build that rejected it with 'invalid argument' + exit code 1, blocking
+    every launch).
+
+    Returns True/False from the actual parse result, or None when the check
+    could not be performed (missing binary, timeout...).  Callers must
+    decide their own conservative fallback for None.
+    """
+    key: tuple[str, int] | None = None
+    try:
+        p = Path(str(path))
+        key = (str(p.resolve()), p.stat().st_mtime_ns)
+    except OSError:
+        key = None
+    ck = (flag, value)
+    if key is not None:
+        cached = _FLAG_CACHE.get(key)
+        if cached and ck in cached:
+            return cached[ck]
+    argv = [str(path), flag]
+    if value != "":
+        argv.append(value)
+    argv.append("--help")
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout)
+        blob = ((r.stdout or "") + "\n" + (r.stderr or "")).lower()
+    except Exception:
+        return None
+    # Rejection markers used by common_getopt / gpt4all's arg parser:
+    #   'error: invalid argument: --api-key'
+    #   'unrecognized option '--api-key''
+    low_flag = flag.lower()
+    rejected = (("invalid argument" in blob and low_flag in blob)
+                or ("unrecognized" in blob and low_flag in blob)
+                or ("unknown option" in blob and low_flag in blob))
+    if rejected:
+        result = False
+    elif "usage" in blob or "options" in blob or "--help" in blob:
+        # Help actually printed => the parse survived our flag.
+        result = True
+    else:
+        result = None
+    if key is not None and result is not None:
+        _FLAG_CACHE.setdefault(key, {})[ck] = result
+    return result
+
+
 def _build_info_lines(path: str | Path) -> str:
     """Version/build-info output lines that list compiled features."""
     try:
@@ -167,12 +227,15 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
     * ``no usable GPU found, --gpu-layers option will be ignored`` - a build
       compiled without CUDA silently ran CPU-only.
 
-    Returns ``{"has_api_key": bool, "has_reasoning_budget": bool,
+    Returns ``{"has_api_key": bool, "has_single_turn": bool,
+               "has_reasoning_budget": bool,
                "flash_attn_auto": bool, "flash_attn_on_off": bool,
                "cuda": bool, "gpu": bool}``.  Every check is conservative:
-    when the binary cannot be probed at all we assume the modern features
-    exist and GPU support does not, so startup never breaks harder than
-    before.  ``gpu`` is True when *any* GPU backend (CUDA/ROCm/Vulkan/Metal)
+    when the binary cannot be probed at all we assume the *modern* flags the
+    help text hints at exist, but optional security/exotic flags
+    (``--api-key``, ``-sp``) default to absent - launching without them is
+    always safe, passing them to a build that rejects them exits 1.
+    ``gpu`` is True when *any* GPU backend (CUDA/ROCm/Vulkan/Metal)
     was detected.
 
     Flash-attention spelling matters: ``-af`` / ``--flash-attn`` (plain
@@ -196,23 +259,29 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
     help_txt = _run_help(p).lower()
     info = _build_info_lines(p)
     if not help_txt and not info:
-        caps = {"has_api_key": True, "has_reasoning_budget": True,
+        caps = {"has_api_key": False, "has_single_turn": False,
+                "has_reasoning_budget": True,
                 "flash_attn_auto": True, "flash_attn_on_off": False,
                 "cuda": False, "gpu": False}
     else:
-        def supported(flag: str) -> bool:
-            """True unless --help explicitly lists the flag as unsupported."""
-            for ln in help_txt.splitlines():
-                low = ln.lower()
-                if ("unsupported" in low or "not supported" in low
-                        or "unrecognized" in low):
-                    if flag in low:
-                        return False
-            return True
+        # Grep the usage text first (cheap), then *verify by parsing*: some
+        # builds accept a flag without listing it in --help, and others
+        # reject flags the help mentions.  accepts_flag() runs
+        # `<binary> <flag> [<value>] --help` and watches for
+        # 'error: invalid argument' - the same code path that killed launches
+        # with '--api-key' / '-sp' on builds lacking them.  When the binary
+        # cannot be probed at all (None) fall back to the help-text guess.
+        def verified(flag: str, value: str, help_guess: bool) -> bool:
+            actual = accepts_flag(p, flag, value)
+            return help_guess if actual is None else actual
 
-        has_api_key = ("--api-key" in help_txt) or supported("--api-key")
-        has_rb = ("reasoning-budget" in help_txt) or \
-                 supported("--reasoning-budget")
+        has_api_key = verified("--api-key", "", "--api-key" in help_txt)
+        # '-sp' (--single-turn) takes an optional string; probe it with an
+        # empty value exactly like server.build_args passes it.
+        has_sp = verified("-sp", "", "-sp," in help_txt
+                          or "--single-turn" in help_txt)
+        has_rb = verified("--reasoning-budget", "1",
+                          "reasoning-budget" in help_txt)
         # Flash-attention spelling (see docstring): modern llama.cpp builds
         # take `--flash-attn auto|on|off`; older ones only the boolean
         # `--flash-attn` / `-fa`; ancient ones have nothing.  Detect from the
@@ -254,7 +323,8 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
         gpu_any = (cuda or "rocm" in info or "hip" in info or "vulkan" in info
                    or "metal" in info or "vulkan" in help_txt
                    or "metal" in help_txt)
-        caps = {"has_api_key": has_api_key, "has_reasoning_budget": has_rb,
+        caps = {"has_api_key": has_api_key, "has_single_turn": has_sp,
+                "has_reasoning_budget": has_rb,
                 "flash_attn_auto": fa_auto, "flash_attn_on_off": fa_on_off,
                 "cuda": cuda, "gpu": gpu_any}
     if key is not None:

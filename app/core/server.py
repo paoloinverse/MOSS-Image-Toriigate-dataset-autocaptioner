@@ -176,18 +176,35 @@ class ServerManager(QObject):
         if cfg.explicit_mode:
             # Disable safety-system prompts server-side; the explicit trigger
             # sentence itself is injected into the system prompt by presets.
-            args += ["-sp", ""]      # empty built-in system prompt
+            # '-sp' takes an optional string, but builds without the flag
+            # abort with "error: invalid argument:" (empty value included)
+            # and exit 1 - so only pass it when the probe says it exists.
+            if _cap("has_single_turn", False):
+                args += ["-sp", ""]   # empty built-in system prompt
+            else:
+                self.log.emit("[server] NOTE: this llama-server does not "
+                              "support '-sp' (--single-turn) - explicit mode "
+                              "runs request-only (the trigger sentence is "
+                              "still injected into the system prompt).")
         args += ["--host", cfg.host, "--port", str(cfg.port)]
         # Auth token for the API endpoints: the real flag is --api-key.
         # Bare `--api` was rejected by older builds ("error: invalid
         # argument: --api" -> exit code 1), so probe before passing it.
-        if _cap("has_api_key", True):
-            args += ["--api-key", ""]
-        else:
-            self.log.emit("[server] NOTE: this llama-server has no --api-key "
-                          "option (old build) - starting without an API "
-                          "token; consider re-building via 'Auto-install / "
-                          "build' for security updates.")
+        # The GUI intentionally has no API-key field (server binds to
+        # 127.0.0.1 only), so we used to pass an *empty* token - which some
+        # builds reject outright ('invalid argument:' + exit 1) and which is
+        # security theatre anyway.  Default now: omit the flag entirely =
+        # no auth.  Advanced users can still enable a token via Tab 2's
+        # 'Extra args' box (e.g. '--api-key secret'); the client reads the
+        # MOSS_API_KEY / APPCAP_API_KEY env var for the Authorization header.
+        if os.environ.get("MOSS_API_KEY") or os.environ.get("APPCAP_API_KEY"):
+            if _cap("has_api_key", False):
+                args += ["--api-key", ""]
+            else:
+                self.log.emit("[server] NOTE: this llama-server has no "
+                              "--api-key option (old build) - starting "
+                              "without an API token; consider re-building "
+                              "via 'Auto-install / build' in Tab 2.")
         # Flash attention: GUI switch (Tab 2 'Flash Attention': Auto/On/Off).
         # The old '-af' alias was deprecated and has been REMOVED from
         # llama.cpp - passing it makes current builds exit with

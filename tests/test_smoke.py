@@ -279,10 +279,12 @@ def test_server_args():
     check("host/port", "--host" in args and "--port" in args)
     check("extra passthrough", "--flash-attn" in args)
     # Regression: the old code appended a bare '--api' which llama.cpp never
-    # had ('error: invalid argument: --api' -> exit 1).  The flag must now be
-    # the real --api-key (probed).
+    # had ('error: invalid argument: --api' -> exit 1).  A later build also
+    # rejected '--api-key ""' outright (same 'invalid argument:' + exit 1),
+    # and since the GUI has no API-key field the empty token was pointless
+    # anyway - the server now starts with NO auth flag by default.
     check("no bogus --api flag", "--api" not in args)
-    check("--api-key present", "--api-key" in args)
+    check("no --api-key without env token", "--api-key" not in args)
     # '-af' was deprecated and removed from llama.cpp - passing it made every
     # launch die with "invalid argument".  It must never appear again; flash
     # attention is a GUI switch mapped to the modern spelling instead.
@@ -351,19 +353,77 @@ def test_server_args():
           "--reasoning-budget" in args2
           and args2[args2.index("--reasoning-budget") + 1] == "4096")
 
+    # Regression (field report): explicit mode appended '-sp ""' and the
+    # default start appended '--api-key ""' unconditionally-ish; a build
+    # lacking either died with 'error: invalid argument:' + exit code 1 -
+    # and because the bad flag was *always* passed, restarts failed forever.
+    # Both flags are now opt-in: gated on a parse-verified probe (and for
+    # --api-key additionally on an env token), defaulting to absent.
+    legacy_only_caps = {"has_api_key": False, "has_single_turn": False,
+                        "has_reasoning_budget": True,
+                        "flash_attn_auto": True, "flash_attn_on_off": False,
+                        "cuda": False, "gpu": False}
+    orig_probe2 = _lc.probe_capabilities
+    try:
+        _lc.probe_capabilities = lambda *a, **k: dict(legacy_only_caps)
+        args_sp = sm.build_args(ServerConfig(
+            model=cfg.model, plan=cfg.plan, explicit_mode=True,
+            binary="/usr/bin/llama-server"))
+        check("no '-sp' when unsupported", "-sp" not in args_sp)
+        import os as _os
+        tok = dict(_os.environ)
+        try:
+            _os.environ["MOSS_API_KEY"] = "s3cret"
+            args_ak = sm.build_args(ServerConfig(
+                model=cfg.model, plan=cfg.plan,
+                binary="/usr/bin/llama-server"))
+            check("--api-key still skipped on old build even with token",
+                  "--api-key" not in args_ak)
+        finally:
+            _os.environ.clear()
+            _os.environ.update(tok)
+        modern_caps = dict(legacy_only_caps, has_api_key=True,
+                           has_single_turn=True)
+        _lc.probe_capabilities = lambda *a, **k: dict(modern_caps)
+        args_ok = sm.build_args(ServerConfig(
+            model=cfg.model, plan=cfg.plan, explicit_mode=True,
+            binary="/usr/bin/llama-server"))
+        check("'--api-key' omitted without env token",
+              "--api-key" not in args_ok)
+        check("'-sp' passed when supported", "-sp" in args_ok)
+        tok = dict(_os.environ)
+        try:
+            _os.environ["APPCAP_API_KEY"] = "s3cret"
+            args_auth = sm.build_args(ServerConfig(
+                model=cfg.model, plan=cfg.plan,
+                binary="/usr/bin/llama-server"))
+            check("'--api-key' passed when env token set + supported",
+                  "--api-key" in args_auth)
+        finally:
+            _os.environ.clear()
+            _os.environ.update(tok)
+    finally:
+        _lc.probe_capabilities = orig_probe2
+
 
 # ------------------------------------------------------------------ profiles
 def test_model_profiles():
-    from app.core.models import (KV_CACHE_TYPES, MODEL_PROFILES,
+    from app.core.models import (KV_CACHE_TYPES, _MODEL_FAMILY_DEFAULTS,
                                  get_model_profile)
 
     check("bf16 in KV types", "bf16" in KV_CACHE_TYPES)
     tg = get_model_profile("toriigate")
     qw = get_model_profile("qwen3.8-27b")
-    check("toriigate Q8_0 context cap",
-          tg.max_context_by_quant.get("Q8_0") == 32768)
-    check("qwen3.8 IQ4_XS context cap",
-          qw.max_context_by_quant.get("UD-IQ4_XS") == 131072)
+    # Per-quant context caps are now derived from the LIVE Hub listing
+    # (file sizes + arch), not a fixed table - so without quant/spec args
+    # (and offline) they are empty by design; model_profile_for() resolves
+    # them when a live spec is available.
+    check("toriigate Q8_0 cap resolved live (empty w/o spec)",
+          tg.max_context_by_quant.get("Q8_0") in (None, 0)
+          or tg.max_context_by_quant["Q8_0"] >= 4096)
+    check("qwen3.8 IQ4_XS cap resolved live (empty w/o spec)",
+          qw.max_context_by_quant.get("UD-IQ4_XS") in (None, 0)
+          or qw.max_context_by_quant["UD-IQ4_XS"] >= 4096)
     check("thinking levels present",
           len(tg.thinking_levels) >= 4 and len(qw.thinking_levels) >= 4)
     budgets = [l.budget for l in qw.thinking_levels]
@@ -372,8 +432,8 @@ def test_model_profiles():
     check("unknown model neutral profile",
           unknown.max_context_by_quant == {}
           and unknown.thinking_levels == ())
-    check("profiles registered", set(MODEL_PROFILES) >= {"toriigate",
-                                                         "qwen3.8-27b"})
+    check("profiles registered", set(_MODEL_FAMILY_DEFAULTS) >= {"toriigate",
+                                                                 "qwen3.8-27b"})
 
 
 # ------------------------------------------------------------------ payload
