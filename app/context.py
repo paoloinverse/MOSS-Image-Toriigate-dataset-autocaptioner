@@ -38,6 +38,8 @@ class InferenceSettings:
     host: str = "127.0.0.1"
     port: int = 8080
     binary: str = "llama-server"     # Tab 2 'Binary:' (autodetected / chosen)
+    run_model_key: str = ""          # Tab 2 explicit override ('' = follow Tab 1)
+    run_quant: str = ""              # Tab 2 quant/filename override ('' = follow)
     verbose_logging: bool = False    # dump llama-server conversation detail
                                      # (prompts sent, answers + thinking) to
                                      # the Log Output panel
@@ -75,6 +77,7 @@ class AppContext(QObject):
     log = Signal(str)                   # global log sink (Tab 5 text box)
     error_log = Signal(str, bool)       # (verbose report, show_modal_dialog)
     binary_changed = Signal()           # llama-server path autodetected/chosen
+    registry_refreshed = Signal(str)    # live Hub listing updated a repo key
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -207,6 +210,39 @@ class AppContext(QObject):
     @property
     def active_model_spec(self) -> ModelSpec:
         return self.registry[self.selected_model_key]
+
+    # ------------------------------------------------------ run-target model
+    @property
+    def run_model_key(self) -> str:
+        """Model key llama-server should load (Tab 2 override, else Tab 1)."""
+        key = getattr(self.settings, "run_model_key", "") or ""
+        if key in self.registry:
+            return key
+        return self.selected_model_key
+
+    @property
+    def run_quant(self) -> str:
+        """Quant tag of the run target (falls back to the Tab 1 selection)."""
+        spec = self.registry.get(self.run_model_key)
+        if spec is None:
+            return self.selected_quant
+        q = getattr(self.settings, "run_quant", "") or ""
+        if q and spec.file_for_quant(q) is not None:
+            return q
+        if self.run_model_key == self.selected_model_key \
+                and spec.file_for_quant(self.selected_quant) is not None:
+            return self.selected_quant
+        for cand in ("Q8_0", "Q8-0"):
+            f = spec.file_for_quant(cand)
+            if f is not None:
+                return f.quant
+        return spec.quants()[0] if spec.quants() else ""
+
+    @property
+    def run_model_file(self):
+        """The concrete :class:`ModelFile` llama-server must launch with."""
+        spec = self.registry[self.run_model_key]
+        return spec.file_for_quant(self.run_quant)
 
     @property
     def storage(self) -> StorageManager:

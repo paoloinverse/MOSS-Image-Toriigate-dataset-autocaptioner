@@ -279,6 +279,27 @@ class ServerManager(QObject):
                         f"Multimodal projector (mmproj) missing: {mmproj_needed}\n"
                         "    fix    : image captioning requires the mmproj GGUF; run "
                         "'Download & Verify' in Tab 1.")
+            # Wrong-projector guard: the auto-detection fallback used to grab
+            # *any* mmproj from the model library, which paired ToriiGate's
+            # projector with the Qwen3.8-27B main GGUF and made llama-server
+            # die at load time with
+            #   "mtmd_init_from_file: mismatch between text model (n_embd =
+            #    5120) and mmproj (n_embd = 2560) / hint: wrong mmproj".
+            # Catch it here - before spawning - with an actionable message.
+            if cfg.mmproj_path and Path(cfg.mmproj_path).is_file():
+                try:
+                    bad = cfg.model.mmproj_companion_error(Path(cfg.mmproj_path))
+                except Exception:
+                    bad = None
+                if bad:
+                    errors.append(
+                        f"Incompatible multimodal projector for "
+                        f"'{cfg.model.filename}': {bad}\n"
+                        f"    would pass: --mmproj {cfg.mmproj_path}\n"
+                        "    fix    : download this model's own mmproj via "
+                        "'Download & Verify' in Tab 1 (the live repo listing "
+                        "includes its projector), or clear 'Extra args' if you "
+                        "set --mmproj manually there.")
 
         # Port sanity / availability check (cheap socket bind probe).
         if not (1 <= cfg.port <= 65535):

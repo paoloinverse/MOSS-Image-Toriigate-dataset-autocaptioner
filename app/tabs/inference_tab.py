@@ -109,6 +109,29 @@ class InferenceTab(QWidget):
         form.addRow("Host:", self.host_edit)
         form.addRow("Port:", self.port_spin)
         form.addRow("Split mode (multi-GPU):", self.split_combo)
+        # ---- Run-target model -------------------------------------------------
+        # Explicit, always-current choice of which GGUF llama-server loads.
+        # Previously Tab 2 silently reused whatever Tab 1 had selected *at
+        # start-up*, so switching to the Qwen model there still launched (and
+        # paired projectors for) ToriiGate.  'Follow Tab 1' keeps the old
+        # behaviour; picking a model here overrides it for server launches
+        # only - caption presets/payloads keep following Tab 1.
+        self.run_model_combo = QComboBox()
+        self.run_model_combo.setToolTip(
+            "Which model llama-server actually loads.\n"
+            "'Follow Tab 1 selection' mirrors the Tab 1 model/quant picker;\n"
+            "choosing an entry here overrides it explicitly (persisted).\n"
+            "Quant sub-menu lists the live-discovered Hub filenames.")
+        self.run_quant_combo = QComboBox()
+        self.run_quant_combo.setToolTip(
+            "Exact GGUF file (quant) to launch - verbatim Hub filename,\n"
+            "discovered live from the repository listing.")
+        form.addRow("Model to run:", self.run_model_combo)
+        form.addRow("Quant / file:", self.run_quant_combo)
+        self.follow_label = QLabel("")
+        self.follow_label.setWordWrap(True)
+        self.follow_label.setStyleSheet("color: gray; font-family: monospace;")
+        form.addRow(self.follow_label)
         # Flash-attention GUI switch.  Replaces the hardcoded '-af' flag that
         # used to be appended on every launch: '-af' was deprecated and has
         # been removed from llama.cpp, so current builds rejected it with
@@ -242,16 +265,34 @@ class InferenceTab(QWidget):
         # the run-out-of-the-box profile defaults (sampling, thinking, cache).
         self.ctx.model_changed.connect(self._on_model_changed)
         self.ctx.binary_changed.connect(self._refresh_binary_status)
+        self.ctx.registry_refreshed.connect(self._on_registry_refreshed)
+        self.run_model_combo.currentIndexChanged.connect(
+            self._on_run_model_changed)
+        self.run_quant_combo.currentIndexChanged.connect(
+            self._on_run_quant_changed)
 
+        self._populate_run_models()
+        self._profiled_key = self.ctx.run_model_key
         self._refresh_binary_status()
 
-    # ---------------------------------------------------------- model profiles
+    # ------------------------------------------------------------------ plan
     def _profile(self):
-        """ModelProfile of the currently selected model (Tab 1 key/quant)."""
-        return get_model_profile(self.ctx.selected_model_key)
+        """ModelProfile of the run-target model (Tab 2 selection)."""
+        return get_model_profile(self.ctx.run_model_key)
+
+    def _on_registry_refreshed(self, key: str):
+        if key == self.ctx.run_model_key or not self.ctx.settings.run_model_key:
+            self._populate_run_models()
+
+    # ---------------------------------------------------------- model profiles
 
     def _on_model_changed(self):
         """model_changed handler: re-populate per-model widgets + re-plan.
+
+        The Tab 2 run-model dropdown is refreshed whenever the *follow* mode
+        is active (or a live listing just landed), so switching models in
+        Tab 1 immediately updates what llama-server will launch with - the
+        stale "still thinks ToriiGate was selected" desync.
 
         Preset sampling defaults are only applied once per model *key* (not
         on every quant switch), so a user's manual slider tweaks survive
@@ -259,7 +300,10 @@ class InferenceTab(QWidget):
         match the active profile and the plan is always recomputed with the
         new per-quant context cap.
         """
-        key = self.ctx.selected_model_key
+        key = self.ctx.run_model_key
+        if not self.ctx.settings.run_model_key \
+                or key == self.ctx.selected_model_key:
+            self._populate_run_models()
         if key != self._profiled_key:
             self._profiled_key = key
             self._apply_profile_defaults()
@@ -268,6 +312,119 @@ class InferenceTab(QWidget):
             self.ctx.settings.thinking_level
             or self.ctx.settings.reasoning_budget)
         self.refresh_plan()
+
+    # ------------------------------------------------------- run-model picker
+    def _populate_run_models(self):
+        """Fill the explicit 'Model to run' dropdown from the registry.
+
+        First entry = follow Tab 1; every registered model family is listed,
+        and its quant sub-menu shows the *live-discovered* GGUF files (exact
+        Hub filenames), so what Tab 2 launches can never silently lag behind
+        a model switch made in Tab 1.
+        """
+        ctx = self.ctx
+        want_key = ctx.run_model_key
+        want_q = ctx.run_quant
+        self.run_model_combo.blockSignals(True)
+        self.run_quant_combo.blockSignals(True)
+        self.run_model_combo.clear()
+        self.run_model_combo.addItem("Follow Tab 1 selection", "")
+        for key, spec in ctx.registry.items():
+            self.run_model_combo.addItem(spec.display_name, key)
+        idx = self.run_model_combo.findData(want_key if self.ctx.settings.run_model_key
+                                            else "")
+        self.run_model_combo.setCurrentIndex(max(0, idx))
+        self.run_model_combo.blockSignals(False)
+        self._populate_run_quants(preserve=(want_key, want_q))
+        self._update_follow_label()
+
+    def _populate_run_quants(self, preserve: "tuple[str, str] | None" = None):
+        """Quant/file list for the current 'Model to run' choice."""
+        ctx = self.ctx
+        cur_key = ctx.run_model_key
+        spec = ctx.registry.get(cur_key)
+        want_q = ""
+        if preserve and preserve[0] == cur_key:
+            want_q = preserve[1]
+        elif ctx.settings.run_quant and spec \
+                and spec.file_for_quant(ctx.settings.run_quant) is not None:
+            want_q = ctx.settings.run_quant
+        elif cur_key == ctx.selected_model_key and spec \
+                and spec.file_for_quant(ctx.selected_quant) is not None:
+            want_q = ctx.selected_quant
+        self.run_quant_combo.blockSignals(True)
+        self.run_quant_combo.clear()
+        if spec is not None:
+            for f in spec.files:
+                self.run_quant_combo.addItem(f"{f.quant}  [{f.filename}]",
+                                             f.quant)
+        idx = -1
+        for i in range(self.run_quant_combo.count()):
+            data = self.run_quant_combo.itemData(i)
+            if want_q and data == want_q:
+                idx = i
+                break
+        if idx < 0 and want_q and spec:
+            alt = spec.file_for_quant(want_q)
+            if alt is not None:
+                for i in range(self.run_quant_combo.count()):
+                    if self.run_quant_combo.itemData(i) == alt.quant:
+                        idx = i
+                        break
+        self.run_quant_combo.setCurrentIndex(max(0, idx))
+        q = self.run_quant_combo.currentData() or ""
+        if q:
+            ctx.settings.run_quant = q
+        self.run_quant_combo.blockSignals(False)
+        self._update_follow_label()
+
+    def _on_run_model_changed(self, _index: int = 0):
+        key = self.run_model_combo.currentData() or ""
+        self.ctx.settings.run_model_key = key
+        if key:
+            spec = self.ctx.registry.get(key)
+            # switching families invalidates the old quant choice unless it
+            # also exists in the new repo
+            q = self.ctx.settings.run_quant
+            if spec is not None and q and spec.file_for_quant(q) is None:
+                self.ctx.settings.run_quant = ""
+        self._populate_run_models()
+        self.ctx.save_settings()
+        k = self.ctx.run_model_key
+        if k != self._profiled_key:
+            self._profiled_key = k
+            self._apply_profile_defaults()
+        else:
+            self._populate_thinking_levels(
+                self.ctx.settings.thinking_level
+                or self.ctx.settings.reasoning_budget)
+            self.refresh_plan()
+
+    def _on_run_quant_changed(self, _index: int = 0):
+        q = self.run_quant_combo.currentData()
+        if q:
+            self.ctx.settings.run_quant = q
+            self.ctx.save_settings()
+        self._update_follow_label()
+        self.refresh_plan()
+
+    def _update_follow_label(self):
+        """Show exactly which main GGUF llama-server will launch with."""
+        mf = self.ctx.run_model_file
+        if mf is None:
+            self.follow_label.setText(
+                "Run target: none available - download a model in Tab 1.")
+            return
+        mode = ("explicit" if self.ctx.settings.run_model_key
+                else "follows Tab 1")
+        try:
+            here = mf.local_path().is_file()
+        except OSError:
+            here = False
+        self.follow_label.setText(
+            f"Run target ({mode}): {mf.repo_id} / {mf.quant}\n"
+            f"  file: {mf.filename}"
+            + ("" if here else "   [NOT downloaded - see Tab 1]"))
 
     def _populate_thinking_levels(self, select):
         """Fill the Thinking-level combo from the active model profile.
@@ -581,26 +738,33 @@ class InferenceTab(QWidget):
     def compute_plan(self):
         """Build the resource plan; never raises - reports instead.
 
+        Always plans for the Tab 2 *run target* (explicit 'Model to run'
+        override, otherwise the Tab 1 selection) so the previewed -c/-ngl
+        numbers match what Start will actually launch.
+
         Returns ``(plan, model_file, arch)`` or ``(None, None, None)`` after
         emitting a verbose error report through ``ctx.report_error``.
         """
         ctx = self.ctx
-        spec = ctx.active_model_spec
-        mf = spec.file_for_quant(ctx.selected_quant)
+        spec = ctx.registry[ctx.run_model_key]
+        mf = ctx.run_model_file
         if mf is None:
             ctx.report_error(
                 "No GGUF entry for quantization "
-                f"'{ctx.selected_quant}' of '{spec.display_name}'.\n"
-                "    fix    : pick another quant in Tab 1.",
+                f"'{ctx.run_quant}' of '{spec.display_name}'.\n"
+                "    fix    : pick another file in the 'Quant / file' dropdown "
+                "(or press 'Refresh from Hub' in Tab 1).",
                 context="resource planning", dialog=False)
             return None, None, None
         try:
             arch = read_arch_info(spec.hf_config_repo, mf.local_path())
-            mm = mf.mmproj_local_path() if mf.mmproj_filename else None
+            # Resolve this model's own projector (live repo listing first);
+            # never a foreign repo's mmproj - see resolve_mmproj_companion.
+            mm = mf.mmproj_local_path()
             # Per-model/per-quant KV-cache hard limit from the profile
             # (run-out-of-the-box presets); falls back to the global cap for
             # models without a profile entry.
-            prof = get_model_profile(ctx.selected_model_key)
+            prof = get_model_profile(ctx.run_model_key)
             max_ctx = prof.max_context_by_quant.get(mf.quant or "")
             plan = plan_resources(ctx.hw, mf, arch,
                                   cache_type=ctx.settings.cache_type,
@@ -651,9 +815,22 @@ class InferenceTab(QWidget):
         ctx = self.ctx
         from app.core.server import ServerConfig
         mm_path = None
-        if mf.mmproj_filename and mf.mmproj_local_path():
-            p = mf.mmproj_local_path()
-            if p.is_file():
+        # Resolve this model's *own* projector; refuse to pass a companion
+        # that belongs to a different repo (the ToriiGate-mmproj-on-Qwen
+        # crash): llama-server aborts at load time with an n_embd mismatch.
+        p = mf.mmproj_local_path()
+        if p is not None and p.is_file():
+            try:
+                bad = mf.mmproj_companion_error(p)
+            except Exception:
+                bad = None
+            if bad:
+                ctx.log.emit(
+                    f"[server] WARNING: ignoring incompatible mmproj for "
+                    f"{mf.filename}: {bad}\n"
+                    f"    server would start text-only; run 'Download & "
+                    f"Verify' in Tab 1 to fetch this model's own projector.")
+            else:
                 mm_path = str(p)
         cfg = ServerConfig(
             model=mf,
