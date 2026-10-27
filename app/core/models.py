@@ -1001,15 +1001,36 @@ class ModelFile:
             mp_arch = _read_gguf_metadata(Path(companion_path))
         except Exception:
             mp_arch = None
-        # 1. cross-repo name sniffing (works even without readable headers)
+        # 1. cross-repo name sniffing (works even without readable headers).
+        #    Real-world projector names carry the *model* slug but usually not
+        #    the "-GGUF" repo suffix ("ToriiGate-0.5-Q8_0.mmproj.gguf"), so the
+        #    raw repo slug alone misses; strip trailing quant/format tags to
+        #    get a distinctive base name as well.
+        def _base_of(slug: str) -> str:
+            import re as _re
+            s = slug.lower()
+            prev = None
+            while s != prev:                      # peel e.g. '-gguf', '.gguf'
+                prev = s
+                s = _re.sub(r"[-._ ]?(gguf|safetensors)$", "", s)
+                s = _re.sub(r"[-._ ](mtp|rco|gsq|abliterated|unsloth|"
+                            r"hf|v\d+(\.\d+)*)$", "", s)
+            return s.strip("-._ ")
+
         mp_name = Path(companion_path).name.lower()
         own_slug = self.repo_id.split("/")[-1].lower()
+        own_base = _base_of(own_slug)
         for spec in _all_specs():
             other_repo = spec.source_repo.lower()
             if other_repo == self.repo_id.lower():
                 continue
             other_slug = other_repo.split("/")[-1].lower()
-            if other_slug and other_slug in mp_name and own_slug not in mp_name:
+            other_base = _base_of(other_slug)
+            hit = ((other_slug and other_slug in mp_name)
+                   or (len(other_base) >= 4 and other_base in mp_name))
+            own_hit = ((own_slug and own_slug in mp_name)
+                       or (len(own_base) >= 4 and own_base in mp_name))
+            if hit and not own_hit:
                 return (f"'{Path(companion_path).name}' belongs to repository "
                         f"'{spec.source_repo}', not '{self.repo_id}'")
         # 2. architecture comparison via GGUF headers
