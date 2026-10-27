@@ -1,8 +1,11 @@
 """Tab 5 - Batch Processing.
 
 * Image selection list (checkboxes) synced from the Dataset Explorer root;
-  whole folders can be checked at once via the folder row.
-* Start Auto-Caption / Stop / Save All controls.
+  whole folders can be checked at once via the folder row.  Clicking
+  anywhere on a row (not just the tiny indicator box) toggles its checkbox.
+* Start Auto-Caption / Stop / Save All controls, plus "Batch Save Extant
+  Captions" which re-saves every existing sidecar of the checked images in
+  the active preset's output format without contacting llama-server.
 * Global progress bar + live Log Output tailing llama-server stdout and the
   streamed caption deltas.
 """
@@ -15,10 +18,38 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QGroupBox,
                                QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QPlainTextEdit, QProgressBar,
-                               QPushButton, QVBoxLayout, QWidget)
+                               QPushButton, QStyle, QVBoxLayout, QWidget)
 
 from app.context import AppContext
 from app.core.batch import BatchWorker, collect_images
+from app.core.presets import load_existing_caption, save_caption
+
+
+class _WideCheckListWidget(QListWidget):
+    """QListWidget where clicking anywhere on a row toggles its checkbox.
+
+    By default only the small indicator square reacts to clicks; this
+    extends the hit area to the whole row (i.e. the image name as well).
+    Clicks that land directly on the indicator itself are left to Qt's
+    normal handling so the state is never flipped twice.
+    """
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            it = self.itemAt(pos)
+            if it is not None and it.flags() & Qt.ItemIsUserCheckable:
+                indicator_w = self.style().pixelMetric(QStyle.PM_IndicatorWidth)
+                rect = self.visualItemRect(it)
+                # Indicator zone at the start of the row -> default handling.
+                if pos.x() - rect.left() > indicator_w + 4:
+                    it.setCheckState(
+                        Qt.Unchecked if it.checkState() == Qt.Checked
+                        else Qt.Checked)
+                    # Consume the event so no rubber-band selection starts.
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
 
 
 class BatchTab(QWidget):
@@ -44,7 +75,7 @@ class BatchTab(QWidget):
 
         sel_box = QGroupBox("Images selected for batch captioning")
         sb = QVBoxLayout(sel_box)
-        self.list = QListWidget()
+        self.list = _WideCheckListWidget()
         self.list.setSelectionMode(QAbstractItemView.NoSelection)
         sb.addWidget(self.list)
         root.addWidget(sel_box, stretch=2)
@@ -57,6 +88,16 @@ class BatchTab(QWidget):
         self.save_all_btn.setToolTip(
             "Flush every sidecar caption already written to disk "
             "(files are saved per-image as they complete).")
+        # Batch-save button: re-writes (normalises) every *existing* caption
+        # of the checked images into the active preset's sidecar format,
+        # without contacting llama-server.
+        self.batch_save_btn = QPushButton("Batch Save Extant Captions")
+        self.batch_save_btn.setToolTip(
+            "For every CHECKED image that already has a caption file\n"
+            "(.txt or .json sidecar), load it and save it back in the\n"
+            "active preset's output format — MOSS presets write a parsed\n"
+            ".json, tag presets a cleaned .txt.  No server required;\n"
+            "images without an existing caption are skipped.")
         # Verbose llama-server conversation logging: when ticked, every
         # request/response exchange is dumped into the Log Output below -
         # full prompts sent (images elided), streamed answers, thinking /
@@ -75,6 +116,7 @@ class BatchTab(QWidget):
         controls.addWidget(self.start_btn)
         controls.addWidget(self.stop_btn)
         controls.addWidget(self.save_all_btn)
+        controls.addWidget(self.batch_save_btn)
         controls.addWidget(self.verbose_check)
         controls.addStretch(1)
         root.addLayout(controls)
@@ -104,6 +146,7 @@ class BatchTab(QWidget):
         self.start_btn.clicked.connect(self.start_batch)
         self.stop_btn.clicked.connect(self.stop_batch)
         self.save_all_btn.clicked.connect(self.save_all)
+        self.batch_save_btn.clicked.connect(self.batch_save_extant_captions)
         self.ctx.server_state.connect(self.on_server_state)
         self.ctx.log.connect(self.append_log)
         self.ctx.model_changed.connect(lambda: None)   # no-op keeps tabs in sync
@@ -211,6 +254,45 @@ class BatchTab(QWidget):
                 if os.path.isfile(base + ".txt") or os.path.isfile(base + ".json"):
                     n += 1
         self.append_log(f"[batch] {n} caption file(s) present on disk for this list.")
+
+    def batch_save_extant_captions(self):
+        """Batch-save every *existing* caption of the checked images.
+
+        For each checked image that already has a sidecar caption (.txt or
+        .json) the caption is loaded and re-saved through the normal
+        save path, which normalises it into the active preset's output
+        format (parsed MOSS JSON -> .json, cleaned tags -> .txt).  Images
+        without an existing caption are skipped; no server round-trip is
+        performed.
+        """
+        images = self.checked_images()
+        if not images:
+            self.append_log("[batch] nothing checked - use Check all or tick "
+                            "rows before batch-saving captions.")
+            return
+        fmt = self.ctx.active_preset.output_format
+        saved = skipped = failed = 0
+        for img in images:
+            kind, text = load_existing_caption(img)
+            if not kind or not text.strip():
+                skipped += 1
+                continue
+            try:
+                target = save_caption(img, text, fmt)
+                saved += 1
+                self.append_log(f"[batch] saved caption -> {target}")
+            except Exception as exc:      # noqa: BLE001 - keep going per-file
+                failed += 1
+                self.ctx.report_error(
+                    f"Could not batch-save caption for "
+                    f"'{os.path.basename(img)}': {type(exc).__name__}: {exc}",
+                    context="batch saving extant captions", dialog=False)
+        summary = (f"[batch] batch save finished: {saved} caption(s) saved, "
+                   f"{skipped} without extant caption skipped")
+        if failed:
+            summary += f", {failed} failed"
+        self.append_log(summary + ".")
+        self.progress_label.setText(summary)
 
     # ------------------------------------------------------------------ signals
     def on_progress(self, done: int, total: int):
