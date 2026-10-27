@@ -56,9 +56,15 @@ QWEN_REPO = "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF"
 
 
 class _FakeSpec:
-    """Enough ModelSpec surface for _all_specs()-driven name sniffing."""
+    """Enough ModelSpec surface for _all_specs()-driven name sniffing and
+    the unified mmproj planner (spec_for_repo / plan_mmproj_download)."""
     def __init__(self, source_repo):
         self.source_repo = source_repo
+        self.key = source_repo              # spec_for_repo() may probe .key
+        self.mmproj_candidates: list[str] = []
+
+    def file_for_quant(self, quant):        # used by resolve_mmproj_companion
+        return None
 
 
 def _install_storage(tmp_path: Path, monkeypatch):
@@ -176,7 +182,7 @@ def test_preflight_blocks_wrong_mmproj(tmp_path, monkeypatch):
     cfg = ServerConfig(model=qwen, mmproj_path=str(bad_mp), port=48317)
     errors = sm._preflight(cfg)
     joined = "\n".join(errors).lower()
-    assert any("incompatible multimodal projector" in e for e in errors), \
+    assert any("incompatible multimodal projector" in e.lower() for e in errors), \
         f"wrong-mmproj gate did not fire: {errors}"
     assert "mmproj" in joined
 
@@ -223,8 +229,131 @@ def test_build_args_pairs_qwen_main_without_foreign_mmproj(tmp_path,
     # (_preflight) would already have blocked it.
     cfg_bad = ServerConfig(model=qwen, mmproj_path=str(torii_mp), port=48319)
     errors = sm._preflight(cfg_bad)
-    assert any("incompatible multimodal projector" in e for e in errors) \
-        and any("ToriiGate" in e for e in errors), errors
+    lowered = [e.lower() for e in errors]
+    assert any("incompatible multimodal projector" in e for e in lowered) \
+        and any("toriigate" in e for e in lowered), errors
+
+
+# --------------------------------------------------------------------------
+# 5. plan_mmproj_download - unified discovery pipeline (both tabs)
+#    local cache -> live main-repo listing -> companion repo -> offline
+# --------------------------------------------------------------------------
+def test_plan_reuses_cached_local_projector(tmp_path, monkeypatch):
+    """ToriiGate-style: cached same-repo mmproj -> no download needed."""
+    _install_storage(tmp_path, monkeypatch)
+    monkeypatch.setattr(M, "resolve_mmproj_live",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not hit the network")))
+    needed, msg, path = M.plan_mmproj_download(_torii_file())
+    assert needed is False
+    assert path is not None and path.name == "ToriiGate-0.5-Q8_0.mmproj.gguf"
+    assert "re-using cached projector" in msg
+
+
+def test_plan_discovers_qwen_style_name_from_live_listing(tmp_path, monkeypatch):
+    """Qwen-style 'mmproj-*.gguf' names come verbatim from the live Hub
+    listing - never composed locally - and are adopted onto the ModelFile."""
+    _install_storage(tmp_path, monkeypatch)
+    qwen = _qwen_file()
+    seen = []
+
+    def fake_live(repo, quant, force_refresh=False):
+        seen.append(repo)
+        return "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
+
+    monkeypatch.setattr(M, "resolve_mmproj_live", fake_live)
+    needed, msg, path = M.plan_mmproj_download(qwen)
+    assert needed is True and path is None
+    assert msg == "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
+    assert qwen.mmproj_filename == msg          # adopted for verify/preflight
+    assert seen == [QWEN_REPO]                  # main repo tried first
+
+
+def test_plan_prefers_companion_repo_override(tmp_path, monkeypatch):
+    """MMPROJ_REPO_OVERRIDE puts the companion repo FIRST in the lookup
+    order; the main repo remains as fallback candidate."""
+    _install_storage(tmp_path, monkeypatch)
+    companion = "unsloth/Huihui-Qwen3.8-27B-Vision"   # distinct from main repo
+    # _FakeSpec.key == source_repo, so key the override by repo id
+    monkeypatch.setattr(M, "MMPROJ_REPO_OVERRIDE", {QWEN_REPO: companion})
+    seen = []
+
+    def fake_live(repo, quant, force_refresh=False):
+        seen.append(repo)
+        if repo == QWEN_REPO:
+            return None          # main repo publishes no projector
+        return f"mmproj-{repo.split('/')[-1]}-F16.gguf"
+
+    monkeypatch.setattr(M, "resolve_mmproj_live", fake_live)
+    needed, msg, _p = M.plan_mmproj_download(_qwen_file())
+    assert needed is True
+    assert seen[0] == companion                 # companion queried first
+    assert seen[1:] == [QWEN_REPO]              # de-duplicated, main as fallback
+    assert companion in msg                     # exact filename from it
+
+
+def test_plan_offline_falls_back_to_remembered_name(tmp_path, monkeypatch):
+    """Hub unreachable (resolve_mmproj_live -> None): a previously adopted
+    name may still be used to queue the download."""
+    _install_storage(tmp_path, monkeypatch)
+    qwen = _qwen_file()
+    qwen.mmproj_filename = "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
+    monkeypatch.setattr(M, "resolve_mmproj_live",
+                        lambda *a, **k: None)
+    needed, msg, _p = M.plan_mmproj_download(qwen)
+    assert needed is True
+    assert msg == qwen.mmproj_filename
+
+
+def test_plan_reports_unavailability_when_nothing_found(tmp_path, monkeypatch):
+    """No local file, no live listing, no remembered name, no bundled
+    candidates -> honest report instead of a composed guess."""
+    _install_storage(tmp_path, monkeypatch)
+    qwen = _qwen_file()
+    monkeypatch.setattr(M, "resolve_mmproj_live",
+                        lambda *a, **k: None)
+    needed, msg, path = M.plan_mmproj_download(qwen)
+    assert needed is False and path is None
+    assert "unavailable" in msg and QWEN_REPO in msg
+
+
+def test_ensure_mmproj_downloaded_success(tmp_path, monkeypatch):
+    _install_storage(tmp_path, monkeypatch)
+    qwen = _qwen_file()
+    monkeypatch.setattr(M, "resolve_mmproj_live",
+                        lambda *a, **k: "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf")
+    got_dir = (tmp_path / "big_models_cache_huggingface" / "unsloth"
+               / QWEN_REPO.replace("/", "--"))
+    made = got_dir / "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
+
+    def fake_dl(repo, files):
+        assert repo == QWEN_REPO and files == \
+            ["mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"]
+        made.write_bytes(b"x" * 2048)
+        return [made]
+
+    monkeypatch.setattr(M, "download_model_files", fake_dl)
+    logs = []
+    ok, msg = M.ensure_mmproj_downloaded(qwen, log_cb=logs.append)
+    assert ok is True and "projector ready" in msg
+    assert any("[mmproj]" in l for l in logs)
+
+
+def test_ensure_mmproj_downloaded_failure_report(tmp_path, monkeypatch):
+    _install_storage(tmp_path, monkeypatch)
+    qwen = _qwen_file()
+    monkeypatch.setattr(M, "resolve_mmproj_live",
+                        lambda *a, **k: "mmproj-Qwen-F16.gguf")
+
+    def boom(repo, files):
+        raise M.AppError("File or repository not found on the Hub",
+                         detail="404 Client Error",
+                         suggestions=["verify filenames in the registry"])
+
+    monkeypatch.setattr(M, "download_model_files", boom)
+    ok, msg = M.ensure_mmproj_downloaded(qwen)
+    assert ok is False
+    assert "not found" in msg.lower() and "404" in msg
 
 
 if __name__ == "__main__":

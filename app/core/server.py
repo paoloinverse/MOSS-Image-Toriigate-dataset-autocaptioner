@@ -277,8 +277,10 @@ class ServerManager(QObject):
                 if mp is None or not Path(mp).is_file():
                     errors.append(
                         f"Multimodal projector (mmproj) missing: {mmproj_needed}\n"
-                        "    fix    : image captioning requires the mmproj GGUF; run "
-                        "'Download & Verify' in Tab 1.")
+                        "    fix    : image captioning requires the mmproj GGUF; press\n"
+                        "             'Fetch mmproj' next to 'Model to run' in Tab 2\n"
+                        "             (or 'Download & Verify' in Tab 1) - both use the\n"
+                        "             same live-Hub discovery pipeline.")
             # Wrong-projector guard: the auto-detection fallback used to grab
             # *any* mmproj from the model library, which paired ToriiGate's
             # projector with the Qwen3.8-27B main GGUF and made llama-server
@@ -294,12 +296,13 @@ class ServerManager(QObject):
                 if bad:
                     errors.append(
                         f"Incompatible multimodal projector for "
-                        f"'{cfg.model.filename}': {bad}\n"
-                        f"    would pass: --mmproj {cfg.mmproj_path}\n"
+                        f"'{cfg.model.filename}': {bad} "
+                        f"(would pass: --mmproj {cfg.mmproj_path})\n"
                         "    fix    : download this model's own mmproj via "
-                        "'Download & Verify' in Tab 1 (the live repo listing "
-                        "includes its projector), or clear 'Extra args' if you "
-                        "set --mmproj manually there.")
+                        "'Fetch mmproj' in Tab 2 (or 'Download & Verify' in "
+                        "Tab 1 - both use the live repo listing, which "
+                        "includes its projector), or clear 'Extra args' if "
+                        "you set --mmproj manually there.")
 
         # Port sanity / availability check (cheap socket bind probe).
         if not (1 <= cfg.port <= 65535):
