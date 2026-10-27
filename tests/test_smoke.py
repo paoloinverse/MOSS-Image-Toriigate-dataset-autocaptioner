@@ -488,6 +488,51 @@ def test_collect_images():
         check("non-recursive finds one", len(nonrec) == 1, str(nonrec))
 
 
+# ------------------------------------------------- split default + startup cfg
+def test_split_default_and_startup_config():
+    from app.core.server import ServerConfig
+    from app.context import InferenceSettings
+    check("ServerConfig split default", ServerConfig().split_mode == "layer")
+    check("InferenceSettings split default",
+          InferenceSettings().split_mode == "layer")
+
+    from app.core.models import find_startup_config, import_full_config
+    with tempfile.TemporaryDirectory() as td:
+        # discovery: explicit $APPCAP_CONFIG (file or dir) beats CWD
+        cfg = os.path.join(td, "captioner_config.json")
+        Path(cfg).write_text("{}", encoding="utf-8")
+        old_env, old_cwd = os.environ.get("APPCAP_CONFIG"), os.getcwd()
+        try:
+            os.environ["APPCAP_CONFIG"] = cfg
+            check("env file path found", find_startup_config() == cfg)
+            os.environ["APPCAP_CONFIG"] = td
+            check("env dir resolved", find_startup_config() == cfg)
+            del os.environ["APPCAP_CONFIG"]
+            os.chdir(td)
+            check("cwd fallback found", find_startup_config() == cfg)
+        finally:
+            os.chdir(old_cwd)
+            if old_env is None:
+                os.environ.pop("APPCAP_CONFIG", None)
+            else:
+                os.environ["APPCAP_CONFIG"] = old_env
+
+        # importer overrides hardwired defaults (presets-only v1 included)
+        class _Stub:
+            presets, active_preset_key, explicit_mode = {}, "moss", False
+            settings = InferenceSettings()
+            storage = None
+            selected_model_key, selected_quant = "toriigate", "Q8_0"
+            registry = {}
+        legacy = {"version": 1, "active_preset": "moss", "explicit_mode": True,
+                  "presets": {}}
+        st = _Stub()
+        warns = import_full_config(st, json.dumps(legacy))
+        check("v1 import sets explicit mode", st.explicit_mode is True)
+        check("v1 import warns about legacy", any("legacy" in w for w in warns),
+              str(warns))
+
+
 if __name__ == "__main__":
     test_kv_context_sizing()
     test_arch_from_config()
@@ -496,5 +541,6 @@ if __name__ == "__main__":
     test_model_profiles()
     test_payload()
     test_collect_images()
+    test_split_default_and_startup_config()
     print("\n%d failure(s): %s" % (len(FAILURES), FAILURES or "none"))
     sys.exit(1 if FAILURES else 0)

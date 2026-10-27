@@ -82,12 +82,30 @@ Afterwards just start the app again with `./run.sh`.
 | Tab | Purpose |
 | --- | --- |
 | **Hardware & Models** | Select GPUs, watch VRAM/RAM meters, pick model + quantization, "Download & Verify" |
-| **Inference Parameters** | Raw `llama-server` flags, Temperature/Top-P/Top-K/Min-P sliders, Reasoning Budget, KV-cache quantization |
+| **Inference Parameters** | Raw `llama-server` flags, Temperature/Top-P/Top-K/Min-P sliders, Reasoning Budget, KV-cache quantization, multi-GPU tensor-split mode (`layer` default — the llama.cpp-recommended split — / `row` / `graph`, passed as `-sm`) |
 | **Captioning Presets** | MOSS-Image / Booru-SDXL / Custom prompts, Explicit Mode toggle, Export/Import config JSON |
 | **Dataset Explorer** | Pick dataset directory (recursive option), browse images, zoom/pan viewer |
 | **Batch Processing** | Select folders/images, Start Auto-Caption / Stop / Save All, **Batch Save Extant Captions** (re-saves every existing sidecar of the checked images in the active preset's format — MOSS JSON → `.json`, tags → cleaned `.txt` — no server round-trip; images without a caption are skipped), progress bar + live `llama-server` log; clicking anywhere on an image row toggles its checkbox; **"Verbose conversation log"** checkbox dumps the full llama-server exchange into the Log Output: every prompt sent (system + user text, base64 images shown as size placeholders), streamed answer deltas, thinking/reasoning output (`delta.reasoning_content`) tagged `[thinking]`, raw SSE chunks, finish reason and token usage — all prefixed with `[llama]` |
 
 The **global side panel** always shows the focused image's caption editor (loads existing `.txt`/`.json` captions) with a manual "Save Caption" button.
+
+### Startup configuration override (`captioner_config.json`)
+
+At launch the app looks for an optional `captioner_config.json` and, if found,
+imports it automatically — overriding the hardwired preset defaults as well as
+the persisted Tab 1/Tab 2 settings, storage location and model selection before
+any tab is built. Search order (first existing file wins):
+
+1. `$APPCAP_CONFIG` — explicit path to the JSON file, or a directory containing `captioner_config.json`
+2. `captioner_config.json` in the current working directory
+3. `captioner_config.json` in the project root (next to `run.sh`)
+
+Both the unified bundle produced by *Captioning Presets → Export full
+application config* and legacy presets-only files are accepted; unknown keys
+are skipped with warnings and a corrupt file never blocks startup (the import
+result and any warnings are written to the Log Output). To pin a machine's
+configuration, export once next to the launcher and every start afterwards
+replays it.
 
 ### Fuzzy JSON schema handling
 
