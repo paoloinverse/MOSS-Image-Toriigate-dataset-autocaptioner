@@ -23,7 +23,7 @@ from app.core.hardware import GPUInfo, HardwareManager
 from app.core.models import (AppError, STORAGE_DEFAULT, STORAGE_UNSLOTH,
                              ModelFile, StorageLocationError,
                              download_model_files, estimate_download_mb,
-                             resolve_mmproj, verify_downloaded)
+                             plan_mmproj_download, verify_downloaded)
 from app.context import AppContext
 
 
@@ -402,30 +402,30 @@ class HardwareModelsTab(QWidget):
         if mf is None:
             self.mmproj_label.setText("mmproj: —")
             return
-        spec = self.ctx.active_model_spec
-        state = []
+        # Unified planner (shared with Tab 2): local fuzzy scan first, then a
+        # live lookup of the repo listing - never a composed filename.
+        mp_path = None
+        needed = False
         try:
-            # Fuzzy companion lookup: finds Unsloth-style names
-            # ('mmproj-Model-Q8_0.gguf') as well as our default
-            # ('Model-Q8_0.mmproj.gguf'); adopts the discovered name.
-            mp_path, mm_name = mf.resolve_mmproj_companion()
-            if mp_path is None:
-                mm_name = mm_name or resolve_mmproj(spec, mf) or "(none found)"
+            needed, _msg, mp_path = plan_mmproj_download(
+                mf, log_cb=self.ctx.log.emit)
+            mm = mf.mmproj_filename or "(none found)"
         except Exception as exc:      # e.g. unexpected Hub API breakage
-            mp_path, mm = None, "(lookup failed)"
-            self.ctx.report_error(exc, context=f"auto-detecting mmproj for {spec.source_repo}")
-        else:
-            mm = mm_name or "(none found)"
+            needed, mm = False, "(lookup failed)"
+            self.ctx.report_error(exc, context=f"auto-detecting mmproj for {mf.repo_id}")
         try:
             gguf_here = mf.local_path().is_file()
         except OSError:
             gguf_here = False
+        state = []
         if gguf_here:
             state.append(f"GGUF cached ({mf.local_path().parent})")
         if mp_path is not None:
             state.append(f"mmproj cached ({mp_path.parent})")
-        elif mm != "(none found)":
+        elif needed:
             state.append("mmproj NOT found locally - would be downloaded")
+        elif mm != "(none found)":
+            state.append("no projector available - see Log")
         self.mmproj_label.setText(f"mmproj: {mm}" +
                                   (f"   [{', '.join(state)}]" if state else ""))
         self.ctx.model_changed.emit()
@@ -542,20 +542,17 @@ class HardwareModelsTab(QWidget):
             return
         spec = self.ctx.active_model_spec
         names = [mf.filename]
-        # Fuzzy companion lookup first: if the projector already exists in
-        # the selected storage under a non-default name (Unsloth layout),
-        # adopt that name instead of queueing a duplicate download.
+        # Unified mmproj planner (same pipeline as Tab 2): re-uses a local
+        # projector under any name (Unsloth layout), otherwise adopts the
+        # exact filename from the live Hub listing - never a composed guess.
         try:
-            mp_path, mm_name = mf.resolve_mmproj_companion()
+            needed, msg, mp_path = plan_mmproj_download(
+                mf, log_cb=self.ctx.log.emit)
         except Exception as exc:
-            mp_path, mm_name = None, mf.mmproj_filename
+            needed, msg, mp_path = bool(mf.mmproj_filename), mf.mmproj_filename, None
             self.ctx.report_error(exc, context="mmproj detection before download")
-        if mp_path is not None:
-            self.ctx.log.emit(f"[dl] mmproj re-use OK: {mp_path}")
-        mm = mm_name or resolve_mmproj(spec, mf)
-        if mm:
-            mf.mmproj_filename = mm
-            names.append(mm)
+        if needed and msg:
+            names.append(msg)       # planner already adopted mf.mmproj_filename
 
         # ---- heavy-download guard ----------------------------------------
         # GGUFs are routinely 10-30 GiB.  Never pull them silently: estimate
