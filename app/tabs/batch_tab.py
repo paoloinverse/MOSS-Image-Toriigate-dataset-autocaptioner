@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QGroupBox,
                                QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QPlainTextEdit, QProgressBar,
@@ -229,7 +230,7 @@ class BatchTab(QWidget):
             self.log_view.appendPlainText(f">>> {name}:")
             self._stream_marker = name
         cursor = self.log_view.textCursor()
-        cursor.movePosition(cursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         self.log_view.setTextCursor(cursor)
         self.log_view.insertPlainText(delta.replace("\n", " "))
         if self.autoscroll.isChecked():
