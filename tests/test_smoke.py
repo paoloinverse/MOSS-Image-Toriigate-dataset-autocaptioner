@@ -153,10 +153,57 @@ def test_presets_and_postproc():
             ' {"box_2d": [1, 2, 3]}], "borders": "none"}')
     try:
         obj3 = parse_moss_json(junk)
-        check("junk watermark entries skipped",
-              obj3["watermark"] == [] and obj3["borders"] == ["none"])
+        # fuzzy parsing: the bare string is captured as text-only data and
+        # the malformed 3-value box is skipped -- nothing crashes.
+        check("junk watermark entries handled",
+              obj3["watermark"] == [{"label": "nope"}]
+              and obj3["borders"] == ["none"])
     except Exception as exc:      # noqa: BLE001
-        check("junk watermark entries skipped", False, str(exc))
+        check("junk watermark entries handled", False, str(exc))
+
+    # Regression (ToriiGate-0.5): fuzzy schema -- watermark is a nested dict
+    # of per-panel text entries AND the model adds an out-of-spec
+    # bounding_boxes section with 0-1 coords and null panels.  None of that
+    # data may be silently dropped.
+    fuzzy = json.dumps({
+        "caption": {"long": "L", "medium": "M", "short": "S"},
+        "watermark": {
+            "panel_6": {"text": "01.26"},
+            "panel_6_signature": {"text": "2023"},
+            "panel_6_additional_signature": {"text": "SARA"},
+            "page_title": "Brooke draws a manga page every week challenge 2023 #1",
+        },
+        "bounding_boxes": {
+            "panel_1": {"character": [0.2, 0.7, 0.3, 0.8],
+                        "face": [0.25, 0.75, 0.28, 0.78]},
+            "panel_2": None,
+            "panel_4": {"character": [0.5, 0.75, 0.6, 0.8], "face": None},
+            "panel_6": {"character": [0.55, 0.7, 0.85, 0.85],
+                        "face": [0.75, 0.75, 0.78, 0.78]},
+        },
+        "borders": ["none"],
+    })
+    try:
+        obj4 = parse_moss_json(fuzzy)
+        wm_labels = [w["label"] for w in obj4["watermark"]]
+        check("fuzzy nested watermark captured",
+              wm_labels == ["01.26", "2023", "SARA",
+                            "Brooke draws a manga page every week challenge 2023 #1"],
+              str(wm_labels))
+        bb_ids = [r["id"] for r in obj4.get("bounding_boxes", [])]
+        check("fuzzy bounding_boxes captured",
+              bb_ids == ["bounding_boxes.panel_1.character",
+                         "bounding_boxes.panel_1.face",
+                         "bounding_boxes.panel_4.character",
+                         "bounding_boxes.panel_6.character",
+                         "bounding_boxes.panel_6.face"],
+              str(bb_ids))
+        first = obj4["bounding_boxes"][0]
+        check("0-1 coords scaled to 0-1000",
+              first["box_2d"] == [200, 700, 300, 800], str(first))
+        check("null panels skipped", all("box_2d" in r for r in obj4["bounding_boxes"]))
+    except Exception as exc:      # noqa: BLE001
+        check("fuzzy nested watermark captured", False, str(exc))
 
     tags = clean_booru_tags("1girl, smile, 1girl, looking at viewer\nbrown hair")
     check("booru dedupe+join", tags == "1girl, smile, looking at viewer, brown hair",

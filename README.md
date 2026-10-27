@@ -89,6 +89,25 @@ Afterwards just start the app again with `./run.sh`.
 
 The **global side panel** always shows the focused image's caption editor (loads existing `.txt`/`.json` captions) with a manual "Save Caption" button.
 
+### Fuzzy JSON schema handling
+
+Models like ToriiGate-0.5 frequently deviate from the strict MOSS schema in
+their responses — e.g. `watermark` as a nested per-panel dict
+(`{"panel_6": {"text": "01.26"}, "page_title": "..."}`) instead of a list of
+`{box_2d, label}`, or an out-of-spec `bounding_boxes` section with 0–1
+coordinates and `null` panels. The parser harvests every region-like object
+recursively so no data is silently dropped:
+
+* `watermark` → normalised to the classic `[{box_2d?, label}]` list; textual
+  watermarks without boxes keep their text as `label`.
+* `bounding_boxes` / `extras` → kept as extra sections in the saved sidecar,
+  each entry `{id, box_2d}` where `id` records the JSON path (e.g.
+  `bounding_boxes.panel_1.face`). Float 0–1 coords are auto-scaled to the
+  0–1000 convention; integer coords pass through unchanged.
+* `null` panels, malformed boxes (≠4 numbers), and stray strings never crash
+  the batch; balanced-brace extraction also fixes truncation when reasoning
+  prose surrounds the JSON object.
+
 ## Troubleshooting
 
 - **"qt.qpa.plugin: Could not load the Qt platform plugin xcb"** → install the optional system libraries above, or force Wayland with `QT_QPA_PLATFORM=wayland ./run.sh`.

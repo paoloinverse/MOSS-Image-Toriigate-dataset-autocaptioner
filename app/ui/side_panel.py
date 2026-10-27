@@ -165,9 +165,24 @@ class CaptionSidePanel(QWidget):
                 wm = obj.get("watermark") or []
                 if wm:
                     parts.append(f"watermarks: {len(wm)}")
+                    for w in wm:
+                        if isinstance(w, dict):
+                            box = w.get("box_2d")
+                            tag = f" @{box}" if box else ""
+                            parts.append(f"  · {w.get('label', '')}{tag}")
                 b = obj.get("borders")
                 if b:
                     parts.append(f"borders: {', '.join(map(str, b))}")
+                bb = obj.get("bounding_boxes") or []
+                if bb:
+                    parts.append(f"bounding boxes: {len(bb)}")
+                    for r in bb:
+                        if isinstance(r, dict):
+                            last = str(r.get("id", "")).rsplit(".", 1)[-1]
+                            box = r.get("box_2d")
+                            txt = r.get("text")
+                            desc = f"{last}: {txt}" if txt else last
+                            parts.append(f"  · {desc}" + (f" @{box}" if box else ""))
                 return "\n".join(parts) or "-"
             except Exception:
                 return text[:200]
