@@ -50,6 +50,31 @@ class MainWindow(QMainWindow):
         self.side_panel.caption_saved.connect(lambda p: ctx.log.emit(
             f"[panel] manual caption saved -> {p}"))
 
+        # ---- startup config override ------------------------------------------
+        # Tabs are built from the hardwired/persisted defaults, so if a
+        # captioner_config.json was imported at AppContext construction we
+        # must push that state into the widgets now (same refresh path Tab 3's
+        # Import button uses).
+        if getattr(ctx, "startup_config_source", None):
+            try:
+                self.tab_presets.reload_combos()
+            except Exception as exc:
+                ctx.report_error(exc, context="refreshing presets after "
+                                 "startup config import", dialog=False)
+            try:
+                self.tab_inference.refresh_from_context()
+            except Exception as exc:
+                ctx.report_error(exc, context="refreshing inference tab after "
+                                 "startup config import", dialog=False)
+            try:
+                self.tab_hardware.refresh_from_context()
+            except Exception as exc:
+                ctx.report_error(exc, context="refreshing hardware tab after "
+                                 "startup config import", dialog=False)
+            ctx.log.emit(
+                f"[config] all tabs refreshed from startup config "
+                f"({ctx.startup_config_source})")
+
         self.statusBar().showMessage("Ready.")
         ctx.server_state.connect(lambda s: self.statusBar().showMessage(
             f"llama-server: {s}"))
