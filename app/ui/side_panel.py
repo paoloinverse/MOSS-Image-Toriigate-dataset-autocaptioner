@@ -173,16 +173,25 @@ class CaptionSidePanel(QWidget):
                 b = obj.get("borders")
                 if b:
                     parts.append(f"borders: {', '.join(map(str, b))}")
-                bb = obj.get("bounding_boxes") or []
-                if bb:
-                    parts.append(f"bounding boxes: {len(bb)}")
-                    for r in bb:
+                # Any extra harvested section (bounding_boxes, characters,
+                # background, texts, ...) — rendered generically.
+                skip = {"caption", "watermark", "borders"}
+                for key, val in obj.items():
+                    if key in skip or not isinstance(val, list) or not val:
+                        continue
+                    parts.append(f"{key}: {len(val)}")
+                    for r in val:
                         if isinstance(r, dict):
                             last = str(r.get("id", "")).rsplit(".", 1)[-1]
-                            box = r.get("box_2d")
                             txt = r.get("text")
                             desc = f"{last}: {txt}" if txt else last
-                            parts.append(f"  · {desc}" + (f" @{box}" if box else ""))
+                            tag = ""
+                            if r.get("box_2d"):
+                                tag = f" @{r['box_2d']}"
+                            elif isinstance(r.get("boxes"), dict):
+                                tag = " " + ", ".join(
+                                    f"{n}@{bx}" for n, bx in r["boxes"].items())
+                            parts.append(f"  · {desc}{tag}")
                 return "\n".join(parts) or "-"
             except Exception:
                 return text[:200]

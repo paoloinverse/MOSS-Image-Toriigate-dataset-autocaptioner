@@ -137,6 +137,12 @@ _REGION_KEYS = {"box_2d", "bbox", "bounding_box", "bounding_boxes",
                 "coordinates", "coords", "points"}
 _TEXT_KEYS = ("label", "text", "description", "name")
 
+# Box keys may also appear as suffixes/qualifiers, e.g. ToriiGate emits
+# ``face_bounding_box`` next to ``bounding_box``, and panel sub-keys such as
+# ``panel_1_character`` carry the entity name after the last dot/underscore.
+_BOX_KEY_WORDS = ("box", "bbox", "boxes", "coord", "coords", "coordinates",
+                  "region", "rect")
+
 
 def _looks_like_region(d: dict) -> bool:
     """True if ``d`` carries a bounding box or descriptive text payload."""
@@ -152,13 +158,90 @@ def _bare_box(node) -> bool:
                     for v in node))
 
 
-def _find_box(d: dict):
-    """Return the first valid 4-number box found in ``d`` (or None)."""
-    for key in ("box_2d", "bbox", "bounding_box", "coordinates", "coords"):
-        box = d.get(key)
-        if isinstance(box, (list, tuple)) and len(box) == 4:
-            return box
-    return None
+def _xywh_box(d: dict) -> list | None:
+    """Return a 4-value box assembled from corner keys, or None.
+
+    llama.cpp's structured-output grammar forces models to emit boxes as
+    objects like ``{"x_min": .., "y_min": .., "x_max": .., "y_max": ..}``
+    (also ``xmin/xmax/ymin/ymax`` or ``left/top/right/bottom`` variants);
+    these count as valid boxes just like the ``[.., .., .., ..]`` lists.
+    """
+    def num(*names):
+        if not isinstance(d, dict):
+            return None
+        for n in names:
+            v = d.get(n)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return float(v)
+        return None
+
+    x1 = num("x_min", "xmin", "x1", "left")
+    y1 = num("y_min", "ymin", "y1", "top")
+    x2 = num("x_max", "xmax", "x2", "right")
+    y2 = num("y_max", "ymax", "y2", "bottom")
+    if None in (x1, y1, x2, y2):
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _is_box_key(key: str) -> bool:
+    """True if a JSON key denotes a bounding box (incl. qualified names)."""
+    k = str(key).lower()
+    if k in _REGION_KEYS:
+        return True
+    words = re.split(r"[^a-z0-9]+", k)
+    return any(w in _BOX_KEY_WORDS or w.endswith(("box", "bbox"))
+               for w in words)
+
+
+def _collect_boxes(node, path: list, out: list) -> None:
+    """Recursively harvest every box under ``node`` into ``out``.
+
+    Each hit is ``(suffix_id, box_list)`` where ``suffix_id`` keeps the
+    qualifier of the box key (``face_bounding_box`` -> ``"face"``,
+    ``panel_1.character`` -> ``"character"``) so nested boxes never collide.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            sub = path + [str(k)]
+            box = None
+            if _is_box_key(k):
+                if _bare_box(v):
+                    box = list(v)
+                else:
+                    box = _xywh_box(v)      # {x_min,y_min,x_max,y_max} object
+            if box is not None:
+                out.append((".".join(sub), box))
+            else:
+                _collect_boxes(v, sub, out)
+    elif isinstance(node, (list, tuple)):
+        if _bare_box(node):
+            out.append((".".join(path), list(node)))
+            return
+        for i, v in enumerate(node):
+            _collect_boxes(v, path + [str(i)], out)
+
+
+def _box_suffix(key: str) -> str:
+    """Qualifier of a box key: 'face_bounding_box' -> 'face', 'box_2d' -> ''.
+
+    Strips generic box vocabulary (``bounding``, ``box``, ``bbox``, ``rect``,
+    ``region``, coordinates, corners...) from the key's words and keeps the
+    remainder; digits-only fragments (panel ids like ``2023``) survive.
+    """
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", str(key)) if p]
+    noise = set(_BOX_KEY_WORDS) | {"box_2d", "min", "max", "2d", "bboxes"}
+    keep = []
+    for p in parts:
+        q = p.lower()
+        if q in noise or q.rstrip("s") in noise or q == "bounding":
+            continue
+        # composite box words ('bbox', 'boundingbox') — but never a bare
+        # numeric fragment like the '2' inside 'box_2d'.
+        if len(p) >= 3 and not p.isdigit() and _is_box_key(q):
+            continue
+        keep.append(p)
+    return "_".join(keep).lower()
 
 
 def _clean_box(box) -> list | None:
@@ -217,26 +300,74 @@ def _walk_regions(node, path: list, out: list) -> None:
     """Recursively harvest every region-like dict from a fuzzy structure.
 
     Handles all the shapes real models emit: flat lists of boxes, a single
-    bare object, nested per-panel objects, null panels, and mixed-depth
-    trees.  Each hit becomes ``{id, box_2d?, text?}`` with ``id`` recording
-    the JSON path (e.g. ``watermark.panel_6_signature``).  Bare strings in
-    lists/dicts are captured as text-only regions so nothing is dropped.
+    bare object, nested per-panel objects, null panels, mixed-depth trees,
+    ``{description, bounding_box}`` entity records, and corner-key boxes
+    (``{"x_min": .., "y_min": .., ...}``) forced by llama.cpp's JSON-grammar
+    sampler.  Each hit becomes ``{id, box_2d?, boxes?, text?}`` with ``id``
+    recording the JSON path (e.g. ``watermark.panel_6_signature``).  Bare
+    strings in lists/dicts are captured as text-only regions so nothing is
+    dropped.
     """
     if isinstance(node, dict):
-        box = _find_box(node)
         text = _extract_text(node)
-        if box is not None or text:
-            entry: dict = {"id": ".".join(path) or "root"}
-            if box is not None:
-                cb = _clean_box(box)
+        own_box = None                  # box carried by this dict itself
+        for bk in ("box_2d", "bbox", "bounding_box", "coordinates", "coords"):
+            v = node.get(bk)
+            if _bare_box(v):
+                own_box = list(v)
+                break
+            ob = _xywh_box(v)           # corner-key object forced by grammar
+            if ob is not None:
+                own_box = ob
+                break
+        if own_box is None and not text and any(_is_box_key(k) for k in node):
+            # Bare corner-key box object ({x_min..} etc.) — the *dict itself*
+            # is the region; never treat its coordinate fields as children.
+            own_box = _xywh_box(node)
+        if own_box is not None or text:
+            # Concrete region record.  Harvest any *additional* boxes below it
+            # (face_bounding_box siblings, nested panel sub-keys) so nothing
+            # is silently dropped.
+            found: list = []
+            _collect_boxes(node, [], found)
+            prefix = ".".join(path)
+            extra = [(((prefix + "." + bp) if bp else prefix), b)
+                     for bp, b in found
+                     if list(b) != (own_box or [])]
+            entry: dict = {"id": prefix or "root"}
+            if own_box is not None and not extra:
+                cb = _clean_box(own_box)
                 if cb is not None:
                     entry["box_2d"] = cb
+            elif own_box is not None or extra:
+                # Multiple boxes (body + face): keep them all, keyed by the
+                # qualifier of their JSON key.
+                boxes: dict = {}
+                if own_box is not None:
+                    cb = _clean_box(own_box)
+                    if cb is not None:
+                        boxes[""] = cb
+                for bp, b in extra:
+                    suffix = _box_suffix(bp.rsplit(".", 1)[-1])
+                    if not suffix and boxes:      # avoid a literal "" key
+                        suffix = str(len(boxes) + 1)
+                    cb = _clean_box(b)
+                    if cb is not None:
+                        boxes[suffix] = cb
+                if len(boxes) == 1:
+                    only = next(iter(boxes.values()))
+                    boxes.clear()
+                    entry["box_2d"] = only
+                else:
+                    entry["boxes"] = boxes
             if text:
                 entry["text"] = text
-            # Preserve any extra fields the model invented (confidence, etc.)
-            known = set(_REGION_KEYS) | set(_TEXT_KEYS)
+            # Preserve any extra scalar fields the model invented.
+            known = set(_REGION_KEYS) | set(_TEXT_KEYS) | {
+                k for k in node if _is_box_key(k)}
             for k, v in node.items():
-                if k not in known and k not in entry and isinstance(v, (str, int, float, bool)):
+                if (k not in known and k not in entry
+                        and isinstance(v, (str, int, float, bool))):
                     entry[k] = v
             out.append(entry)
             return                      # treated as leaf region
@@ -284,6 +415,7 @@ def _regions_to_watermarks(regions: list) -> list:
 
     Entries keep ``box_2d``/``label`` when the model supplied them; box-less
     textual watermarks get their panel id as ``label`` so nothing is lost.
+    Extra boxes (e.g. a secondary crop) ride along under ``boxes``.
     """
     wm: list = []
     for r in regions:
@@ -299,15 +431,43 @@ def _regions_to_watermarks(regions: list) -> list:
     return wm
 
 
+# Top-level keys handled explicitly by parse_moss_json; everything else the
+# model volunteers (characters, background, texts, tags, ...) is preserved
+# losslessly via _collect_regions().
+_CORE_KEYS = {"caption", "watermark", "borders"}
+
+
+def _harvest_scalar_section(value, section: str) -> list:
+    """Capture a non-container top-level section without dropping data.
+
+    Plain strings/numbers become ``[{id, text}]`` records and lists of
+    scalars are walked element-wise — ``_walk_regions`` only understands
+    containers, so e.g. ToriiGate's ``"overall_atmosphere": "..."`` used to
+    vanish entirely.
+    """
+    if isinstance(value, str):
+        v = value.strip()
+        return [{"id": section, "text": v}] if v else []
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [{"id": section, "text": str(value)}]
+    out: list = []
+    _walk_regions(value, [section], out)
+    return out
+
+
 def parse_moss_json(raw: str) -> dict:
     """Extract & validate the MOSS schema object from a model response.
 
     Tolerates markdown fences, leading reasoning text, and *fuzzy* schemas:
     models (e.g. ToriiGate-0.5) often deviate from the strict prompt spec by
     emitting ``watermark`` as a nested per-panel dict or adding a separate
-    ``bounding_boxes`` section.  Instead of dropping that data, every
-    region-like object is harvested into normalised lists.  Raises ValueError
-    when no valid JSON object with the expected keys can be recovered.
+    ``bounding_boxes`` section, and — when llama-server runs with a
+    JSON-schema grammar — boxes appear as ``{"x_min":..,"y_min":..,
+    "x_max":..,"y_max":..}`` corner objects next to ``face_bounding_box``,
+    ``characters``/``background``/``texts``/``overall_atmosphere`` sections.
+    Instead of dropping that data, every region-like object is harvested
+    into normalised lists.  Raises ValueError when no valid JSON object with
+    the expected keys can be recovered.
     """
     text = raw.strip()
     if text.startswith("```"):
@@ -336,13 +496,17 @@ def parse_moss_json(raw: str) -> dict:
             }
             if not isinstance(norm["borders"], list):
                 norm["borders"] = ["none"]
-            # Extra sections the model volunteered beyond the strict schema.
-            bb = _collect_regions(obj.get("bounding_boxes"), "bounding_boxes")
-            if bb:
-                norm["bounding_boxes"] = bb
-            extras = _collect_regions(obj.get("extras"), "extras")
-            if extras:
-                norm["extras"] = extras
+            # Every other top-level section the model volunteered beyond
+            # the strict schema (bounding_boxes, characters, background,
+            # texts, overall_atmosphere, extras, ...) is harvested into
+            # its own list so no data is silently dropped.
+            for key, value in obj.items():
+                if key in _CORE_KEYS:
+                    continue
+                regions = _harvest_scalar_section(value, str(key))
+                if regions:
+                    norm.setdefault(key, [])
+                    norm[key].extend(regions)
             return norm
     raise ValueError("Model response did not contain a valid MOSS caption JSON object")
 
