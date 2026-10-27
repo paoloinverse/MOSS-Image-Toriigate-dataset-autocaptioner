@@ -1399,6 +1399,153 @@ def resolve_mmproj(spec: ModelSpec, chosen: ModelFile) -> str | None:
     return mmprojs[0]
 
 
+# ---------------------------------------------------------------------------
+# Unified vision-projector (mmproj) planning - single source of truth used by
+# BOTH Tab 1 ("Download & Verify") and Tab 2 ("Fetch mmproj" / start gate).
+# Every decision here is model-agnostic: ToriiGate-style projectors
+# ("<Model>-Q8_0.mmproj.gguf", same repo as the GGUF) and Qwen-style ones
+# ("mmproj-<Model>-<quant>.gguf", sometimes published in a *separate*
+# companion repo) go through exactly the same discovery pipeline.
+# ---------------------------------------------------------------------------
+#: Optional per-repo override: repos whose multimodal projector lives in a
+#: different Hugging Face repository than the main GGUFs.  Empty by default -
+#: every other repo is resolved purely from its own live listing.
+MMPROJ_REPO_OVERRIDE: dict[str, str] = {}
+
+
+def spec_for_repo(repo_id: str) -> "ModelSpec | None":
+    """The registry :class:`ModelSpec` owning ``repo_id`` (either direction)."""
+    rid = (repo_id or "").lower()
+    for s in _all_specs():
+        if s.source_repo.lower() == rid or s.key == repo_id:
+            return s
+    return None
+
+
+def mmproj_repos_to_try(spec: "ModelSpec | None", mf: "ModelFile") -> list[str]:
+    """Repos that may host ``mf``'s projector, main repo first.
+
+    Includes the optional companion-repo override (for layouts where the
+    projector is published separately) and de-duplicates.
+    """
+    repos: list[str] = []
+    if spec is not None:
+        ov = MMPROJ_REPO_OVERRIDE.get(spec.key) or MMPROJ_REPO_OVERRIDE.get(
+            spec.source_repo)
+        if ov:
+            repos.append(ov)
+    if mf.repo_id not in repos:
+        repos.append(mf.repo_id)
+    return repos
+
+
+def plan_mmproj_download(mf: "ModelFile", *, force_refresh: bool = False,
+                         log_cb=None) -> "tuple[bool, str, Path | None]":
+    """Decide what must happen to make ``mf``'s vision projector available.
+
+    Returns ``(needed, message, local_path)``:
+
+    * ``(False, "...found...", path)`` - the projector is already cached in
+      the active storage (Unsloth re-use included); nothing to download.
+    * ``(True, "<exact Hub filename>", None)`` - not on disk; the message is
+      the verbatim live-Hub filename to fetch (never a composed guess).  The
+      discovered name is adopted onto ``mf.mmproj_filename`` so downstream
+      verify/preflight stays aligned.
+    * ``(False, "<unavailability report>", None)`` - no projector could be
+      located locally or on the Hub (offline, gated, or the repo genuinely
+      publishes none).  The message explains why and what to do next.
+
+    Resolution order (identical for both tabs):
+    1. fuzzy local scan (:meth:`ModelFile.resolve_mmproj_companion`),
+    2. live listing of the main repo (force-refreshable),
+    3. live listing of any configured companion repo,
+    4. offline fallback: last remembered name / bundled seed candidates.
+    """
+    def note(msg: str):
+        if log_cb:
+            log_cb(msg)
+
+    # 1. already on disk?  (adopt Unsloth-style names as a side effect)
+    path, name = mf.resolve_mmproj_companion()
+    if path is not None and path.is_file():
+        if name:
+            mf.mmproj_filename = name
+        note(f"[mmproj] re-use OK: {path}")
+        return False, f"re-using cached projector: {path}", path
+
+    spec = spec_for_repo(mf.repo_id)
+    tried: list[str] = []
+
+    # 2./3. live lookups over every candidate repo (main + companions)
+    for repo in mmproj_repos_to_try(spec, mf):
+        tried.append(repo)
+        live = resolve_mmproj_live(repo, mf.quant, force_refresh=force_refresh)
+        if not live:
+            continue
+        # A live hit may still match a file sitting in another storage dir
+        # under a slightly different name - check before queueing bytes.
+        hit = STORAGE.find_existing(repo, live)
+        if hit is not None and hit.is_file():
+            mf.mmproj_filename = hit.name
+            note(f"[mmproj] re-use OK: {hit}")
+            return False, f"re-using cached projector: {hit}", hit
+        mf.mmproj_filename = live
+        note(f"[mmproj] '{mf.filename}' -> projector '{live}' "
+             f"(live listing of '{repo}')")
+        return True, live, None
+
+    # 4. offline fallbacks - only trustworthy when we already know the name
+    if mf.mmproj_filename:
+        note(f"[mmproj] Hub unreachable; falling back to remembered name "
+             f"'{mf.mmproj_filename}'.")
+        return True, mf.mmproj_filename, None
+    if spec is not None and spec.mmproj_candidates:
+        cand = spec.mmproj_candidates[0]
+        mf.mmproj_filename = cand
+        note(f"[mmproj] Hub unreachable; using bundled candidate '{cand}'.")
+        return True, cand, None
+    note("[mmproj] WARNING: no projector found locally and none could be "
+         f"looked up on the Hub (tried: {', '.join(tried) or mf.repo_id}). "
+         "Check your connection and press 'Refresh from Hub'.")
+    return (False,
+            "vision projector unavailable: not cached locally and no "
+            f"mmproj*.gguf found in '{' / '.join(tried) or mf.repo_id}' "
+            "(offline, gated, or the repo publishes none)",
+            None)
+
+
+def ensure_mmproj_downloaded(mf: "ModelFile", log_cb=None) -> "tuple[bool, str]":
+    """Blocking: make ``mf``'s projector present, downloading it if needed.
+
+    Shared by Tab 1's "Download & Verify" worker and Tab 2's on-demand
+    "Fetch mmproj" action.  Returns ``(ok, message)``; on success the message
+    names the local file, failures carry the verbose report.
+    """
+    needed, msg, path = plan_mmproj_download(mf, log_cb=log_cb)
+    if not needed:
+        if path is not None:
+            return True, msg
+        return False, msg          # unavailability report
+    try:
+        paths = download_model_files(mf.repo_id, [msg])
+    except AppError as exc:
+        if log_cb:
+            log_cb(exc.report())
+        return False, exc.report()
+    except Exception as exc:
+        err = AppError.classify(exc, context=f"downloading mmproj for "
+                                            f"'{mf.filename}'")
+        if log_cb:
+            log_cb(err.report())
+        return False, err.report()
+    got = paths[-1] if paths else None
+    if got is not None:
+        mf.mmproj_filename = Path(got).name
+    ok = got is not None and Path(got).is_file()
+    return ok, (f"projector ready: {got}" if ok
+                else "mmproj download produced no usable file")
+
+
 def estimate_download_mb(repo_id: str, filenames: list[str]) -> float:
     """Best-effort total download size in MiB using Hub metadata only.
 
