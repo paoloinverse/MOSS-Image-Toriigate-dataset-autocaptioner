@@ -296,8 +296,8 @@ class ServerManager(QObject):
                 if bad:
                     errors.append(
                         f"Incompatible multimodal projector for "
-                        f"'{cfg.model.filename}': {bad}\n"
-                        f"    would pass: --mmproj {cfg.mmproj_path}\n"
+                        f"'{cfg.model.filename}': {bad} "
+                        f"(would pass: --mmproj {cfg.mmproj_path})\n"
                         "    fix    : download this model's own mmproj via "
                         "'Fetch mmproj' in Tab 2 (or 'Download & Verify' in "
                         "Tab 1 - both use the live repo listing, which "

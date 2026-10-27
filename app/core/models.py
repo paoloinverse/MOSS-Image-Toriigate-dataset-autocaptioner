@@ -1430,9 +1430,9 @@ def mmproj_repos_to_try(spec: "ModelSpec | None", mf: "ModelFile") -> list[str]:
     """
     repos: list[str] = []
     if spec is not None:
-        ov = MMPROJ_REPO_OVERRIDE.get(spec.key) or MMPROJ_REPO_OVERRIDE.get(
-            spec.source_repo)
-        if ov:
+        ov = (MMPROJ_REPO_OVERRIDE.get(spec.key)
+              or MMPROJ_REPO_OVERRIDE.get(spec.source_repo))
+        if ov and ov not in repos:
             repos.append(ov)
     if mf.repo_id not in repos:
         repos.append(mf.repo_id)
@@ -1478,6 +1478,8 @@ def plan_mmproj_download(mf: "ModelFile", *, force_refresh: bool = False,
 
     # 2./3. live lookups over every candidate repo (main + companions)
     for repo in mmproj_repos_to_try(spec, mf):
+        if repo in tried:
+            continue                    # companion == main repo: query once
         tried.append(repo)
         live = resolve_mmproj_live(repo, mf.quant, force_refresh=force_refresh)
         if not live:
