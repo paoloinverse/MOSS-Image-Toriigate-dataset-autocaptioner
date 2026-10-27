@@ -206,6 +206,135 @@ QUANT_BITS = {
 
 
 # ---------------------------------------------------------------------------
+# Live Hugging Face Hub lookups (file names are DISCOVERED, never composed)
+# ---------------------------------------------------------------------------
+#: repo_id -> {"files": [...], "sizes": {...}, "ts": monotonic-time}
+_REPO_LOOKUP_CACHE: dict[str, dict] = {}
+REPO_LOOKUP_TTL = 300.0          # seconds; refresh on demand afterwards
+
+
+def _lookup_entry(repo_id: str, force: bool = False) -> dict:
+    """Fetch (and cache) the live file list + sizes of an HF GGUF repo.
+
+    Filenames come verbatim from the Hub - the app no longer composes or
+    restricts them.  Raises AppError (via :meth:`AppError.classify`) when the
+    repo cannot be listed so callers can show a verbose report.
+    """
+    ent = _REPO_LOOKUP_CACHE.get(repo_id)
+    if ent is not None and not force:
+        import time as _t
+        if _t.monotonic() - ent["ts"] < REPO_LOOKUP_TTL:
+            return ent
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi().repo_info(repo_id, files_metadata=True)
+        files = [s.rfilename for s in (info.siblings or [])]
+        sizes = {s.rfilename: int(s.size or 0) for s in (info.siblings or [])}
+    except ImportError as exc:
+        raise AppError.classify(exc, context=f"listing '{repo_id}'") from exc
+    except Exception as exc:
+        raise AppError.classify(exc, context=f"listing '{repo_id}'") from exc
+    import time as _t
+    ent = {"files": files, "sizes": sizes, "ts": _t.monotonic()}
+    _REPO_LOOKUP_CACHE[repo_id] = ent
+    return ent
+
+
+def _quant_tag_from_name(name: str) -> str:
+    """Extract the quant tag embedded in a real Hub filename.
+
+    Scans underscore-separated tokens left-to-right and returns the first one
+    matching a GGUF quant pattern (``Q8_0``, ``IQ4_XS`` -> ``IQ4-XS``,
+    ``BF16``, ``F16``, ``UD-IQ4_XS`` -> ``UD-IQ4-XS``).  Falls back to the
+    last dot-separated stem token.  This is *parsing* an existing name, not
+    composing one.
+    """
+    stem = os.path.splitext(os.path.basename(name))[0]
+    m = re.search(r"(?:^|[._-])((?:UD-?)?(?:BF16|F16|F32|Q\d(?:_\d)?(?:_[A-Z]{1,3})?|"
+                  r"I[MQ]\d+(?:_[A-Z]{1,2})?(?:_XL)?))$", stem, re.IGNORECASE)
+    toks = stem.split("_")
+    cand = None
+    for i, t in enumerate(toks):
+        if re.fullmatch(r"(?:UD-?)?(?:BF16|F16|F32|Q\d(?:\d)?|[IQ][M]?Q?\d+[A-Z]*|"
+                        r"[A-Z]{2,4})", t, re.IGNORECASE) and \
+                re.search(r"\d|BF16|F16", t):
+            cand = "_".join(toks[i:])
+            break
+    if cand is None:
+        cand = m.group(1) if m else (toks[-1] if toks else stem)
+    return cand.replace("-", "-").upper()
+
+
+def discover_repo_ggufs(repo_id: str, force_refresh: bool = False
+                        ) -> "list[tuple[str, str, int]]":
+    """Live ``(filename, quant, size_bytes)`` list of main GGUFs in a repo.
+
+    ``mmproj`` files are excluded (they are companions, not base models).
+    Every ``*.gguf`` the repo publishes is offered - there are **no
+    restrictions on allowed quants**.  Returns [] only when the listing
+    fails after the offline fallback (callers should surface it).
+    """
+    try:
+        ent = _lookup_entry(repo_id, force=force_refresh)
+    except AppError:
+        return []
+    out = []
+    for f in ent["files"]:
+        low = f.lower()
+        if not low.endswith(".gguf") or "mmproj" in low:
+            continue
+        out.append((f, _quant_tag_from_name(f), ent["sizes"].get(f, 0)))
+    return out
+
+
+def find_live_filename(repo_id: str, wanted: str) -> "str | None":
+    """Resolve a hardwired/default filename to its real counterpart on the
+    Hub (case-insensitive match over the live listing; exact match wins).
+
+    Used so legacy registry seeds (e.g. the old ``ToriiGate-0.5-BF16.gguf``)
+    automatically adopt renamed files (e.g. ``...-bf16.gguf``) instead of
+    404-ing mid-download.  Returns ``wanted`` unchanged when offline.
+    """
+    try:
+        files = _lookup_entry(repo_id)["files"]
+    except AppError:
+        return wanted
+    if wanted in files:
+        return wanted
+    low = wanted.lower()
+    for f in files:
+        if f.lower() == low:
+            return f
+    return wanted
+
+
+def resolve_mmproj_live(repo_id: str, quant: str,
+                        force_refresh: bool = False) -> "str | None":
+    """Pick the projector companion for ``quant`` from the LIVE repo listing.
+
+    Priority: same-quant mmproj > F16/BF16 mmproj > any single mmproj.
+    Returns None when the repo has none or the Hub is unreachable.
+    """
+    try:
+        ent = _lookup_entry(repo_id, force=force_refresh)
+    except AppError:
+        return None
+    mmprojs = [f for f in ent["files"]
+               if "mmproj" in f.lower() and f.lower().endswith(".gguf")]
+    if not mmprojs:
+        return None
+    want = (quant or "").upper().replace("-", "")
+    for m in mmprojs:
+        mu = m.upper().replace("-", "")
+        if want and want in mu:
+            return m
+    for m in mmprojs:
+        if "F16" in m.upper() or "BF16" in m.upper():
+            return m
+    return mmprojs[0]
+
+
+# ---------------------------------------------------------------------------
 # Per-model run-out-of-the-box profiles
 # ---------------------------------------------------------------------------
 #: Valid llama.cpp ``--cache-type-k/-v`` values surfaced in Tab 2 (incl. bf16).
@@ -246,9 +375,12 @@ _QWEN_THINKING_LEVELS = (
     ThinkingLevel("high", "High  (~16K reasoning tokens)", 16384),
 )
 
-MODEL_PROFILES: dict[str, ModelProfile] = {
+#: Static *family* defaults; ``max_context_by_quant`` is only consulted for
+#: quants whose live context cap is unknown (per-quant entries are now
+#: discovered dynamically via :func:`model_profile_for`).
+_MODEL_FAMILY_DEFAULTS: dict[str, ModelProfile] = {
     "toriigate": ModelProfile(
-        max_context_by_quant={"BF16": 16384, "Q8_0": 32768},
+        max_context_by_quant={},
         default_cache_type="q8_0",
         thinking_levels=_QWEN_THINKING_LEVELS,
         default_thinking="low",
@@ -257,8 +389,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
              "map to --reasoning-budget; its chat template honours "
              "enable_thinking."),
     "qwen3.8-27b": ModelProfile(
-        max_context_by_quant={"Q8_0": 32768, "Q6_K": 65536,
-                              "UD-IQ4_XS": 131072},
+        max_context_by_quant={},
         default_cache_type="q8_0",
         thinking_levels=_QWEN_THINKING_LEVELS,
         default_thinking="medium",
@@ -267,10 +398,129 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
              "in the request plus --reasoning-budget on the server."),
 }
 
+#: Rough VRAM budget (GiB) allowed to the KV cache when deriving per-quant
+#: context caps from the live file size - keeps big quants from OOMing while
+#: letting small ones stretch further.  ToriiGate's published caps
+#: (BF16->16K @ ~1 GiB, Q8_0->32K @ ~0.6 GiB) match this budget closely.
+_KV_BUDGET_GIB = 0.8
 
-def get_model_profile(key: str | None) -> ModelProfile:
-    """Profile for a registry key; neutral fallback for unknown models."""
-    return MODEL_PROFILES.get(key or "", ModelProfile())
+
+def _arch_from_config_json(data: dict) -> "ArchInfo | None":
+    """Extract ArchInfo fields from a parsed HF ``config.json`` dict."""
+    try:
+        text_cfg = data.get("text_config") or {}
+        hidden = int(text_cfg.get("hidden_size") or data.get("hidden_size") or 0)
+        layers = int(text_cfg.get("num_hidden_layers")
+                     or data.get("num_hidden_layers") or 0)
+        kv_heads = int(text_cfg.get("num_key_value_heads")
+                       or data.get("num_key_value_heads") or 0)
+        head_dim = int(text_cfg.get("head_dim") or 0)
+        if head_dim == 0 and hidden and kv_heads:
+            head_dim = hidden // kv_heads
+        if hidden and layers and kv_heads and head_dim:
+            return ArchInfo(hidden_size=hidden, num_layers=layers,
+                            num_kv_heads=kv_heads, head_dim=head_dim)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _hf_config_fields(spec: "ModelSpec") -> "ArchInfo | None":
+    """Fetch arch fields from the model repo's config.json (cached)."""
+    import time as _t
+    ent = _CONFIG_ARCH_CACHE.get(spec.key)
+    if ent is not None and _t.monotonic() - ent[0] < REPO_LOOKUP_TTL:
+        return ent[1]
+    arch = None
+    repos = [r for r in (spec.hf_config_repo, spec.source_repo) if r]
+    for repo in repos:
+        try:
+            from huggingface_hub import hf_hub_download
+            p = hf_hub_download(repo_id=repo, filename="config.json",
+                                cache_dir=str(default_cache_dir() / "hf_meta"))
+            with open(p, "r", encoding="utf-8") as fh:
+                arch = _arch_from_config_json(json.load(fh))
+        except Exception:
+            arch = None
+        if arch is not None:
+            break
+    _CONFIG_ARCH_CACHE[spec.key] = (_t.monotonic(), arch)
+    return arch
+
+
+#: spec.key -> (monotonic ts, ArchInfo | None)
+_CONFIG_ARCH_CACHE: dict[str, tuple] = {}
+
+
+def _live_max_context(spec: "ModelSpec", f: "ModelFile") -> int:
+    """Derive a per-quant context cap from the LIVE file size + arch math.
+
+    No hardwired quant list: any GGUF the repo publishes gets a cap computed
+    from its real byte size (weights leave ``_KV_BUDGET_GIB`` for the KV
+    cache inside the profile's total VRAM budget).  Falls back to the family
+    static entry, then to nothing (global cap applies).
+    """
+    bits = QUANT_BITS.get(f.quant.upper(),
+                          QUANT_BITS.get(_quant_tag_from_name(f.filename), 8.5))
+    params_b = f.params_billions or 0.0
+    gib = 0.0
+    try:
+        sz = _lookup_entry(f.repo_id)["sizes"].get(f.filename, 0)
+    except AppError:
+        sz = 0
+    if sz > 0:
+        gib = sz / (1024 ** 3)
+        params_b = params_b or round(sz * 8 / bits / 1e9, 2)
+    elif params_b > 0:
+        gib = params_b * 1e9 * bits / 8 / (1024 ** 3)
+    if params_b <= 0 or gib <= 0:
+        return 0
+    total_budget_gib = max(_KV_BUDGET_GIB, 2.0 - gib)   # family weight budget guard
+    kv_gib = max(0.05, total_budget_gib * 0.5)
+    arch = _hf_config_fields(spec)
+    mmproj_gib = 0.35
+    free_gib = max(0.05, total_budget_gib - gib - mmproj_gib)
+    kv_gib = min(kv_gib, free_gib)
+    if arch is None:
+        return 0
+    tok_cap = int(kv_gib * (1024 ** 3) / arch.kv_bytes_per_token("q8_0"))
+    return max(4096, tok_cap // 1024 * 1024)
+
+
+def model_profile_for(key: str | None, quant: str | None = None,
+                      spec: "ModelSpec | None" = None) -> ModelProfile:
+    """Profile for a registry key, with the per-quant context cap resolved
+    against the LIVE Hub listing (sizes/arch) instead of a fixed table."""
+    base = _MODEL_FAMILY_DEFAULTS.get(key or "", ModelProfile())
+    caps = dict(base.max_context_by_quant)
+    if spec is None and key:
+        spec = REGISTRY.get(key)
+    if spec is not None and quant:
+        f = spec.file_for_quant(quant)
+        if f is not None:
+            cap = _live_max_context(spec, f)
+            if cap:
+                caps[quant] = cap
+    return ModelProfile(max_context_by_quant=caps,
+                        default_cache_type=base.default_cache_type,
+                        thinking_levels=base.thinking_levels,
+                        default_thinking=base.default_thinking,
+                        temperature=base.temperature, top_p=base.top_p,
+                        top_k=base.top_k, min_p=base.min_p, note=base.note)
+
+
+def get_model_profile(key: str | None, quant: str | None = None,
+                      spec: "ModelSpec | None" = None) -> ModelProfile:
+    """Profile for a registry key; neutral fallback for unknown models.
+
+    When ``quant`` (and optionally the live ``spec``) are given, the
+    per-quant context cap is included exactly as configured by the family
+    defaults; live-discovered caps come via :func:`model_profile_for`.
+    """
+    prof = model_profile_for(key, quant, spec)
+    if key and key not in _MODEL_FAMILY_DEFAULTS and not prof.max_context_by_quant:
+        return ModelProfile()          # truly unknown model: fully neutral
+    return prof
 
 
 # ---------------------------------------------------------------------------
@@ -581,16 +831,39 @@ def set_storage(mode: str, unsloth_root: str = "") -> StorageManager:
 
 @dataclass
 class ModelFile:
-    """One concrete GGUF choice inside a repository."""
-    filename: str            # e.g. "ToriiGate-0.5-Q8_0.gguf"
-    quant: str               # e.g. "Q8_0"
+    """One concrete GGUF choice inside a repository.
+
+    ``filename`` is the name exactly as published on the Hub - discovered by
+    :func:`discover_repo_ggufs` at runtime, never composed from a template.
+    ``params_billions`` is only a last-resort seed for size estimates when
+    both the local file and the live Hub metadata are unavailable.
+    """
+    filename: str            # e.g. "ToriiGate-0.5-Q8_0.gguf" (verbatim Hub name)
+    quant: str               # e.g. "Q8_0" (parsed back out of the filename)
     repo_id: str             # HF repo hosting it
-    params_billions: float   # rough param count for size estimate
-    mmproj_filename: str | None = None   # fixed companion if known
+    params_billions: float = 0.0   # rough param count for size estimate
+    mmproj_filename: str | None = None   # resolved companion (live lookup)
 
     @property
     def estimated_size_mb(self) -> float:
-        bits = QUANT_BITS.get(self.quant, 8.5)
+        """Best available size estimate: real local file > live Hub metadata
+        > bits-per-weight math over the seeded param count."""
+        try:
+            p = self.local_path()
+            if p.is_file():
+                return p.stat().st_size / (1024 * 1024)
+        except OSError:
+            pass
+        try:
+            sz = _lookup_entry(self.repo_id)["sizes"].get(self.filename, 0)
+        except AppError:
+            sz = 0
+        if sz > 0:
+            return sz / (1024 * 1024)
+        bits = QUANT_BITS.get(self.quant.upper(),
+                              QUANT_BITS.get(_quant_tag_from_name(self.filename), 8.5))
+        if self.params_billions <= 0:
+            self.params_billions = max(0.5, round(sz / 1e9, 2)) if sz else 0.5
         return self.params_billions * 1e9 * bits / 8 / (1024 * 1024)
 
     def local_path(self) -> Path:
@@ -606,18 +879,20 @@ class ModelFile:
 
         Returns ``(path, filename)`` - ``path`` is an existing file when one
         can be found, ``filename`` is the best-guess companion name for
-        reporting/downloading even when nothing was found locally.
+        reporting/downloading even when nothing was found locally.  The
+        fallback *name* comes from a live lookup of the repo listing (see
+        :func:`resolve_mmproj`) - never from a composed template.
 
         Robust to real-world Unsloth layouts where the *projector* is stored
         under a different name than the hardwired default (e.g. Unsloth
-        ships ``mmproj-ToriiGate-0.5-Q8_0.gguf`` while our registry expects
-        ``ToriiGate-0.5-Q8_0.mmproj.gguf``).  Search order:
+        ships ``mmproj-ToriiGate-0.5-Q8_0.gguf`` while our seed registry
+        expects ``ToriiGate-0.5-Q8_0.mmproj.gguf``).  Search order:
 
-        1. the fixed ``mmproj_filename`` via ``find_existing``,
+        1. the remembered ``mmproj_filename`` via ``find_existing``,
         2. any already-present ``*mmproj*.gguf`` inside this repo's folders
            in the active storage (preferring same-quant, then F16/BF16),
         3. recursive scan of the Unsloth tree (same preference),
-        4. fallback candidate name from the spec (for download planning).
+        4. live repo listing for the companion name (download planning).
         """
         # 1. exact expected name
         if self.mmproj_filename:
@@ -711,28 +986,98 @@ class ModelFile:
 
 @dataclass
 class ModelSpec:
-    """A selectable model family with its quant dropdown entries."""
+    """A selectable model family whose quant list is discovered LIVE.
+
+    ``seed_files`` are fallback entries used only when the Hub cannot be
+    reached (offline start-up).  At runtime :meth:`refresh` replaces the
+    file list with whatever GGUFs the repository actually publishes - every
+    quant, no allow-list - so renamed files (e.g. lowercase ``-bf16.gguf``)
+    are picked up automatically instead of 404-ing mid-download.
+    """
     key: str                       # internal id used in configs
     display_name: str
     source_repo: str
     hf_config_repo: str | None     # repo whose config.json describes arch
+    seed_files: list[ModelFile] = field(default_factory=list)
     files: list[ModelFile] = field(default_factory=list)
     mmproj_candidates: list[str] = field(default_factory=list)
     abliterated: bool = False      # safe to inject explicit-mode triggers
     vision: bool = True
+    last_refresh_error: str = ""   # verbose report of the failed live lookup
+    refreshed_at: float = 0.0      # monotonic timestamp of last refresh
+    live: bool = False             # True once a live listing populated files
 
+    def __post_init__(self):
+        if not self.files:
+            self.files = list(self.seed_files)
+
+    # ------------------------------------------------------------- live list
+    def refresh(self, force: bool = False) -> bool:
+        """Re-discover quants/filenames from the live Hub listing.
+
+        Returns True when the registry now reflects the Hub.  On failure the
+        previous list (seeds offline) is kept and a verbose report is stored
+        in ``last_refresh_error``; nothing ever raises so start-up / dropdown
+        population stays safe.  Honours the module-level lookup cache TTL
+        unless ``force``.
+        """
+        import time as _t
+        if self.refreshed_at and not force \
+                and _t.monotonic() - self.refreshed_at < REPO_LOOKUP_TTL:
+            return self.live
+        try:
+            ggufs = discover_repo_ggufs(self.source_repo, force_refresh=force)
+        except AppError as exc:
+            self.last_refresh_error = exc.report()
+            return self.live
+        if not ggufs:
+            self.last_refresh_error = (
+                f"[models] WARNING: live file listing of '{self.source_repo}' "
+                "returned no GGUFs (offline or gated?) - falling back to the "
+                "bundled seed filenames.")
+            return self.live
+        params = max((f.params_billions for f in self.seed_files), default=0.0)
+        old_by_name = {f.filename.lower(): f for f in self.files}
+        new: list[ModelFile] = []
+        for fn, quant, _size in ggufs:
+            prev = old_by_name.get(fn.lower())
+            new.append(ModelFile(
+                filename=fn, quant=quant, repo_id=self.source_repo,
+                params_billions=params,
+                # keep an already-adopted local mmproj name; otherwise the
+                # companion is resolved live on demand (resolve_mmproj)
+                mmproj_filename=prev.mmproj_filename if prev else None))
+        self.files = new
+        self.live = True
+        self.last_refresh_error = ""
+        self.refreshed_at = _t.monotonic()
+        return True
+
+    # ------------------------------------------------------------ accessors
     def quants(self) -> list[str]:
         return [f.quant for f in self.files]
 
     def file_for_quant(self, quant: str) -> ModelFile | None:
+        """Match by displayed tag first, then case/punctuation-insensitively
+        (live tags normalise ``Q8_0`` names to ``Q8-0`` etc.)."""
         for f in self.files:
             if f.quant == quant:
+                return f
+        norm = (quant or "").upper().replace("_", "-")
+        for f in self.files:
+            if f.quant.upper().replace("_", "-") == norm:
                 return f
         return None
 
 
-def build_registry() -> dict[str, ModelSpec]:
-    """Hardwired supported-model catalogue."""
+def build_registry(refresh: bool = True) -> dict[str, ModelSpec]:
+    """Supported-model catalogue.
+
+    Only *repositories* are hardwired here; the concrete GGUF filenames and
+    available quants are looked up live from the Hugging Face Hub when the
+    registry is built (``refresh=True``, the default).  The seed entries act
+    strictly as offline fallbacks.
+    """
     torii_repo = "DraconicDragon/ToriiGate-0.5-GGUF"
     qwen_repo = "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF"
 
@@ -741,7 +1086,7 @@ def build_registry() -> dict[str, ModelSpec]:
         display_name="ToriiGate-0.5 (MOSS captioner)",
         source_repo=torii_repo,
         hf_config_repo="Minthy/ToriiGate-0.5",
-        files=[
+        seed_files=[
             ModelFile("ToriiGate-0.5-BF16.gguf", "BF16", torii_repo, 0.5),
             ModelFile("ToriiGate-0.5-Q8_0.gguf", "Q8_0", torii_repo, 0.5,
                       mmproj_filename="ToriiGate-0.5-Q8_0.mmproj.gguf"),
@@ -754,20 +1099,24 @@ def build_registry() -> dict[str, ModelSpec]:
         display_name="Huihui-Qwen3.8-27B-abliterated",
         source_repo=qwen_repo,
         hf_config_repo="huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
-        files=[
+        seed_files=[
             ModelFile("Huihui-Qwen3.8-27B-abliterated-Q8_0.gguf", "Q8_0", qwen_repo, 27),
             ModelFile("Huihui-Qwen3.8-27B-abliterated-Q6_K.gguf", "Q6_K", qwen_repo, 27),
             ModelFile("Huihui-Qwen3.8-27B-abliterated-UD-IQ4_XS.gguf",
                       "UD-IQ4_XS", qwen_repo, 27),
         ],
-        # Resolved dynamically against the repo listing (see resolve_mmproj).
+        # Resolved dynamically against the live repo listing (see resolve_mmproj).
         mmproj_candidates=[
             "mmproj-Huihui-Qwen3.8-27B-abliterated-Q8_0.gguf",
             "mmproj-F16.gguf",
         ],
         abliterated=True,
     )
-    return {torii.key: torii, qwen.key: qwen}
+    specs = {torii.key: torii, qwen.key: qwen}
+    if refresh:
+        for spec in specs.values():
+            spec.refresh(force=True)
+    return specs
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1250,8 @@ def import_full_config(ctx, raw: str) -> list[str]:
 # Process-wide registry.  ModelFile.resolve_mmproj_companion() needs to look
 # up a file's owning spec for fallback naming; AppContext builds its own copy
 # (mutable presets live there), so we expose a shared read-only view here.
+# Built from the cached live Hub listing when reachable, seed files otherwise
+# (the import must never block on or crash because of the network).
 REGISTRY: dict[str, ModelSpec] = build_registry()
 
 
@@ -939,11 +1290,17 @@ def list_repo_files(repo_id: str) -> list[str]:
 def resolve_mmproj(spec: ModelSpec, chosen: ModelFile) -> str | None:
     """Pick the compatible multimodal projector for ``chosen``.
 
-    Priority: explicit fixed filename > same-quant mmproj in the repo >
-    any F16 mmproj > first mmproj candidate.
+    Live-first: the companion name is taken verbatim from the repository's
+    current Hub listing (:func:`resolve_mmproj_live`), never composed.
+    Priority: explicit fixed filename > same-quant mmproj in the live repo >
+    any F16/BF16 mmproj > first candidate from the (offline) listing >
+    hardwired seed candidates.
     """
     if chosen.mmproj_filename:
         return chosen.mmproj_filename
+    live = resolve_mmproj_live(spec.source_repo, chosen.quant)
+    if live:
+        return live
     files = list_repo_files(spec.source_repo)
     mmprojs = [f for f in files if "mmproj" in f.lower() and f.lower().endswith(".gguf")]
     if not mmprojs:
@@ -1060,9 +1417,25 @@ def download_model_files(repo_id: str, filenames: list[str],
     Files already present anywhere in the storage tree (e.g. downloaded by
     Unsloth Desktop) are skipped and reported as re-used.
 
+    Every requested name is first reconciled against the LIVE Hub listing
+    (:func:`find_live_filename`): renamed files - e.g. ``ToriiGate-0.5-BF16``
+    republished as lowercase ``ToriiGate-0.5-bf16.gguf`` - are corrected to
+    their real filename before any request goes out, so stale composed names
+    can never produce a mid-download 404.
+
     ``progress_cb(filename, done_bytes, total_bytes)`` is invoked by the
     caller-side worker thread.  Returns the local paths written/re-used.
     """
+    # ---- live filename reconciliation (never trust composed names) --------
+    resolved: list[str] = []
+    for fn in filenames:
+        real = find_live_filename(repo_id, fn)
+        if real != fn:
+            print(f"[models] '{fn}' not published under that exact name; "
+                  f"using live Hub filename '{real}' instead.", flush=True)
+        resolved.append(real)
+    filenames = resolved
+
     try:
         preflight_download_check(repo_id, filenames)
     except AppError:

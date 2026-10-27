@@ -27,6 +27,36 @@ from app.core.models import (AppError, STORAGE_DEFAULT, STORAGE_UNSLOTH,
 from app.context import AppContext
 
 
+class RepoRefreshWorker(QThread):
+    """Live re-discovery of a repo's GGUF filenames/quants off the GUI thread."""
+    done = Signal(bool, str)          # ok, verbose message/report
+    log = Signal(str)
+
+    def __init__(self, spec, parent=None):
+        super().__init__(parent)
+        self.spec = spec
+
+    def run(self):
+        self.log.emit(f"[models] live lookup: listing GGUFs published by "
+                      f"{self.spec.source_repo} ...")
+        try:
+            ok = self.spec.refresh(force=True)
+        except Exception as exc:      # never crash the worker thread
+            err = AppError.classify(exc, context=f"listing {self.spec.source_repo}")
+            self.done.emit(False, err.report())
+            return
+        if ok:
+            self.done.emit(True,
+                           f"{self.spec.display_name}: discovered "
+                           f"{len(self.spec.files)} GGUF(s) live from the Hub: "
+                           + ", ".join(f"{f.quant} ({f.filename})"
+                                       for f in self.spec.files))
+        else:
+            msg = self.spec.last_refresh_error or \
+                "live listing unavailable - kept previously known files."
+            self.done.emit(False, msg)
+
+
 class DownloadWorker(QThread):
     progress = Signal(str, int, int)     # filename, done, total (-1 unknown)
     done = Signal(bool, str)
@@ -144,7 +174,15 @@ class HardwareModelsTab(QWidget):
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Quantization:"))
         self.quant_combo = QComboBox()
+        self.quant_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         row2.addWidget(self.quant_combo, stretch=1)
+        self.refresh_models_btn = QPushButton("Refresh from Hub")
+        self.refresh_models_btn.setToolTip(
+            "Live-lookup the repository file list on huggingface.co and rebuild\n"
+            "this dropdown from the filenames/quants actually published there.\n"
+            "Names are never composed locally, so renamed uploads (e.g. a\n"
+            "lowercase '-bf16.gguf') are picked up automatically.")
+        row2.addWidget(self.refresh_models_btn)
         ml.addLayout(row2)
 
         self.mmproj_label = QLabel("mmproj: —")
@@ -203,6 +241,7 @@ class HardwareModelsTab(QWidget):
         self.model_combo.currentIndexChanged.connect(self.refresh_quants)
         self.quant_combo.currentIndexChanged.connect(self.refresh_mmproj_label)
         self.download_btn.clicked.connect(self.start_download)
+        self.refresh_models_btn.clicked.connect(self.refresh_from_hub)
         self.storage_combo.currentIndexChanged.connect(self._update_storage_widgets)
         self.browse_btn.clicked.connect(self.browse_unsloth_folder)
         self.apply_storage_btn.clicked.connect(self.apply_storage)
@@ -214,6 +253,12 @@ class HardwareModelsTab(QWidget):
         self._update_storage_widgets()
         self.refresh_storage_ui()
         self.refresh_quants()
+        # Late-bound live listing: if start-up fell back to the seed files
+        # (offline), pull the real Hub filenames now without blocking the UI.
+        for spec in self.ctx.registry.values():
+            if not spec.live:
+                self._start_repo_refresh(spec, startup=True)
+                break
 
     # ------------------------------------------------------------------ GPU UI
     def on_gpus_updated(self, gpus: list[GPUInfo]):
@@ -271,29 +316,89 @@ class HardwareModelsTab(QWidget):
 
     # ------------------------------------------------------------------ models
     def refresh_quants(self):
+        """Populate the quant dropdown from the LIVE-discovered file list.
+
+        Each entry shows the parsed quant tag plus the exact Hub filename, so
+        what the user selects is literally what gets downloaded - no locally
+        composed names anywhere in the pipeline.
+        """
         key = self.model_combo.currentData()
         self.ctx.selected_model_key = key
         spec = self.ctx.registry[key]
+        prev_q = self.quant_combo.currentText()
         self.quant_combo.blockSignals(True)
         self.quant_combo.clear()
-        for q in spec.quants():
-            self.quant_combo.addItem(q)
-        default_q = "Q8_0" if "Q8_0" in spec.quants() else (
-            spec.quants()[0] if spec.quants() else "")
-        idx = self.quant_combo.findText(default_q)
+        for f in spec.files:
+            self.quant_combo.addItem(f"{f.quant}  [{f.filename}]", f.quant)
+        default_q = ""
+        if prev_q and spec.file_for_quant(prev_q) is not None:
+            default_q = prev_q                    # keep selection across refresh
+        elif "Q8_0" in spec.quants():
+            default_q = "Q8_0"
+        elif any(q.upper().replace("_", "-") == "Q8-0" for q in spec.quants()):
+            default_q = next(q for q in spec.quants()
+                             if q.upper().replace("_", "-") == "Q8-0")
+        elif spec.quants():
+            default_q = spec.quants()[0]
+        idx = self.quant_combo.findText(default_q) \
+            if default_q else -1
+        if idx < 0:
+            for i in range(self.quant_combo.count()):
+                if self.quant_combo.itemData(i) == default_q:
+                    idx = i
+                    break
         self.quant_combo.setCurrentIndex(max(0, idx))
         self.quant_combo.blockSignals(False)
-        self.ctx.selected_quant = self.quant_combo.currentText()
+        self.ctx.selected_quant = self.quant_combo.currentData() or ""
+        if not spec.live and spec.last_refresh_error:
+            self.status_label.setText(
+                "Offline fallback: showing bundled seed filenames "
+                "(live Hub lookup failed). Press 'Refresh from Hub' to retry.")
         self.refresh_mmproj_label()
         self.ctx.model_changed.emit()
 
+    # ----------------------------------------------------- live Hub discovery
+    def _start_repo_refresh(self, spec, startup: bool = False):
+        if getattr(self, "_repo_worker", None) is not None \
+                and self._repo_worker.isRunning():
+            return
+        self._repo_worker = RepoRefreshWorker(spec, self)
+        self._repo_worker.log.connect(self.ctx.log.emit)
+        self._repo_worker.done.connect(
+            lambda ok, msg, s=spec: self.on_repo_refreshed(ok, msg, s))
+        self.refresh_models_btn.setEnabled(False)
+        self.refresh_models_btn.setText("Looking up…")
+        self._repo_worker.start()
+        if startup:
+            self.ctx.log.emit(
+                f"[models] start-up listing of '{spec.source_repo}' was "
+                "unavailable; retrying the live lookup in the background.")
+
+    def refresh_from_hub(self):
+        """Manual trigger: re-query the Hub and rebuild the quant dropdown."""
+        self._start_repo_refresh(self.ctx.active_model_spec)
+
+    def on_repo_refreshed(self, ok: bool, msg: str, spec):
+        self.refresh_models_btn.setEnabled(True)
+        self.refresh_models_btn.setText("Refresh from Hub")
+        self.ctx.log.emit(msg if ok else f"[models] {msg}")
+        if not ok and not getattr(spec, "live", False):
+            self.status_label.setText("Live Hub lookup failed - see Log (Tab 5).")
+            return
+        if self.model_combo.currentData() == spec.key:
+            self.refresh_quants()
+        else:
+            self.ctx.model_changed.emit()
+
     def current_file(self):
         spec = self.ctx.active_model_spec
-        return spec.file_for_quant(self.quant_combo.currentText())
+        return spec.file_for_quant(self.quant_combo.currentData()
+                                   or self.quant_combo.currentText())
 
     def refresh_mmproj_label(self):
         mf = self.current_file()
-        self.ctx.selected_quant = self.quant_combo.currentText()
+        self.ctx.selected_quant = (self.quant_combo.currentData()
+                                   or self.quant_combo.currentText())
         if mf is None:
             self.mmproj_label.setText("mmproj: —")
             return
