@@ -47,10 +47,114 @@ class ServerConfig:
     extra_args: str = ""             # raw passthrough from Tab 2
     explicit_mode: bool = False      # disables safety-system prompts
     binary: str = "llama-server"
+    api_key: str = ""                # Tab 2 'API Key:' (--api-key + client auth)
 
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+
+# --------------------------------------------------------------------------
+# Host classification / liveness probes (shared by the preflight and Tab 2's
+# on-commit reachability check - see app/tabs/inference_tab.py)
+# --------------------------------------------------------------------------
+LOCAL_HOSTNAMES = {"", "localhost", "localhost.localdomain", "ip6-localhost",
+                   "127.0.0.1", "::1", "0.0.0.0", "::"}
+
+
+def is_local_host(host: str) -> bool:
+    """True for loopback/wildcard/this-machine names (bind locally)."""
+    h = (host or "").strip().strip("[]").lower()
+    if not h:
+        return True
+    if h in LOCAL_HOSTNAMES:
+        return True
+    if h.startswith("127."):                 # whole 127/8 loopback block
+        return True
+    try:
+        import socket as _sk
+        infos = _sk.getaddrinfo(h, None)
+        addrs = {i[4][0] for i in infos}
+        if any(a in ("127.0.0.1", "::1") for a in addrs):
+            return True
+        # A name that only resolves to this machine's own addresses
+        # (e.g. the laptop's hostname or its LAN IP) still counts local.
+        try:
+            host_addrs = {i[4][0]
+                          for i in _sk.getaddrinfo(_sk.gethostname(), None)}
+            if addrs and addrs <= host_addrs:
+                return True
+        except OSError:
+            pass
+    except OSError:
+        pass
+    return False
+
+
+def probe_server(base_url: str, api_key: str = "", timeout: float = 3.0,
+                 connect_timeout: float = 3.0) -> tuple[str, str]:
+    """Probe ``base_url/health``; returns one of:
+
+    * ``("running", "")``            - HTTP 200: server up, no auth needed
+    * ``("running-auth", "")``       - HTTP 401: server up, token accepted
+                                       (or unauthenticated health endpoint)
+    * ``("auth-required", msg)``     - HTTP 401/403 with NO token configured
+    * ``("auth-failed", msg)``       - HTTP 401/403 WITH a token: it is wrong
+    * ``("down", msg)``              - TCP reachable, nothing answering HTTP
+    * ``("unreachable", msg)``       - DNS/TCP/connect failure
+
+    Never raises; every outcome carries a short human-readable detail.
+    """
+    url = base_url.rstrip("/") + "/health"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        import urllib.request as _ur
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=timeout) as r:
+            if r.status == 200:
+                return ("running", "")
+            return ("running", f"HTTP {r.status}")
+    except Exception as exc:
+        import urllib.error as _ue
+        status = None
+        if isinstance(exc, _ue.HTTPError):
+            status = exc.code
+        if status in (401, 403):
+            if not api_key:
+                return ("auth-required",
+                        f"HTTP {status}: server requires an API key")
+            # A token WAS sent.  llama-server builds differ on whether
+            # /health itself is gated, so confirm against a definitely-
+            # protected endpoint (/v1/models): still denied there means the
+            # key is wrong; accepted means the server is fine for us.
+            try:
+                req2 = _ur.Request(base_url.rstrip("/") + "/v1/models",
+                                   headers=headers)
+                with _ur.urlopen(req2, timeout=timeout) as r2:
+                    if r2.status < 400:
+                        return ("running-auth", "")
+            except _ue.HTTPError as e2:
+                if e2.code in (401, 403):
+                    return ("auth-failed",
+                            f"HTTP {e2.code}: server rejected the API key")
+            except Exception:
+                pass
+            return ("auth-failed",
+                    f"HTTP {status}: server rejected the API key")
+        # No HTTP answer at all - distinguish "port closed" from "no route".
+        try:
+            import socket as _sk
+            from urllib.parse import urlparse as _up
+            pr = _up(base_url)
+            s = _sk.create_connection((pr.hostname or "127.0.0.1",
+                                       pr.port or 8080),
+                                       timeout=connect_timeout)
+            s.close()
+            return ("down", f"{type(exc).__name__}: {exc}")
+        except OSError as exc2:
+            return ("unreachable", f"{type(exc2).__name__}: {exc2}")
 
 
 class ServerManager(QObject):
@@ -190,16 +294,16 @@ class ServerManager(QObject):
         # Auth token for the API endpoints: the real flag is --api-key.
         # Bare `--api` was rejected by older builds ("error: invalid
         # argument: --api" -> exit code 1), so probe before passing it.
-        # The GUI intentionally has no API-key field (server binds to
-        # 127.0.0.1 only), so we used to pass an *empty* token - which some
-        # builds reject outright ('invalid argument:' + exit 1) and which is
-        # security theatre anyway.  Default now: omit the flag entirely =
-        # no auth.  Advanced users can still enable a token via Tab 2's
-        # 'Extra args' box (e.g. '--api-key secret'); the client reads the
-        # MOSS_API_KEY / APPCAP_API_KEY env var for the Authorization header.
-        if os.environ.get("MOSS_API_KEY") or os.environ.get("APPCAP_API_KEY"):
+        # Tab 2 now has an explicit 'API Key:' field (cfg.api_key); when it
+        # is empty we fall back to the MOSS_API_KEY / APPCAP_API_KEY env
+        # vars.  An *empty* token was never passed any more - omitting the
+        # flag entirely = no auth, which stays the default.
+        _key = (getattr(cfg, "api_key", "") or
+                os.environ.get("MOSS_API_KEY") or
+                os.environ.get("APPCAP_API_KEY") or "")
+        if _key:
             if _cap("has_api_key", False):
-                args += ["--api-key", ""]
+                args += ["--api-key", _key]
             else:
                 self.log.emit("[server] NOTE: this llama-server has no "
                               "--api-key option (old build) - starting "
@@ -304,21 +408,84 @@ class ServerManager(QObject):
                         "includes its projector), or clear 'Extra args' if "
                         "you set --mmproj manually there.")
 
-        # Port sanity / availability check (cheap socket bind probe).
+        # Port sanity + host-aware availability check.
+        #
+        # LOCAL host (127.0.0.1 / localhost / 0.0.0.0 / this machine): we own
+        # the bind, so a cheap socket-bind probe is the right test - if the
+        # port is taken by another llama-server, reuse it transparently when
+        # it is healthy (the Tab-2 commit-time check already told the user)
+        # and block with an actionable error otherwise.
+        #
+        # REMOTE host: binding locally is meaningless; instead probe whether
+        # a server is ALREADY answering on that address/port.  If one is, we
+        # attach to it instead of spawning a duplicate; if not, verify the
+        # address is network-reachable at all before trying to spawn a binary
+        # on a remote box (which llama-server cannot do).
         if not (1 <= cfg.port <= 65535):
             errors.append(f"Invalid port {cfg.port} (must be 1-65535).")
-        else:
-            try:
-                import socket as _s
-                probe = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
-                probe.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
-                probe.bind((cfg.host, cfg.port))
-                probe.close()
-            except OSError as exc:
+        elif not str(cfg.host or "").strip():
+            errors.append("Empty host - set an address in Tab 2 "
+                          "(e.g. 127.0.0.1, 0.0.0.0 or a remote IP).")
+        elif is_local_host(cfg.host):
+            status, detail = probe_server(cfg.base_url,
+                                          getattr(cfg, "api_key", ""))
+            if status in ("running", "running-auth"):
+                self._adopt_existing(cfg, status)
+                return errors      # no further checks needed - we attached
+            if status in ("auth-required", "auth-failed"):
                 errors.append(
-                    f"Cannot bind {cfg.host}:{cfg.port}: {exc}\n"
-                    "    fix    : another llama-server or process already uses this "
-                    "port; change the port in Tab 2 or stop the other instance.")
+                    f"{cfg.base_url} answered but authentication failed "
+                    f"({detail}).\n    fix    : put the server's token in "
+                    "Tab 2 'API Key:' (or MOSS_API_KEY/APPCAP_API_KEY), "
+                    "then press 'Check' again.")
+            else:
+                try:
+                    import socket as _s
+                    probe = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+                    probe.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+                    probe.bind((cfg.host if cfg.host not in ("", "::")
+                                else "0.0.0.0", cfg.port))
+                    probe.close()
+                except OSError as exc:
+                    if status == "down":
+                        # Something holds the port but is not a healthy
+                        # llama-server (or is still booting).
+                        errors.append(
+                            f"Cannot bind {cfg.host}:{cfg.port}: {exc}\n"
+                            "    fix    : another process already uses this "
+                            "port; change the port in Tab 2 or stop the "
+                            "other instance.")
+                    else:
+                        errors.append(
+                            f"Cannot bind {cfg.host}:{cfg.port}: {exc}\n"
+                            "    fix    : another llama-server or process "
+                            "already uses this port; change the port in "
+                            "Tab 2 or stop the other instance.")
+        else:
+            status, detail = probe_server(cfg.base_url,
+                                          getattr(cfg, "api_key", ""))
+            if status in ("running", "running-auth"):
+                self._adopt_existing(cfg, status)
+                return errors
+            if status in ("auth-required", "auth-failed"):
+                # Reachable, but we cannot confirm health without credentials.
+                self.log.emit(
+                    f"[server] remote {cfg.base_url} reachable but "
+                    f"{detail}; starting anyway - fix the 'API Key:' field "
+                    "in Tab 2 if requests come back 401.")
+            elif status == "unreachable":
+                errors.append(
+                    f"Remote host {cfg.base_url} is unreachable ({detail}).\n"
+                    "    fix    : check the address/port, that the machine "
+                    "is on the network/firewall-open, or start llama-server "
+                    "there yourself ('--host 0.0.0.0') and use 'Check' in "
+                    "Tab 2 to attach to it.")
+            else:  # "down": TCP ok, no HTTP answer
+                self.log.emit(
+                    f"[server] NOTE: remote {cfg.base_url} is reachable but "
+                    f"no llama-server answered /health ({detail}); note this "
+                    "GUI cannot launch a process on a remote machine - "
+                    "attempting anyway in case the service is still booting.")
 
         plan = cfg.plan
         if plan is not None and plan.context_tokens < MIN_CONTEXT:
@@ -341,6 +508,11 @@ class ServerManager(QObject):
                     self.log.emit("[server] PRE-FLIGHT ERROR: " + p)
                 self.state_changed.emit("crashed")
                 return False
+            # _preflight may have ATTACHED to an already-running server
+            # (healthy /health on the configured address) instead of leaving
+            # room to spawn one - in that case there is nothing to launch.
+            if self.ready:
+                return True
 
             self._shutdown_requested = False
             args = self.build_args(cfg)
