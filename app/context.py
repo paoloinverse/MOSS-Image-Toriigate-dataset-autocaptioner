@@ -33,7 +33,11 @@ class InferenceSettings:
     reasoning_budget: int = 0
     thinking_level: str = ""         # Tab 2 combo key ("" = off) - persisted
     cache_type: str = "q8_0"
-    split_mode: str = "row"
+    # Multi-GPU tensor split mode passed to llama-server as '-sm <mode>'.
+    # Default is 'layer' (llama.cpp's recommended split for pipeline-style
+    # layer distribution across GPUs); 'row' / 'graph' remain selectable in
+    # Tab 2.  Mirrors ServerConfig.split_mode in app/core/server.py.
+    split_mode: str = "layer"          # row | layer | graph
     flash_attn: str = "auto"         # Tab 2 switch: auto | on | off (--flash-attn)
     host: str = "127.0.0.1"
     port: int = 8080
@@ -105,6 +109,15 @@ class AppContext(QObject):
         self._persisted = load_app_settings()
         self.settings.apply_dict(self._persisted.get("settings") or {})
 
+        # Startup config override: an optional captioner_config.json sitting
+        # next to the launcher (or pointed at by $APPCAP_CONFIG) is imported
+        # automatically and OVERRIDES the hardwired preset defaults plus the
+        # persisted Tab 1/Tab 2 values.  Applied before any tab exists, so
+        # every widget hydrates from the imported state.
+        self.startup_config_source: str | None = None
+        self.startup_config_warnings: list[str] = []
+        self._load_startup_config_override()
+
         # Wire internal mirrors ------------------------------------------------
         self.server.state_changed.connect(self.server_state.emit)
         self.server.log.connect(self.log.emit)
@@ -148,6 +161,56 @@ class AppContext(QObject):
             self.log.emit("[llama.cpp] autodetect found no llama-server.\n"
                           + llamacpp.describe_search())
         return None
+
+    # ------------------------------------------------- startup config override
+    @staticmethod
+    def startup_config_path() -> str | None:
+        """Locate an optional ``captioner_config.json`` for this launch.
+
+        Thin wrapper around :func:`app.core.models.find_startup_config`
+        ($APPCAP_CONFIG → CWD → project root); see there for the details.
+        """
+        from app.core.models import find_startup_config
+        return find_startup_config()
+
+    def _load_startup_config_override(self):
+        """Import :func:`startup_config_path` if present, overriding defaults.
+
+        Uses the same importer as Tab 3's Import button, so both the unified
+        bundle (presets + settings + storage + model) and legacy preset-only
+        files work.  A broken file never blocks startup: the problem is logged
+        and the hardwired/persisted configuration stays in effect.
+        """
+        path = self.startup_config_path()
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            self.log.emit(
+                f"[config] captioner_config.json found at {path} but could "
+                f"not be read ({type(exc).__name__}: {exc}); using built-in "
+                "defaults instead.")
+            return
+        try:
+            from app.core.models import import_full_config
+            warnings = import_full_config(self, raw)
+        except Exception as exc:
+            self.log.emit(
+                f"[config] startup import of {path} FAILED: "
+                f"{type(exc).__name__}: {exc}; using built-in defaults.")
+            return
+        self.startup_config_source = path
+        self.startup_config_warnings = list(warnings or [])
+        n_presets = len(self.presets)
+        self.log.emit(
+            f"[config] startup: imported {path} — overrode hardwired presets "
+            f"({n_presets} preset(s), active '{self.active_preset_key}', "
+            f"explicit mode {'on' if self.explicit_mode else 'off'}), plus "
+            "Tab 1/Tab 2 settings/storage/model selection.")
+        for w in self.startup_config_warnings:
+            self.log.emit(f"[config] startup import warning: {w}")
 
     def save_settings(self):
         """Persist Tab-1/Tab-2 configuration to app_settings.json."""

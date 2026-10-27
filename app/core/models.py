@@ -142,6 +142,42 @@ SETTINGS_PATH = Path(os.environ.get(
                                 os.path.expanduser("~/.config")),
                  "moss-captioner", "app_settings.json")))
 
+#: Default filename of the optional startup configuration override.  When
+#: this file exists (see :func:`find_startup_config`) it is imported at
+#: launch and OVERRIDES the hardwired preset defaults - see
+#: ``AppContext._load_startup_config_override`` in app/context.py.
+STARTUP_CONFIG_NAME = "captioner_config.json"
+
+
+def find_startup_config(name: str = STARTUP_CONFIG_NAME) -> str | None:
+    """Locate the optional startup config file for this launch.
+
+    Search order (first existing file wins):
+
+    1. ``$APPCAP_CONFIG`` — explicit path; either the JSON file itself or a
+       directory containing *name*.
+    2. *name* in the current working directory.
+    3. *name* in the project root (the folder holding ``run.sh`` / the ``app``
+       package) — where Tab 3's 'Export full application config' default
+       filename lands when exported next to the app.
+
+    Returns the path string, or ``None`` when no candidate exists.
+    """
+    env = os.environ.get("APPCAP_CONFIG", "").strip()
+    candidates: list[Path] = []
+    if env:
+        p = Path(env).expanduser()
+        candidates.append(p if p.suffix else p / name)
+    proj_root = Path(__file__).resolve().parent.parent.parent
+    candidates += [Path.cwd() / name, proj_root / name]
+    for p in candidates:
+        try:
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    return None
+
 
 def load_app_settings() -> dict:
     """Read the persisted settings; corrupt/unreadable files never crash.

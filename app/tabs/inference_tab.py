@@ -132,7 +132,20 @@ class InferenceTab(QWidget):
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(st.port)
         self.split_combo = QComboBox()
-        self.split_combo.addItems(["row", "layer", "graph"])
+        # 'layer' is llama.cpp's recommended multi-GPU split and is the
+        # shipped default (InferenceSettings.split_mode / ServerConfig);
+        # list it first so it is the pre-selected entry, then hydrate from
+        # the live settings value (persisted or captioner_config.json).
+        self.split_combo.addItems(["layer", "row", "graph"])
+        _sm = (st.split_mode or "layer").strip().lower()
+        self.split_combo.setCurrentText(
+            _sm if _sm in ("layer", "row", "graph") else "layer")
+        st.split_mode = self.split_combo.currentText()
+        self.split_combo.setToolTip(
+            "llama-server '-sm' tensor split mode for multi-GPU runs.\n"
+            "layer: distribute whole layers across devices (default)\n"
+            "row  : split individual tensors row-wise\n"
+            "graph: split at the computation-graph level")
         form.addRow("Host:", self.host_edit)
         form.addRow("Port:", self.port_spin)
         form.addRow("Split mode (multi-GPU):", self.split_combo)
@@ -318,6 +331,55 @@ class InferenceTab(QWidget):
         self._refresh_binary_status()
 
     # ------------------------------------------------------------------ plan
+    def refresh_from_context(self):
+        """Re-hydrate every widget from ``ctx.settings`` / presets.
+
+        Used after a config import (Tab 3 button, or the automatic startup
+        import of captioner_config.json) so the UI shows the imported values
+        instead of the ones captured when this tab was constructed.
+        """
+        st = self.ctx.settings
+        self.binary_edit.blockSignals(True)
+        self.binary_edit.setText(st.binary)
+        self.binary_edit.blockSignals(False)
+        self.host_edit.blockSignals(True)
+        self.host_edit.setText(st.host)
+        self.host_edit.blockSignals(False)
+        self.port_spin.blockSignals(True)
+        self.port_spin.setValue(int(st.port))
+        self.port_spin.blockSignals(False)
+        sm = (st.split_mode or "layer").strip().lower()
+        if self.split_combo.findText(sm) >= 0:
+            self.split_combo.setCurrentText(sm)
+        st.split_mode = self.split_combo.currentText()
+        fa = (st.flash_attn or "auto").strip().lower()
+        self.fa_combo.blockSignals(True)
+        self.fa_combo.setCurrentText(fa if fa in ("auto", "on", "off") else "auto")
+        self.fa_combo.blockSignals(False)
+        st.flash_attn = self.fa_combo.currentText()
+        if st.cache_type in KV_CACHE_TYPES:
+            self.cache_combo.blockSignals(True)
+            self.cache_combo.setCurrentText(st.cache_type)
+            self.cache_combo.blockSignals(False)
+        # Raw passthrough args + generation sliders / thinking level.
+        self.extra_args.blockSignals(True)
+        self.extra_args.setPlainText(st.extra_args or "")
+        self.extra_args.blockSignals(False)
+        for slider, label, value in (
+                (self.temp_slider, self.temp_val, st.temperature),
+                (self.top_p_slider, self.top_p_val, st.top_p),
+                (self.top_k_slider, self.top_k_val, st.top_k),
+                (self.min_p_slider, self.min_p_val, st.min_p),
+                (self.reason_slider, self.reason_val, st.reasoning_budget)):
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+            label.setText(slider.text())
+        self._populate_thinking_levels(st.thinking_level or st.reasoning_budget)
+        self._refresh_binary_status()
+        self._populate_run_models()
+        self.refresh_plan()
+
     def _profile(self):
         """ModelProfile of the run-target model (Tab 2 selection)."""
         return get_model_profile(self.ctx.run_model_key)
