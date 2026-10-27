@@ -933,21 +933,35 @@ class ModelFile:
         if hit is not None:
             return hit, hit.name
 
-        # 3. bounded recursive scan of the Unsloth tree (different nesting)
+        # 3. bounded recursive scan of the Unsloth tree (different nesting).
+        #    STRICTLY scoped to this file's own repository folder (slug or
+        #    literal repo-id path segments): an unscoped whole-tree scan used
+        #    to hand back *another* model's projector whenever this repo had
+        #    none locally - e.g. ToriiGate's ``ToriiGate-0.5-Q8_0.mmproj.gguf``
+        #    (n_embd 2560) got attached to the Qwen3.8-27B main GGUF
+        #    (n_embd 5120) and llama-server died with
+        #    "mtmd_init_from_file: mismatch between text model and mmproj".
         if STORAGE.mode == STORAGE_UNSLOTH and STORAGE.unsloth_root.strip():
             import os as _os
+            slug = self.repo_id.replace("/", "--")
+            parts = [p for p in self.repo_id.split("/") if p]
             all_ggufs: list[Path] = []
             for r in STORAGE.unsloth_search_roots():
                 try:
                     base_depth = str(r).rstrip("/").count("/")
                     for dirpath, dirnames, fnames in _os.walk(
                             r, topdown=True, followlinks=False):
+                        rel_parts = set(
+                            Path(dirpath).relative_to(r).parts)
+                        if slug not in rel_parts and not set(parts) & rel_parts:
+                            dirnames[:] = []      # not our repo -> prune
+                            continue
                         if dirpath.count("/") - base_depth >= 4:
                             dirnames[:] = []
                         for fn in fnames:
                             if fn.lower().endswith(".gguf"):
                                 all_ggufs.append(Path(dirpath) / fn)
-                except OSError:
+                except (OSError, ValueError):
                     continue
             hit = _pick(all_ggufs)
             if hit is not None:
@@ -961,6 +975,55 @@ class ModelFile:
             if spec is not None:
                 expected = resolve_mmproj(spec, self)
         return None, expected
+
+    def mmproj_companion_error(self, companion_path: Path) -> str | None:
+        """Return a human-readable incompatibility reason for ``companion_path``.
+
+        Guards against the field-reported "wrong projector" crash where a
+        leftover *other-model* mmproj (e.g. ToriiGate's ``..._Q8_0.mmproj.gguf``,
+        n_embd 2560) got auto-attached to a different main GGUF (Qwen3.8-27B,
+        n_embd 5120) and llama-server aborted with::
+
+            E mtmd_init_from_file: mismatch between text model (n_embd = 5120)
+              and mmproj (n_embd = 2560)
+            hint: you may be using wrong mmproj
+
+        Checks, in order:
+        1. filename cross-reference - if the companion name contains another
+           registered repo's model slug it cannot belong to this model;
+        2. header metadata - both GGUFs must expose ``general.architecture``
+           and those architectures must match.
+
+        Returns ``None`` when the companion looks compatible (or cannot be
+        checked); otherwise a message naming both files and the mismatch.
+        """
+        try:
+            mp_arch = _read_gguf_metadata(Path(companion_path))
+        except Exception:
+            mp_arch = None
+        # 1. cross-repo name sniffing (works even without readable headers)
+        mp_name = Path(companion_path).name.lower()
+        own_slug = self.repo_id.split("/")[-1].lower()
+        for spec in _all_specs():
+            other_repo = spec.source_repo.lower()
+            if other_repo == self.repo_id.lower():
+                continue
+            other_slug = other_repo.split("/")[-1].lower()
+            if other_slug and other_slug in mp_name and own_slug not in mp_name:
+                return (f"'{Path(companion_path).name}' belongs to repository "
+                        f"'{spec.source_repo}', not '{self.repo_id}'")
+        # 2. architecture comparison via GGUF headers
+        try:
+            main_arch = _read_gguf_metadata(self.local_path())
+        except Exception:
+            main_arch = None
+        if main_arch is not None and mp_arch is not None:
+            a = (main_arch.source or "").replace("gguf:", "").strip().lower()
+            b = (mp_arch.source or "").replace("gguf:", "").strip().lower()
+            if a and b and a != b:
+                return (f"text model architecture '{a}' does not match mmproj "
+                        f"architecture '{b}'")
+        return None
 
     def mmproj_local_path(self) -> Path | None:
         path, name = self.resolve_mmproj_companion()
