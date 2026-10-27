@@ -31,6 +31,7 @@ import base64
 import json
 import logging
 import mimetypes
+import os
 import re
 from typing import Awaitable, Callable, Optional
 
@@ -175,6 +176,17 @@ class CaptionClient:
     def __init__(self, base_url: str, timeout: float = 600.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # Optional bearer token.  The server normally starts *without*
+        # --api-key (localhost-only, no auth); if the user adds one manually
+        # via Tab 2 'Extra args', set MOSS_API_KEY / APPCAP_API_KEY in the
+        # environment so requests carry the matching Authorization header.
+        self.api_key = (os.environ.get("MOSS_API_KEY")
+                        or os.environ.get("APPCAP_API_KEY") or "")
+
+    def _headers(self) -> dict[str, str]:
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
 
     async def caption(self, image_path: str, preset: CaptionPreset,
                       system_prompt: str, on_chunk: ChunkCb = None,
@@ -213,7 +225,8 @@ class CaptionClient:
         think_chunks: list[str] = []    # reasoning / thinking text
         n = 0                           # SSE data-event counter
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream("POST", url, json=payload) as resp:
+            async with client.stream("POST", url, json=payload,
+                                     headers=self._headers()) as resp:
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", "replace")
                     _emit(log_cb, f"[llama] <<< HTTP {resp.status_code} "
