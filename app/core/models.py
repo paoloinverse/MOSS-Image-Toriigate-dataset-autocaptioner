@@ -422,9 +422,11 @@ class ModelProfile:
 
 
 # Qwen3.8-family (Unsloth-patched chat template) effort levels.  Ordered
-# from most to least thinking so the combo reads Deep -> Brief; budgets
-# ascend towards "Off", which keeps the persisted-int nearest-match logic
-# and the test invariant (ascending budgets) intact.
+# from most to least thinking so the combo reads Deep -> Brief -> Off;
+# budgets *descend* towards "Off" (-1 = unlimited is the largest amount of
+# thinking, 0 disables it).  The persisted-int nearest-match logic in
+# api_client._resolve_effort special-cases the -1 sentinel, so tuple order
+# carries no meaning there beyond GUI display.
 _QWEN_THINKING_LEVELS = (
     ThinkingLevel("xhigh", "Deep / Maximum  (xhigh — unrestricted thinking)",
                   REASONING_BUDGET_UNLIMITED),

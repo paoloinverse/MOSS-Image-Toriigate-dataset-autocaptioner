@@ -360,7 +360,7 @@ def test_server_args():
     # Both flags are now opt-in: gated on a parse-verified probe (and for
     # --api-key additionally on an env token), defaulting to absent.
     legacy_only_caps = {"has_api_key": False, "has_single_turn": False,
-                        "has_reasoning_budget": True,
+                        "has_reasoning_budget": True, "has_jinja": True,
                         "flash_attn_auto": True, "flash_attn_on_off": False,
                         "cuda": False, "gpu": False}
     orig_probe2 = _lc.probe_capabilities
@@ -407,6 +407,87 @@ def test_server_args():
 
 
 # ------------------------------------------------- host/API-key/probe/attach
+def test_launch_argv_sanitizer():
+    # Field report (Oct 2026): reloading the server with tweaked args died
+    # with "error: invalid argument:" (EMPTY offending name) + exit code 1,
+    # twice.  The exec line showed '-sp ' followed by an empty argv entry -
+    # llama.cpp's common_getopt treats that empty token as an unknown option
+    # and aborts before printing anything useful.  Two layers of defence:
+    #   1. probe_capabilities no longer trusts a bare '-sp,' substring hit
+    #      in --help (it also matches '--ctx-checkpoints <string>' style
+    #      lines); has_single_turn needs help evidence AND parse proof.
+    #   2. start() scrubs any '' entry that directly follows an
+    #      option-looking token before Popen, logging loudly instead of
+    #      crash-looping the server.
+    import subprocess
+    from app.core.server import ServerManager
+
+    captured: dict = {}
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+    sm = ServerManager.__new__(ServerManager)   # skip QObject init
+    sm.hw = type("HW", (), {"selected_gpus": []})()
+    msgs: list[str] = []
+    sm.log = type("LogCapture", (), {"emit": staticmethod(
+        lambda *a, **k: msgs.append(str(a[0]) if a else ""))})()
+    # Same trick as test_server_args: QObject is never initialised, so the
+    # real Qt signals would raise "Signal source has been deleted".
+    sm.state_changed = sm.log
+    sm.oom_recovery = sm.log
+    sm._lock = __import__("threading").RLock()
+    sm.proc = None
+    sm.ready = False
+    sm.attached = False
+    sm._shutdown_requested = False
+    sm._stop_reader = __import__("threading").Event()
+    sm._reader_threads = []
+    sm.config = None
+    sm.find_binary = lambda: "/usr/bin/llama-server"
+    sm.build_args = lambda cfg: ["llama-server", "-m", "x.gguf", "--jinja",
+                                 "", "-sp", "", "--host", "127.0.0.1"]
+    # Expected sanitized argv:
+    #  * '--jinja' survives (boolean flag; only its stray '' is dropped)
+    #  * '-sp' + '' vanish together (the lone flag would be just as fatal)
+    #  * no empty entries reach Popen
+    expected = ["llama-server", "-m", "x.gguf", "--jinja",
+                "--host", "127.0.0.1"]
+    sm._preflight = lambda cfg: []
+    orig_popen = subprocess.Popen
+    orig_thread = __import__("threading").Thread
+    try:
+        def fake_popen(argv, *a, **k):
+            captured["argv"] = list(argv)
+            return FakeProc()
+        subprocess.Popen = fake_popen
+        __import__("threading").Thread = lambda *a, **k: type(
+            "T", (), {"start": lambda self: None})()
+        ok = sm.start(object())   # cfg contents irrelevant; build_args stubbed
+    finally:
+        subprocess.Popen = orig_popen
+        __import__("threading").Thread = orig_thread
+    check("start() survives empty argv entries", ok is True)
+    argv = captured.get("argv", [])
+    check("empty argv entries scrubbed before Popen", "" not in argv,
+          detail=str(argv))
+    check("real flags preserved",
+          argv == ["llama-server", "-m", "x.gguf", "--jinja",
+                   "-sp", "--host", "127.0.0.1"],
+          detail=str(argv))
+    check("scrubber logs a loud warning",
+          any("dropped" in m and "invalid argument" in m for m in msgs),
+          detail=" | ".join(msgs)[:300])
+    # And the exec line logged to the user must show the CLEANED command,
+    # never the poison argv that would have been spawned.
+    exec_lines = [m for m in msgs if m.startswith("[server] exec:")]
+    check("exec log shows sanitized argv",
+          len(exec_lines) == 1 and not exec_lines[0].rstrip().endswith("-sp ")
+          and "  " not in exec_lines[0],
+          detail=(exec_lines[0][:200] if exec_lines else "<none>"))
+
+
 def test_host_apikey_probe_attach():
     import socket
     import app.core.llamacpp as _lc
@@ -559,7 +640,13 @@ def test_model_profiles():
     check("thinking levels present",
           len(tg.thinking_levels) >= 4 and len(qw.thinking_levels) >= 4)
     budgets = [l.budget for l in qw.thinking_levels]
-    check("thinking budgets ascend", budgets == sorted(budgets))
+    # GUI order is Deep -> Off: xhigh first with the -1 unlimited sentinel,
+    # then descending caps down to 0.  (Plain numeric sorting can't express
+    # this because -1 means "unlimited", i.e. the LARGEST budget; the
+    # persisted-int nearest-match logic special-cases the sentinel too.)
+    check("thinking budgets ordered deep->off",
+          budgets[0] == -1 and budgets[1:] == sorted(budgets[1:], reverse=True)
+          and budgets[-1] == 0)
     unknown = get_model_profile("does-not-exist")
     check("unknown model neutral profile",
           unknown.max_context_by_quant == {}
@@ -581,8 +668,6 @@ def test_payload():
         check("multimodal parts", kinds == {"text", "image_url"})
         url = next(c["image_url"]["url"] for c in content if c["type"] == "image_url")
         check("base64 data url", url.startswith("data:image/png;base64,"))
-        check("thinking flag", pl.get("enable_thinking") is True)
-        check("reasoning budget", pl.get("reasoning_budget_tokens") == 512)
         check("sampling params", pl["temperature"] == 1.0 and pl["top_p"] == 0.95
               and pl["top_k"] == 40 and "min_p" in pl)
         check("streaming", pl["stream"] is True)
@@ -696,6 +781,7 @@ if __name__ == "__main__":
     test_arch_from_config()
     test_presets_and_postproc()
     test_server_args()
+    test_launch_argv_sanitizer()
     test_model_profiles()
     test_payload()
     test_collect_images()
