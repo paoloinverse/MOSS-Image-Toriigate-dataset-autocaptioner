@@ -479,30 +479,50 @@ def test_host_apikey_probe_attach():
               probe_server("http://no.such.host.invalid:9", timeout=1.0)[0]
               == "unreachable")
 
-        # _adopt_existing: attach to the live stub, then stop() DETACHES
-        sm2 = ServerManager(FakeHW([]))
-        msgs = []
-        sm2.log = type("LogCapture", (), {"emit": staticmethod(
-            lambda *a, **k: msgs.append(a[0] if a else ""))})()
-        sm2.find_binary = lambda: "/usr/bin/llama-server"
-        okc = ServerConfig(host="127.0.0.1", port=port,
-                           api_key="sekret", model=None,
-                           plan=cfg_plan())
-        err = sm2._preflight(okc)
-        check("preflight attaches instead of erroring",
-              sm2.attached and err == [], str(err))
-        check("is_running while attached", sm2.is_running())
-        check("attach NOTE logged",
-              any("attach" in m.lower() for m in msgs), "\n".join(msgs))
-        msgs.clear()
-        sm2.stop()
-        check("stop detaches (no kill of foreign process)",
-              not sm2.attached
-              and any("detach" in m.lower() for m in msgs)
-              and not any("stopped the server" in m.lower() for m in msgs),
-              "\n".join(msgs))
-        check("stub server survived detach",
-              probe_server(base, "sekret")[0].startswith("running"))
+        # _adopt_existing: attach to the live stub, then stop() DETACHES.
+        # Use a real ModelFile pointing at a temp GGUF so the regular
+        # preflight guards (which correctly reject model=None) don't mask
+        # the attach path we are actually testing here.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            gguf = Path(td) / "fake.gguf"
+            gguf.write_bytes(b"\x00" * (2 * 1024 * 1024))   # > 1 MiB guard
+            orig_storage = None
+            try:
+                from app.core import models as _md
+                orig_storage = _md.STORAGE
+                _md.STORAGE = type("S", (), {
+                    "find_existing": staticmethod(lambda repo, fn: gguf),
+                    "primary_download_dir": staticmethod(lambda repo: Path(td)),
+                })()
+                fake_model = ModelFile("fake.gguf", "Q8_0", "x/y", 0.5)
+                sm2 = ServerManager(FakeHW([]))
+                msgs = []
+                sm2.log = type("LogCapture", (), {"emit": staticmethod(
+                    lambda *a, **k: msgs.append(a[0] if a else ""))})()
+                sm2.find_binary = lambda: "/usr/bin/llama-server"
+                okc = ServerConfig(host="127.0.0.1", port=port,
+                                   api_key="sekret", model=fake_model,
+                                   plan=cfg_plan())
+                err = sm2._preflight(okc)
+                check("preflight attaches instead of erroring",
+                      sm2.attached and err == [], str(err))
+                check("is_running while attached", sm2.is_running())
+                check("attach NOTE logged",
+                      any("attach" in m.lower() for m in msgs), "\n".join(msgs))
+                msgs.clear()
+                sm2.stop()
+                check("stop detaches (no kill of foreign process)",
+                      not sm2.attached
+                      and any("detach" in m.lower() for m in msgs)
+                      and not any("stopped the server" in m.lower() for m in msgs),
+                      "\n".join(msgs))
+                check("stub server survived detach",
+                      probe_server(base, "sekret")[0].startswith("running"))
+            finally:
+                if orig_storage is not None:
+                    from app.core import models as _md
+                    _md.STORAGE = orig_storage
     finally:
         srv.shutdown(); srv.server_close()
 
