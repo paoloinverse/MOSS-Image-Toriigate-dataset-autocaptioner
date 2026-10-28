@@ -586,24 +586,50 @@ def test_payload():
         check("sampling params", pl["temperature"] == 1.0 and pl["top_p"] == 0.95
               and pl["top_k"] == 40 and "min_p" in pl)
         check("streaming", pl["stream"] is True)
+        # Qwen3.8-family payload contract: chat_template_kwargs carries the
+        # template knobs, the numeric cap travels top-level.  No settings ->
+        # MOSS preset (enable_thinking=True, budget 512): effort stays empty
+        # (presets have no named level), so reasoning_effort must NOT appear.
+        ctk = pl.get("chat_template_kwargs") or {}
+        check("chat_template_kwargs enable", ctk.get("enable_thinking") is True)
+        check("preserve always sent", ctk.get("preserve_thinking") is True)
+        check("no effort without a named level", "reasoning_effort" not in ctk)
+        check("top-level reasoning budget", pl.get("reasoning_budget") == 512)
 
         # Live Tab 2 settings override the preset values (thinking levels).
         from app.context import InferenceSettings
         s = InferenceSettings(temperature=0.6, top_p=0.9, top_k=20, min_p=0.0,
-                              reasoning_budget=4096)
+                              reasoning_budget=4096, thinking_level="medium")
         pl2 = build_payload(img, DEFAULT_PRESETS["moss"], "SYS", settings=s)
         check("settings override sampling",
               pl2["temperature"] == 0.6 and pl2["top_p"] == 0.9
               and pl2["top_k"] == 20 and pl2["min_p"] == 0.0)
+        ctk2 = pl2.get("chat_template_kwargs") or {}
         check("settings drive thinking",
-              pl2.get("enable_thinking") is True
-              and pl2.get("reasoning_budget_tokens") == 4096)
-        s_off = InferenceSettings(reasoning_budget=0)
-        # Preset enable_thinking stays on unless overridden by a preset that
-        # disables it; with budget 0 no reasoning tokens are injected.
+              ctk2.get("enable_thinking") is True
+              and ctk2.get("reasoning_effort") == "medium"
+              and pl2.get("reasoning_budget") == 4096)
+        # xhigh / Unlimited (-1): effort IS sent, the cap is omitted entirely
+        # (never forward a negative value the sampler would reject).
+        s_xh = InferenceSettings(reasoning_budget=-1, thinking_level="xhigh")
+        pl_xh = build_payload(img, DEFAULT_PRESETS["moss"], "SYS",
+                              settings=s_xh)
+        ctk_xh = pl_xh.get("chat_template_kwargs") or {}
+        check("xhigh sends effort", ctk_xh.get("reasoning_effort") == "xhigh"
+              and ctk_xh.get("enable_thinking") is True)
+        check("unlimited omits cap", "reasoning_budget" not in pl_xh)
+        # Master switch off: effort omitted (strict templates reject it with
+        # enable_thinking=False) and budget 0 forces an immediate close.
+        s_off = InferenceSettings(enable_thinking=False, thinking_level="",
+                                  reasoning_budget=0)
         pl3 = build_payload(img, DEFAULT_PRESETS["moss"], "SYS", settings=s_off)
-        check("zero budget -> no reasoning tokens",
-              "reasoning_budget_tokens" not in pl3)
+        ctk3 = pl3.get("chat_template_kwargs") or {}
+        check("off -> enable false + no effort",
+              ctk3.get("enable_thinking") is False
+              and "reasoning_effort" not in ctk3)
+        check("off -> preserve still honoured", ctk3.get("preserve_thinking")
+              is True)
+        check("off -> zero budget", pl3.get("reasoning_budget") == 0)
 
 
 # ------------------------------------------------------------------ batch collect

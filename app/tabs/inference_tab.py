@@ -311,27 +311,84 @@ class InferenceTab(QWidget):
         self.top_p_slider, self.top_p_val = _slider("Top-P", 0.0, 1.0, st.top_p)
         self.top_k_slider, self.top_k_val = _slider("Top-K", 1, 200, st.top_k, 1)
         self.min_p_slider, self.min_p_val = _slider("Min-P", 0.0, 1.0, st.min_p)
+        # Reasoning Budget slider: -1 ("Unlimited") .. REASONING_BUDGET_MAX.
+        # The leftmost stop is the unlimited sentinel; the dedicated
+        # Unlimited checkbox below is the primary way to select it (it also
+        # disables the slider, matching the Qwen3.8 GUI spec).
         self.reason_slider, self.reason_val = _slider(
-            "Reasoning Budget", 0, 16384, st.reasoning_budget, 1)
+            "Reasoning Budget", REASONING_BUDGET_UNLIMITED,
+            REASONING_BUDGET_MAX, st.reasoning_budget, 1)
         self.reason_slider.setSingleStep(64)
+        self.cb_unlimited = QCheckBox("Unlimited (-1, no token cap)")
+        self.cb_unlimited.setChecked(int(st.reasoning_budget) < 0)
+        self.cb_unlimited.setToolTip(
+            "Checked: reasoning_budget = -1 -> no hard cap is sent; the\n"
+            "model thinks as long as it wants (xhigh behaviour).\n"
+            "Unchecked: the slider value becomes a top-level\n"
+            "reasoning_budget token cap enforced by the llama-server\n"
+            "sampler (force-closes the thinking block when reached).")
+        self.cb_unlimited.toggled.connect(self._on_unlimited_toggled)
 
         gf.addRow("Temperature:", self._row(self.temp_slider, self.temp_val))
         gf.addRow("Top-P:", self._row(self.top_p_slider, self.top_p_val))
         gf.addRow("Top-K:", self._row(self.top_k_slider, self.top_k_val))
         gf.addRow("Min-P:", self._row(self.min_p_slider, self.min_p_val))
-        # Thinking level: named per-model preset (Off/Low/Medium/High) that
-        # sets the reasoning budget; the slider below stays for fine control.
+        # ---- Qwen3.8-family reasoning controls ------------------------------
+        # Master switch first: with thinking off the effort combo, budget
+        # widgets and preserve checkbox are greyed out (the payload then
+        # carries chat_template_kwargs.enable_thinking=False + budget 0).
+        self.cb_enable_thinking = QCheckBox("Enable Thinking")
+        self.cb_enable_thinking.setChecked(bool(st.enable_thinking))
+        self.cb_enable_thinking.setToolTip(
+            "chat_template_kwargs.enable_thinking (per request).\n"
+            "Unchecked: reasoning is disabled - effort / budget /\n"
+            "preserve controls are locked and the sampler closes any\n"
+            "thinking block immediately (reasoning_budget: 0).")
+        self.cb_enable_thinking.toggled.connect(
+            lambda v: (setattr(self.ctx.settings, "enable_thinking", bool(v)),
+                       self._toggle_thinking_controls()))
+        gf.addRow(self.cb_enable_thinking)
+        # Thinking level: named reasoning_effort the Qwen3.8 template
+        # supports distinctly (xhigh / medium / low / Off - 'high' is only a
+        # silent upstream alias of 'xhigh' and is never exposed or sent);
+        # selecting a level also presets the budget slider.
         self.thinking_combo = QComboBox()
         self.thinking_combo.setToolTip(
-            "Model-specific thinking levels (Qwen3-family hybrid thinker).\n"
-            "Sets --reasoning-budget on the server and reasoning_budget_tokens\n"
-            "/ enable_thinking in the request payload.")
+            "Reasoning effort exactly as the Unsloth-patched Qwen3.8 chat\n"
+            "template supports it (chat_template_kwargs.reasoning_effort):\n"
+            "  xhigh  - Deep / Maximum, unrestricted thinking (budget -1)\n"
+            "  medium - Standard / Balanced (~4K reasoning tokens)\n"
+            "  low    - Brief / Fast (~1K reasoning tokens)\n"
+            "'high' is deliberately NOT offered: upstream silently aliases\n"
+            "it onto 'xhigh'.  Sent per request, so changing the level\n"
+            "mid-conversation applies to the NEXT turn without restarting\n"
+            "llama-server (requires --jinja, added automatically).")
         self._populate_thinking_levels(st.thinking_level or st.reasoning_budget)
-        gf.addRow("Thinking level:", self.thinking_combo)
-        gf.addRow("Reasoning Budget (tokens):",
-                  self._row(self.reason_slider, self.reason_val))
-        hint = QLabel("Reasoning budget maps to --reasoning-budget / "
-                      "reasoning_budget_tokens (Qwen3.8 thinking mode).")
+        gf.addRow("Thinking level (effort):", self.thinking_combo)
+        bud_row = QHBoxLayout()
+        bud_row.addWidget(self.reason_slider, stretch=1)
+        bud_row.addWidget(self.reason_val)
+        bud_w = QWidget()
+        bud_w.setLayout(bud_row)
+        gf.addRow("Reasoning Budget (tokens):", bud_w)
+        gf.addRow("", self.cb_unlimited)
+        self.cb_preserve = QCheckBox("Preserve Thinking History")
+        self.cb_preserve.setChecked(bool(st.preserve_thinking))
+        self.cb_preserve.setToolTip(
+            "chat_template_kwargs.preserve_thinking.\n"
+            "Keeps earlier thinking blocks verbatim in the context history.\n"
+            "Recommended (repo default): if the effort level changes\n"
+            "mid-conversation, disabling preservation lets the template\n"
+            "rewrite/summarise old thinking blocks, which can confuse the\n"
+            "model when they no longer match the current effort instruction.")
+        self.cb_preserve.toggled.connect(
+            lambda v: setattr(self.ctx.settings, "preserve_thinking", bool(v)))
+        gf.addRow(self.cb_preserve)
+        hint = QLabel(
+            "Reasoning knobs travel PER REQUEST: effort / enable / preserve "
+            "via chat_template_kwargs (needs llama-server --jinja, added "
+            "automatically), the numeric cap via top-level reasoning_budget. "
+            "Changes apply to the next turn - no model reload required.")
         hint.setStyleSheet("color: gray;")
         hint.setWordWrap(True)
         gf.addRow(hint)
@@ -377,8 +434,8 @@ class InferenceTab(QWidget):
         self.top_k_slider.valueChanged.connect(
             lambda v: self._set_param("top_k", v, self.top_k_val))
         self.reason_slider.valueChanged.connect(
-            lambda v: (self._set_param("reasoning_budget", v, self.reason_val),
-                       self._sync_reasoning_to_slider()))
+            lambda v: (setattr(self.ctx.settings, "reasoning_budget", int(v)),
+                       self._on_reason_slider_moved(v)))
         self.thinking_combo.currentIndexChanged.connect(
             self._on_thinking_level_changed)
         self.cache_combo.currentTextChanged.connect(
@@ -426,6 +483,11 @@ class InferenceTab(QWidget):
         self._populate_run_models()
         self._profiled_key = self.ctx.run_model_key
         self._refresh_binary_status()
+        # Initial greyed-out state of the reasoning controls (master switch)
+        # plus unlimited/slider enablement - done AFTER wiring so programmatic
+        # setChecked/setValue calls above never fired the live handlers.
+        self.cb_unlimited.setChecked(int(self.ctx.settings.reasoning_budget) < 0)
+        self._toggle_thinking_controls()
 
     # ------------------------------------------------------------------ plan
     def refresh_from_context(self):
@@ -469,13 +531,31 @@ class InferenceTab(QWidget):
                 (self.temp_slider, self.temp_val, st.temperature),
                 (self.top_p_slider, self.top_p_val, st.top_p),
                 (self.top_k_slider, self.top_k_val, st.top_k),
-                (self.min_p_slider, self.min_p_val, st.min_p),
-                (self.reason_slider, self.reason_val, st.reasoning_budget)):
+                (self.min_p_slider, self.min_p_val, st.min_p)):
             slider.blockSignals(True)
             slider.setValue(value)
             slider.blockSignals(False)
-            label.setText(slider.text())
+            label.setText(str(slider.value()))
+        # Reasoning budget: -1 (unlimited sentinel) is a valid slider value;
+        # hydrate the Unlimited checkbox from it and show "Unlimited" instead
+        # of the raw number on the value label.
+        rb = int(st.reasoning_budget)
+        self.cb_unlimited.blockSignals(True)
+        self.cb_unlimited.setChecked(rb < 0)
+        self.cb_unlimited.blockSignals(False)
+        self.reason_slider.blockSignals(True)
+        self.reason_slider.setValue(max(self.reason_slider.minimum(),
+                                         min(self.reason_slider.maximum(), rb)))
+        self.reason_slider.blockSignals(False)
+        self.reason_val.setText("Unlimited" if rb < 0 else str(rb))
+        self.cb_enable_thinking.blockSignals(True)
+        self.cb_enable_thinking.setChecked(bool(st.enable_thinking))
+        self.cb_enable_thinking.blockSignals(False)
+        self.cb_preserve.blockSignals(True)
+        self.cb_preserve.setChecked(bool(st.preserve_thinking))
+        self.cb_preserve.blockSignals(False)
         self._populate_thinking_levels(st.thinking_level or st.reasoning_budget)
+        self._toggle_thinking_controls()
         self._refresh_binary_status()
         self._populate_run_models()
         self.refresh_plan()
@@ -693,7 +773,11 @@ class InferenceTab(QWidget):
 
         ``select`` is a level key (str) or a raw budget (int); when nothing
         matches exactly, the closest budget wins so persisted settings map
-        onto the named levels.
+        onto the named levels.  The keys come straight from the model
+        profile - for Qwen3.8-family models that is exactly what the
+        Unsloth-patched template supports distinctly: ``xhigh`` / ``medium``
+        / ``low`` (+ the explicit Off entry).  ``high`` is never offered:
+        upstream silently aliases it onto ``xhigh``.
         """
         prof = self._profile()
         self.thinking_combo.blockSignals(True)
@@ -718,26 +802,88 @@ class InferenceTab(QWidget):
         else:   # int budget from persisted settings -> nearest named level
             best = None
             for i, lvl in enumerate(levels):
-                d = abs(lvl.budget - int(select or 0))
+                d = abs(lvl.budget - int(select))
                 if best is None or d < best[0]:
                     best = (d, i)
             idx = best[1] if best else 0
         self.thinking_combo.setCurrentIndex(idx)
         self.thinking_combo.blockSignals(False)
 
+    def _toggle_thinking_controls(self):
+        """Enable/disable the reasoning widgets from the master switch.
+
+        Mirrors the Qwen3.8 GUI spec: with 'Enable Thinking' unchecked the
+        effort combo, Unlimited checkbox, budget slider and Preserve checkbox
+        are greyed out; with it checked, the slider is additionally locked
+        while 'Unlimited' is ticked (the value stays pinned at -1).
+        """
+        on = self.cb_enable_thinking.isChecked()
+        unlimited = self.cb_unlimited.isChecked()
+        self.thinking_combo.setEnabled(on and self.thinking_combo.count() > 1)
+        self.cb_unlimited.setEnabled(on)
+        self.reason_slider.setEnabled(on and not unlimited)
+        self.cb_preserve.setEnabled(on)
+
+    def _on_unlimited_toggled(self, checked: bool):
+        """Unlimited checkbox <-> slider sync (budget sentinel -1)."""
+        if checked:
+            # Pin the settings value to the unlimited sentinel; the slider
+            # parks at its leftmost stop purely as a visual cue.
+            self.ctx.settings.reasoning_budget = REASONING_BUDGET_UNLIMITED
+            self.reason_slider.blockSignals(True)
+            self.reason_slider.setValue(REASONING_BUDGET_UNLIMITED)
+            self.reason_slider.blockSignals(False)
+            self.reason_val.setText("Unlimited")
+        else:
+            v = int(self.reason_slider.value())
+            if v < 0:
+                v = 0     # leave the sentinel zone so the cap is concrete
+                self.reason_slider.blockSignals(True)
+                self.reason_slider.setValue(0)
+                self.reason_slider.blockSignals(False)
+            self.ctx.settings.reasoning_budget = v
+            self.reason_val.setText(str(v))
+        self._toggle_thinking_controls()
+
+    def _on_reason_slider_moved(self, value: int):
+        """Slider drag handler: update label + combo alignment."""
+        self.reason_val.setText("Unlimited" if int(value) < 0 else str(int(value)))
+        # Dragging back into negative territory means "Unlimited" again.
+        if int(value) < 0 and not self.cb_unlimited.isChecked():
+            self.cb_unlimited.blockSignals(True)
+            self.cb_unlimited.setChecked(True)
+            self.cb_unlimited.blockSignals(False)
+            self._toggle_thinking_controls()
+        self._sync_reasoning_to_slider()
+
     def _on_thinking_level_changed(self, _index: int):
         lvl_key = self.thinking_combo.currentData() or ""
         budgets = {l.key: l.budget for l in self._profile().thinking_levels}
         budget = int(budgets.get(lvl_key, 0))
         self.ctx.settings.thinking_level = lvl_key
-        # Clamp into the slider range before pushing the value through it so
-        # the label + settings stay consistent with the widget state.
-        self.reason_slider.blockSignals(True)
-        clamped = max(self.reason_slider.minimum(),
-                      min(self.reason_slider.maximum(), budget))
-        self.reason_slider.setValue(clamped)
-        self.reason_slider.blockSignals(False)
-        self._set_param("reasoning_budget", clamped, self.reason_val)
+        # xhigh maps to the unlimited sentinel (-1): tick 'Unlimited' and
+        # park the slider at its leftmost stop instead of clamping to 0.
+        if budget < 0:
+            self.ctx.settings.reasoning_budget = REASONING_BUDGET_UNLIMITED
+            self.cb_unlimited.blockSignals(True)
+            self.cb_unlimited.setChecked(True)
+            self.cb_unlimited.blockSignals(False)
+            self.reason_slider.blockSignals(True)
+            self.reason_slider.setValue(REASONING_BUDGET_UNLIMITED)
+            self.reason_slider.blockSignals(False)
+            self.reason_val.setText("Unlimited")
+        else:
+            self.cb_unlimited.blockSignals(True)
+            self.cb_unlimited.setChecked(False)
+            self.cb_unlimited.blockSignals(False)
+            clamped = max(self.reason_slider.minimum(),
+                          min(self.reason_slider.maximum(), budget))
+            self.reason_slider.blockSignals(True)
+            self.reason_slider.setValue(clamped)
+            self.reason_slider.blockSignals(False)
+            self.ctx.settings.reasoning_budget = clamped
+            self.reason_val.setText(str(clamped))
+        self._toggle_thinking_controls()
 
     def _sync_reasoning_to_slider(self):
         """Keep the combo aligned when the budget slider is moved manually."""
@@ -798,7 +944,8 @@ class InferenceTab(QWidget):
     def _set_param(self, attr: str, value, label: QLabel):
         setattr(self.ctx.settings, attr, value)
         if attr == "reasoning_budget":
-            label.setText(str(int(value)))
+            v = int(value)
+            label.setText("Unlimited" if v < 0 else str(v))
         elif isinstance(value, int):
             label.setText(str(value))
         else:
@@ -1105,6 +1252,15 @@ class InferenceTab(QWidget):
             cache_type_k=ctx.settings.cache_type,
             cache_type_v=ctx.settings.cache_type,
             flash_attn=self.fa_combo.currentText().strip().lower() or "auto",
+            # Qwen3.8-family reasoning: the effort/preserve/enable values are
+            # applied PER REQUEST via chat_template_kwargs (api_client); the
+            # server config only drives --jinja gating + startup logging.
+            # reasoning_budget > 0 additionally sets a server-wide default
+            # cap; -1 ("Unlimited") deliberately omits --reasoning-budget so
+            # no global cap conflicts with per-request overrides.
+            enable_thinking=bool(ctx.settings.enable_thinking),
+            preserve_thinking=bool(ctx.settings.preserve_thinking),
+            reasoning_effort=str(ctx.settings.thinking_level or ""),
             reasoning_budget=int(ctx.settings.reasoning_budget),
             extra_args=self.extra_args.toPlainText().strip(),
             explicit_mode=ctx.explicit_mode,
@@ -1112,6 +1268,19 @@ class InferenceTab(QWidget):
             api_key=self.api_key_edit.text().strip(),
         )
         ctx.log.emit("[server] requested start with plan: " + plan.summary())
+        # Template-compatibility heads-up: the reasoning knobs rely on the
+        # Unsloth-patched Qwen3.8 chat template.  Models whose profile has no
+        # thinking levels at all (unknown family / raw HF GGUF conversion)
+        # may ignore reasoning_effort entirely - or raise a Jinja render
+        # error on it - so warn instead of silently promising thinking.
+        if bool(ctx.settings.enable_thinking) \
+                and not self._profile().thinking_levels:
+            ctx.log.emit(
+                "[server] WARNING: run target '"
+                f"{ctx.run_model_key}' has no known Qwen3.8-family chat "
+                "template profile - reasoning_effort / preserve_thinking may "
+                "be ignored by a raw HF GGUF template. If thinking output "
+                "looks wrong, use an Unsloth-patched Qwen3.8 build.")
         # start() runs its own preflight checks and emits every problem into
         # the global log ("[server] PRE-FLIGHT ERROR: ...") - it returns
         # False without raising when something blocks the launch.
