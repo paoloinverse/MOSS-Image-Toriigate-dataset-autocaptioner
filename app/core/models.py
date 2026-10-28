@@ -444,17 +444,25 @@ _MODEL_FAMILY_DEFAULTS: dict[str, ModelProfile] = {
         thinking_levels=_QWEN_THINKING_LEVELS,
         default_thinking="low",
         temperature=1.0, top_p=0.95, top_k=40, min_p=0.05,
-        note="ToriiGate-0.5 is a Qwen3-VL-based captioner: thinking levels "
-             "map to --reasoning-budget; its chat template honours "
-             "enable_thinking."),
+        preserve_thinking_default=True,
+        note="ToriiGate-0.5 is a Qwen3-VL-based captioner (Unsloth-patched "
+             "Qwen3.8-family chat template): reasoning_effort xhigh/medium/"
+             "low + enable_thinking/preserve_thinking go per-request via "
+             "chat_template_kwargs (server needs --jinja); the budget maps "
+             "to --reasoning-budget / per-request reasoning_budget."),
     "qwen3.8-27b": ModelProfile(
         max_context_by_quant={},
         default_cache_type="q8_0",
         thinking_levels=_QWEN_THINKING_LEVELS,
-        default_thinking="medium",
+        default_thinking="xhigh",
         temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
-        note="Qwen3-family hybrid thinker: 'thinking' needs enable_thinking "
-             "in the request plus --reasoning-budget on the server."),
+        preserve_thinking_default=True,
+        note="Qwen3.8-family hybrid thinker: enable_thinking / "
+             "reasoning_effort ('xhigh' | 'medium' | 'low'; 'high' is only a "
+             "silent alias of 'xhigh' and never sent) / preserve_thinking go "
+             "in chat_template_kwargs per request (--jinja required); the "
+             "token cap uses --reasoning-budget on the server plus a "
+             "top-level reasoning_budget override per request."),
 }
 
 #: Rough VRAM budget (GiB) allowed to the KV cache when deriving per-quant
@@ -565,7 +573,9 @@ def model_profile_for(key: str | None, quant: str | None = None,
                         thinking_levels=base.thinking_levels,
                         default_thinking=base.default_thinking,
                         temperature=base.temperature, top_p=base.top_p,
-                        top_k=base.top_k, min_p=base.min_p, note=base.note)
+                        top_k=base.top_k, min_p=base.min_p,
+                        preserve_thinking_default=base.preserve_thinking_default,
+                        note=base.note)
 
 
 def get_model_profile(key: str | None, quant: str | None = None,

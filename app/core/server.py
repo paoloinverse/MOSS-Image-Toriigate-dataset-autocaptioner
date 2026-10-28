@@ -43,7 +43,14 @@ class ServerConfig:
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
     flash_attn: str = "auto"         # GUI switch: auto | on | off ("" = leave to server)
-    reasoning_budget: int = 0        # --reasoning-budget (thinking level)
+    reasoning_budget: int = -1       # --reasoning-budget (-1/0 = no server cap;
+                                     # per-request override wins, see api_client)
+    # Qwen3.8-family reasoning knobs.  The effort/budget/preserve values are
+    # applied PER REQUEST via chat_template_kwargs (api_client.build_payload);
+    # the server only needs them for startup logging + --jinja gating.
+    enable_thinking: bool = True
+    preserve_thinking: bool = True
+    reasoning_effort: str = "xhigh"  # "" | low | medium | xhigh
     extra_args: str = ""             # raw passthrough from Tab 2
     explicit_mode: bool = False      # disables safety-system prompts
     binary: str = "llama-server"
@@ -278,16 +285,38 @@ class ServerManager(QObject):
         if selected:
             args += ["--cache-type-k", cfg.cache_type_k,
                      "--cache-type-v", cfg.cache_type_v]
-        # Thinking level -> server-side reasoning budget (Qwen3-family);
-        # skipped when the binary predates the flag (older llama.cpp builds
-        # reject it with 'invalid argument' and exit 1).
+        # ---- Qwen3.8-family reasoning support --------------------------------
+        # --jinja is REQUIRED for llama-server to forward the per-request
+        # chat_template_kwargs (enable_thinking / reasoning_effort /
+        # preserve_thinking) into the model's Jinja chat template; without it
+        # the template falls back to the built-in simplified one and every
+        # thinking knob Tab 2 exposes is silently ignored.  Boolean flag, so
+        # probe first - builds predating it exit 1 on 'invalid argument'.
+        _thinking_on = bool(getattr(cfg, "enable_thinking", True)) \
+            or str(getattr(cfg, "reasoning_effort", "") or "")
+        if _thinking_on:
+            if _cap("has_jinja", True):
+                args += ["--jinja"]
+            else:
+                self.log.emit(
+                    "[server] WARNING: this llama-server does not support "
+                    "--jinja - per-request chat_template_kwargs "
+                    "(enable_thinking / reasoning_effort / preserve_thinking)"
+                    " cannot reach the Qwen3.8 chat template. Update the "
+                    "binary ('Auto-install / build' in Tab 2) for full "
+                    "thinking-level control.")
+        # Server-wide default reasoning budget: only passed when the user set
+        # an actual numeric cap (> 0).  -1 ("Unlimited") deliberately omits
+        # the flag so no global cap conflicts with the per-request
+        # reasoning_budget override sent by api_client.build_payload().
         if getattr(cfg, "reasoning_budget", 0) > 0:
             if _cap("has_reasoning_budget", True):
                 args += ["--reasoning-budget", str(cfg.reasoning_budget)]
             else:
                 self.log.emit("[server] WARNING: this llama-server does not "
                               "support --reasoning-budget - thinking levels "
-                              "are request-only (enable_thinking in payload).")
+                              "are request-only (chat_template_kwargs in "
+                              "payload, needs --jinja).")
         if cfg.explicit_mode:
             # Disable safety-system prompts server-side; the explicit trigger
             # sentence itself is injected into the system prompt by presets.

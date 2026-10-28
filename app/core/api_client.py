@@ -3,9 +3,21 @@
 Uses ``httpx`` (async).  Images are base64 data-URLs embedded in multimodal
 message content, exactly as llama-server's compatibility endpoint expects.
 
-Payload extras per spec:
-* ``enable_thinking: true``           -> MOSS "Thinking Mode"
-* ``reasoning_budget_tokens: N``      -> Qwen3.8 reasoning budget
+Payload extras per spec (Qwen3.8-family compliance, Unsloth-patched chat
+template; every knob is sent PER REQUEST so Tab 2 changes apply to the next
+turn without restarting llama-server):
+* ``chat_template_kwargs.enable_thinking``   -> master thinking switch
+* ``chat_template_kwargs.reasoning_effort``  -> "xhigh" | "medium" | "low"
+  (exactly what the template supports distinctly; the silent 'high'->'xhigh'
+  alias is deliberately never emitted).  Omitted when thinking is off so a
+  strict template build cannot raise a Jinja error on an unusable value.
+* ``chat_template_kwargs.preserve_thinking`` -> keep earlier  blocks
+  verbatim in the history (recommended: prevents the model being confused
+  by old thinking blocks after a mid-conversation effort change).
+* top-level ``reasoning_budget``             -> hard token cap enforced by
+  the llama-server sampler (forces the closing  when reached).
+  -1 / 0-budget-unlimited means "omit the cap"; thinking disabled sends 0
+  so the server immediately closes any reasoning block.
 * streaming responses are forwarded chunk-by-chunk to a callback so the GUI
   can show live output.
 
@@ -142,9 +154,45 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
     # Tab 2 live settings win over the preset when provided (AppContext's
     # InferenceSettings); this keeps server-side --reasoning-budget and the
     # request-side thinking flags consistent with what the user picked.
-    reasoning_budget = int(getattr(settings, "reasoning_budget",
-                                   params.reasoning_budget) or 0)
-    enable_thinking = bool(params.enable_thinking) or reasoning_budget > 0
+    # ``-1`` is the app-wide "unlimited" sentinel: never forward a negative
+    # cap to llama-server (the sampler would reject it) - just omit the
+    # override so the server default applies.
+    budget_raw = getattr(settings, "reasoning_budget", None)
+    if budget_raw is None:
+        budget_raw = params.reasoning_budget
+    try:
+        reasoning_budget = int(budget_raw or 0)
+    except (TypeError, ValueError):
+        reasoning_budget = 0
+    unlimited = reasoning_budget < 0
+    # Effort level ("xhigh" | "medium" | "low"; "" = off).  Fall back to the
+    # nearest named level for legacy configs that only persisted an int
+    # budget, so old captioner_config.json files keep working unchanged.
+    effort = (getattr(settings, "thinking_level", None) or "").strip().lower()
+    if not effort:
+        from app.core.models import get_model_profile
+        prof = get_model_profile(getattr(settings, "run_model_key", "") or "")
+        if unlimited:
+            cand = next((l.key for l in prof.thinking_levels if l.budget < 0),
+                        "")
+        else:
+            pairs = [(abs(l.budget - reasoning_budget), l.key)
+                     for l in prof.thinking_levels if l.key and l.budget > 0]
+            cand = min(pairs)[1] if pairs else ""
+        # Only trust the derived key when the budget actually matches it;
+        # otherwise leave effort empty (pure numeric-cap behaviour).
+        lvl = next((l for l in prof.thinking_levels if l.key == cand), None)
+        if lvl is not None and (lvl.budget == reasoning_budget or
+                                (unlimited and lvl.budget < 0)):
+            effort = cand
+    enable_flag = getattr(settings, "enable_thinking", None)
+    if enable_flag is None:
+        # No Tab 2 settings (headless / legacy callers): honour the preset.
+        enable_thinking = bool(params.enable_thinking) or reasoning_budget > 0
+    else:
+        enable_thinking = bool(enable_flag) and (bool(effort) or unlimited
+                                                 or reasoning_budget > 0)
+    preserve = bool(getattr(settings, "preserve_thinking", True))
     payload: dict = {
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -163,10 +211,27 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
     # llama-server accepts sampling extras at top level of the request body.
     payload["top_k"] = int(getattr(settings, "top_k", params.top_k))
     payload["min_p"] = float(getattr(settings, "min_p", params.min_p))
+    # ---- Qwen3.8-family reasoning block ----------------------------------
+    # chat_template_kwargs reaches the Jinja template only when the server
+    # runs with --jinja (see server.build_args / llamacpp.probe_capabilities).
+    ctk: dict = {"enable_thinking": enable_thinking,
+                 "preserve_thinking": preserve}
+    # reasoning_effort ONLY when thinking is on: the Qwen3.8 template rejects
+    # an effort value combined with enable_thinking=False, and 'high' is
+    # never emitted (the Unsloth patch silently aliases it onto 'xhigh').
+    if enable_thinking and effort:
+        ctk["reasoning_effort"] = effort
+    payload["chat_template_kwargs"] = ctk
     if enable_thinking:
-        payload["enable_thinking"] = True
-    if reasoning_budget > 0:
-        payload["reasoning_budget_tokens"] = reasoning_budget
+        if reasoning_budget > 0:
+            # Top-level hard cap enforced by the llama-server sampler: it
+            # force-closes  once N thinking tokens were generated.
+            payload["reasoning_budget"] = reasoning_budget
+        # unlimited (-1): omit the cap entirely -> server default applies.
+    else:
+        # Thinking off: budget 0 forces the model to close any reasoning
+        # block immediately instead of relying on the template alone.
+        payload["reasoning_budget"] = 0
     return payload
 
 

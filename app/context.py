@@ -30,8 +30,16 @@ class InferenceSettings:
     top_p: float = 0.95
     top_k: int = 40
     min_p: float = 0.05
-    reasoning_budget: int = 0
-    thinking_level: str = ""         # Tab 2 combo key ("" = off) - persisted
+    # Qwen3.8-family reasoning controls (Tab 2 -> api_client.build_payload):
+    # ``enable_thinking`` is the master switch mapped to
+    # chat_template_kwargs.enable_thinking; ``preserve_thinking`` keeps
+    # earlier  blocks verbatim in the history (safest when the effort
+    # level changes mid-conversation); ``reasoning_budget`` is the token cap
+    # (-1 = unlimited => no per-request override / no server-side cap).
+    enable_thinking: bool = True
+    preserve_thinking: bool = True
+    reasoning_budget: int = -1
+    thinking_level: str = "xhigh"    # reasoning_effort key ("" = off) - persisted
     cache_type: str = "q8_0"
     # Multi-GPU tensor split mode passed to llama-server as '-sm <mode>'.
     # Default is 'layer' (llama.cpp's recommended split for pipeline-style
