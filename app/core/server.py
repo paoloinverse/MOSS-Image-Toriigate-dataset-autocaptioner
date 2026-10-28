@@ -103,19 +103,24 @@ def probe_server(base_url: str, api_key: str = "", timeout: float = 3.0,
     * ``("down", msg)``              - TCP reachable, nothing answering HTTP
     * ``("unreachable", msg)``       - DNS/TCP/connect failure
 
+    ``("running", ...)`` and ``("running-auth", ...)`` both mean "the server
+    answers requests" - the suffix only records whether a token was supplied.
     Never raises; every outcome carries a short human-readable detail.
     """
     url = base_url.rstrip("/") + "/health"
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+
+    def _ok(status: int) -> tuple[str, str]:
+        label = "running-auth" if api_key else "running"
+        return (label, "" if status == 200 else f"HTTP {status}")
+
     try:
         import urllib.request as _ur
         req = _ur.Request(url, headers=headers)
         with _ur.urlopen(req, timeout=timeout) as r:
-            if r.status == 200:
-                return ("running", "")
-            return ("running", f"HTTP {r.status}")
+            return _ok(r.status)
     except Exception as exc:
         import urllib.error as _ue
         status = None
@@ -125,10 +130,11 @@ def probe_server(base_url: str, api_key: str = "", timeout: float = 3.0,
             if not api_key:
                 return ("auth-required",
                         f"HTTP {status}: server requires an API key")
-            # A token WAS sent.  llama-server builds differ on whether
-            # /health itself is gated, so confirm against a definitely-
-            # protected endpoint (/v1/models): still denied there means the
-            # key is wrong; accepted means the server is fine for us.
+            # A token WAS sent but /health refused it.  Some llama-server
+            # builds gate /health inconsistently even for VALID keys, so
+            # confirm against /v1/models before declaring the key wrong:
+            # accepted there => server is fine for us (running-auth);
+            # denied there too => the key really is bad (auth-failed).
             try:
                 req2 = _ur.Request(base_url.rstrip("/") + "/v1/models",
                                    headers=headers)

@@ -82,7 +82,7 @@ Afterwards just start the app again with `./run.sh`.
 | Tab | Purpose |
 | --- | --- |
 | **Hardware & Models** | Select GPUs, watch VRAM/RAM meters, pick model + quantization, "Download & Verify" |
-| **Inference Parameters** | Raw `llama-server` flags, Temperature/Top-P/Top-K/Min-P sliders, Reasoning Budget, KV-cache quantization, multi-GPU tensor-split mode (`layer` default — the llama.cpp-recommended split — / `row` / `graph`, passed as `-sm`) |
+| **Inference Parameters** | Raw `llama-server` flags, Temperature/Top-P/Top-K/Min-P sliders, Reasoning Budget, KV-cache quantization, multi-GPU tensor-split mode (`layer` default — the llama.cpp-recommended split — / `row` / `graph`, passed as `-sm`), **API Key** field (sent as `--api-key` to a spawned server and as `Authorization: Bearer` on every request) and auto host/port reachability check with attach-to-remote semantics (see below) |
 | **Captioning Presets** | MOSS-Image / Booru-SDXL / Custom prompts, Explicit Mode toggle, Export/Import config JSON |
 | **Dataset Explorer** | Pick dataset directory (recursive option), browse images, zoom/pan viewer |
 | **Batch Processing** | Select folders/images, Start Auto-Caption / Stop / Save All, **Batch Save Extant Captions** (re-saves every existing sidecar of the checked images in the active preset's format — MOSS JSON → `.json`, tags → cleaned `.txt` — no server round-trip; images without a caption are skipped), progress bar + live `llama-server` log; clicking anywhere on an image row toggles its checkbox; **"Verbose conversation log"** checkbox dumps the full llama-server exchange into the Log Output: every prompt sent (system + user text, base64 images shown as size placeholders), streamed answer deltas, thinking/reasoning output (`delta.reasoning_content`) tagged `[thinking]`, raw SSE chunks, finish reason and token usage — all prefixed with `[llama]` |
@@ -106,6 +106,42 @@ are skipped with warnings and a corrupt file never blocks startup (the import
 result and any warnings are written to the Log Output). To pin a machine's
 configuration, export once next to the launcher and every start afterwards
 replays it.
+
+### Connecting to a server: API key & host reachability (Tab 2)
+
+**API Key** — Tab 2 has an *API Key* field (password-masked, with a Show
+toggle; persisted in the app settings). It is used in both directions:
+
+* when the app **starts** `llama-server` locally it is forwarded as
+  `--api-key`, so the spawned server demands that token;
+* when the app **talks** to a server (single captioning, batch runs, health
+  probes) it is sent as the `Authorization: Bearer <key>` header. Leaving the
+  field empty falls back to the `MOSS_API_KEY` / `APPCAP_API_KEY` environment
+  variables.
+
+**Host check on commit** — after you finish editing the *Host* or *Port*
+field (or press the **Check** button), a background probe answers
+`GET /health` against `http://host:port` without ever blocking the UI:
+
+* **Local host** (`localhost`, `127.x.x.x`, `::1`, `0.0.0.0`, …): purely
+  advisory — the status label tells you whether something already answers
+  there, but the default flow stays unchanged: you keep starting the server
+  yourself from Tab 2 with the configured options, bound to the address you
+  typed (`0.0.0.0` = all interfaces; clients then connect via `127.0.0.1`).
+  If a local server is found running, *Start Server* reuses it and *Stop*
+  only detaches instead of killing it.
+* **Remote host**: if reachable and answering, *Start Server* switches into
+  attach mode — it joins the existing remote server (no local process is
+  launched, and a 401 even on the unauthenticated probe counts as "running,
+  auth required"). Host reachable but silent → orange hint; unreachable →
+  red status with the network error. A wrong/missing API key shows up as
+  *auth-required* (orange) or *auth-failed* (red) respectively.
+
+The same probe distinguishes `running` / `running-auth` / `auth-required` /
+`auth-failed` / `down` / `unreachable` and logs each result to the Log
+Output; repeated commits of an unchanged endpoint are deduplicated, and
+*Stop* on an attached (foreign) server always detaches rather than killing
+a process the app did not spawn.
 
 ### Fuzzy JSON schema handling
 
