@@ -320,16 +320,24 @@ class ServerManager(QObject):
         if cfg.explicit_mode:
             # Disable safety-system prompts server-side; the explicit trigger
             # sentence itself is injected into the system prompt by presets.
-            # '-sp' takes an optional string, but builds without the flag
-            # abort with "error: invalid argument:" (empty value included)
-            # and exit 1 - so only pass it when the probe says it exists.
+            # NOTE: '-sp' / '--single-turn' are NOT upstream llama.cpp flags.
+            # Passing ['-sp', ''] made real builds abort with
+            # "error: invalid argument:" (empty name - common_getopt chokes
+            # on the empty argv entry) + exit 1, which is exactly the crash
+            # seen when reloading with explicit mode on.  We therefore only
+            # pass it for custom forks that *prove* support twice: the flag
+            # must appear in --help AND survive parse probing
+            # (probe_capabilities -> has_single_turn).  Otherwise explicit
+            # mode stays request-only - fully functional, since presets
+            # inject the trigger sentence into the system prompt per call.
             if _cap("has_single_turn", False):
-                args += ["-sp", ""]   # empty built-in system prompt
+                args += ["-sp", ""]   # empty built-in system prompt (forks)
             else:
                 self.log.emit("[server] NOTE: this llama-server does not "
-                              "support '-sp' (--single-turn) - explicit mode "
-                              "runs request-only (the trigger sentence is "
-                              "still injected into the system prompt).")
+                              "support '-sp' (not an upstream flag) - "
+                              "explicit mode runs request-only (the trigger "
+                              "sentence is still injected into the system "
+                              "prompt by the active preset).")
         args += ["--host", cfg.host, "--port", str(cfg.port)]
         # Auth token for the API endpoints: the real flag is --api-key.
         # Bare `--api` was rejected by older builds ("error: invalid
@@ -587,6 +595,55 @@ class ServerManager(QObject):
 
             self._shutdown_requested = False
             args = self.build_args(cfg)
+            # Guard against launch-killing argv bugs like the historical
+            # '-sp ""' pair: llama.cpp's common_getopt aborts on an empty
+            # argv entry with 'error: invalid argument:' (empty name!) and
+            # exit code 1, killing every spawn.  A real llama-server never
+            # takes an intentionally-empty argument, so drop empties that
+            # follow an option-looking token, log loudly, and keep the
+            # server startable instead of crash-looping.  When BOTH the flag
+            # and its '' value are dropped (e.g. a probe false-positive
+            # passed '-sp' + ''), remember the flag name for the NOTE below:
+            # a lone '-sp' is just as fatal upstream, but a *boolean* flag
+            # legitimately followed by a stray '' must survive alone.
+            cleaned: list[str] = []
+            dropped: list[int] = []
+            fully_dropped_opts: list[str] = []
+            i = 0
+            while i < len(args):
+                a = args[i]
+                if (a == "" and cleaned and cleaned[-1].startswith("-")):
+                    dropped.append(i)
+                    opt = cleaned.pop()      # orphaned flag: drop it too
+                    dropped.append(len(cleaned))
+                    if (i + 1 < len(args) and args[i + 1] == ""):
+                        # '<flag>' '' '' - the flag itself was only there to
+                        # carry the empty value; keep argv minimal & safe.
+                        fully_dropped_opts.append(opt)
+                        i += 2
+                    else:
+                        i += 1
+                    continue
+                cleaned.append(a)
+                i += 1
+            if dropped:
+                extra = ""
+                if fully_dropped_opts:
+                    extra = (" Fully removed flag(s): "
+                             + ", ".join(fully_dropped_opts)
+                             + " (their values were empty; e.g. '-sp' is not "
+                               "an upstream llama.cpp flag at all).")
+                self.log.emit(
+                    "[server] WARNING: dropped "
+                    f"{len(dropped)} command-line token(s) at "
+                    f"position(s) {sorted(dropped)} - this llama-server build "
+                    "would abort with 'error: invalid argument:' + exit code "
+                    "1 on them (common_getopt treats the empty token as an "
+                    "unknown option)." + extra +
+                    " Likely cause: a flag whose value came out empty or a "
+                    "probe false-positive; check the 'exec:' line above "
+                    "against Tab 2 settings.")
+                args = cleaned
             self.log.emit("[server] exec: " + " ".join(args))
             binary = args[0]
             try:

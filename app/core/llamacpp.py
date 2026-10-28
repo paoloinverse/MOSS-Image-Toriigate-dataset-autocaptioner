@@ -279,10 +279,17 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
             return help_guess if actual is None else actual
 
         has_api_key = verified("--api-key", "", "--api-key" in help_txt)
-        # '-sp' (--single-turn) takes an optional string; probe it with an
-        # empty value exactly like server.build_args passes it.
-        has_sp = verified("-sp", "", "-sp," in help_txt
-                          or "--single-turn" in help_txt)
+        # '-sp' is NOT a llama.cpp flag (never was): builds reject it with
+        # `error: invalid argument:` (empty name after the colon, because
+        # common_getopt treats the following *empty* argv entry as the
+        # offending token) and exit 1 - which killed every explicit-mode
+        # launch on real binaries.  The historical '--single-turn' guess was
+        # wrong too (that option does not exist upstream).  Keep probing so
+        # custom forks that genuinely add -sp are still detected, but only
+        # trust an affirmative result; default False otherwise.
+        sp_help = ("-sp," in help_txt or "--single-turn" in help_txt
+                   or " single turn" in help_txt)
+        has_sp = bool(verified("-sp", "", False)) and sp_help
         has_rb = verified("--reasoning-budget", "1",
                           "reasoning-budget" in help_txt)
         # --jinja: required so per-request chat_template_kwargs (Qwen3.8
