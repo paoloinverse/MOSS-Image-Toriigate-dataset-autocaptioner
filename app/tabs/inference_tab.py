@@ -9,8 +9,14 @@
   *before* any dialog) -> only then folder choice + confirmation -> build.
 * Generation sliders (Temperature, Top-P, Top-K, Min-P); per-model profile
   defaults are re-applied whenever the selected model changes.
-* "Thinking level" combo (Off/Low/Medium/High -> --reasoning-budget +
-  reasoning_budget_tokens) plus a fine-grained Reasoning Budget slider.
+* Qwen3.8-family "Reasoning Settings": Enable-Thinking master switch, effort
+  combo exposing exactly what the chat template supports distinctly
+  (xhigh / medium / low - 'high' is only a silent alias of 'xhigh' upstream),
+  a fine-grained Reasoning Budget slider with an Unlimited (-1) checkbox,
+  and Preserve-Thinking.  These map to per-request chat_template_kwargs +
+  top-level reasoning_budget (api_client.build_payload) plus --jinja /
+  --reasoning-budget server flags - changeable mid-conversation without a
+  restart because everything except --jinja travels per request.
 * KV cache type dropdown populated from models.KV_CACHE_TYPES (incl. bf16).
 * Start/Stop llama-server buttons; the computed resource plan (-c/-ngl) is
   previewed live so the user sees the dynamic KV sizing decision, capped by
@@ -22,7 +28,7 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QSlider, QSpinBox, QTextEdit,
@@ -30,9 +36,10 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox,
 
 from app.context import AppContext
 from app.core import llamacpp
-from app.core.models import (KV_CACHE_TYPES, ensure_mmproj_downloaded,
-                             get_model_profile, plan_mmproj_download,
-                             read_arch_info)
+from app.core.models import (KV_CACHE_TYPES, REASONING_BUDGET_MAX,
+                             REASONING_BUDGET_UNLIMITED,
+                             ensure_mmproj_downloaded, get_model_profile,
+                             plan_mmproj_download, read_arch_info)
 from app.core.resources import ResourcePlanError, plan_resources
 
 

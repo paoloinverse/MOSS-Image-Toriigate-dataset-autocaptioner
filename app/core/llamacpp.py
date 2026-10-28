@@ -228,7 +228,7 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
       compiled without CUDA silently ran CPU-only.
 
     Returns ``{"has_api_key": bool, "has_single_turn": bool,
-               "has_reasoning_budget": bool,
+               "has_reasoning_budget": bool, "has_jinja": bool,
                "flash_attn_auto": bool, "flash_attn_on_off": bool,
                "cuda": bool, "gpu": bool}``.  Every check is conservative:
     when the binary cannot be probed at all we assume the *modern* flags the
@@ -236,7 +236,10 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
     (``--api-key``, ``-sp``) default to absent - launching without them is
     always safe, passing them to a build that rejects them exits 1.
     ``gpu`` is True when *any* GPU backend (CUDA/ROCm/Vulkan/Metal)
-    was detected.
+    was detected.  ``has_jinja`` gates ``--jinja``, which is REQUIRED for
+    llama-server to forward per-request ``chat_template_kwargs`` (the
+    Qwen3.8 reasoning knobs: enable_thinking / reasoning_effort /
+    preserve_thinking) into the model's Jinja chat template.
 
     Flash-attention spelling matters: ``-af`` / ``--flash-attn`` (plain
     boolean) was deprecated and then *removed* from llama.cpp - current
@@ -260,7 +263,7 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
     info = _build_info_lines(p)
     if not help_txt and not info:
         caps = {"has_api_key": False, "has_single_turn": False,
-                "has_reasoning_budget": True,
+                "has_reasoning_budget": True, "has_jinja": True,
                 "flash_attn_auto": True, "flash_attn_on_off": False,
                 "cuda": False, "gpu": False}
     else:
@@ -282,6 +285,11 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
                           or "--single-turn" in help_txt)
         has_rb = verified("--reasoning-budget", "1",
                           "reasoning-budget" in help_txt)
+        # --jinja: required so per-request chat_template_kwargs (Qwen3.8
+        # reasoning knobs) reach the model's Jinja template instead of being
+        # ignored by the built-in simplified one.  Boolean flag -> probed
+        # with an empty value, exactly like build_args passes it.
+        has_jinja = verified("--jinja", "", "--jinja" in help_txt)
         # Flash-attention spelling (see docstring): modern llama.cpp builds
         # take `--flash-attn auto|on|off`; older ones only the boolean
         # `--flash-attn` / `-fa`; ancient ones have nothing.  Detect from the
@@ -324,7 +332,7 @@ def probe_capabilities(path: str | Path) -> dict[str, bool]:
                    or "metal" in info or "vulkan" in help_txt
                    or "metal" in help_txt)
         caps = {"has_api_key": has_api_key, "has_single_turn": has_sp,
-                "has_reasoning_budget": has_rb,
+                "has_reasoning_budget": has_rb, "has_jinja": has_jinja,
                 "flash_attn_auto": fa_auto, "flash_attn_on_off": fa_on_off,
                 "cuda": cuda, "gpu": gpu_any}
     if key is not None:
