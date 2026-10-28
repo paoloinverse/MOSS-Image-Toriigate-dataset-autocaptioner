@@ -377,12 +377,28 @@ def resolve_mmproj_live(repo_id: str, quant: str,
 KV_CACHE_TYPES = ("f16", "bf16", "q8_0", "fp8", "q4_0", "iq4_nl")
 
 
+#: Hard token cap of the fine-grained Reasoning Budget control in Tab 2.
+#: A level/budget of -1 means "unlimited": no server-side cap and no
+#: per-request ``reasoning_budget`` override (see api_client.build_payload).
+REASONING_BUDGET_MAX = 16384
+#: Sentinel meaning "no cap" for every reasoning-budget knob in the app.
+REASONING_BUDGET_UNLIMITED = -1
+
+
 @dataclass(frozen=True)
 class ThinkingLevel:
-    """One named reasoning/thinking option for a model family."""
-    key: str                 # "" = disabled | "low" | "medium" | "high"
+    """One named reasoning/thinking option for a model family.
+
+    ``key`` is the exact value handed to the Qwen3.8 chat template as
+    ``chat_template_kwargs.reasoning_effort`` ("" = thinking disabled).
+    The Unsloth-patched template silently maps ``'high'`` onto ``'xhigh'``;
+    exposing ``high`` here would hide that aliasing, so the selectable set
+    mirrors exactly what the template supports distinctively:
+    ``xhigh`` / ``medium`` / ``low``.
+    """
+    key: str                 # "" = disabled | "low" | "medium" | "xhigh"
     label: str               # GUI text
-    budget: int              # reasoning-budget tokens (server + payload)
+    budget: int              # reasoning-budget tokens (-1 = unlimited)
 
 
 @dataclass(frozen=True)
@@ -401,14 +417,21 @@ class ModelProfile:
     top_p: float = 0.95
     top_k: int = 40
     min_p: float = 0.05
+    preserve_thinking_default: bool = True
     note: str = ""
 
 
+# Qwen3.8-family (Unsloth-patched chat template) effort levels.  Ordered
+# from most to least thinking so the combo reads Deep -> Brief; budgets
+# ascend towards "Off", which keeps the persisted-int nearest-match logic
+# and the test invariant (ascending budgets) intact.
 _QWEN_THINKING_LEVELS = (
+    ThinkingLevel("xhigh", "Deep / Maximum  (xhigh — unrestricted thinking)",
+                  REASONING_BUDGET_UNLIMITED),
+    ThinkingLevel("medium", "Standard / Balanced  (medium — ~4K reasoning tokens)",
+                  4096),
+    ThinkingLevel("low", "Brief / Fast  (low — ~1K reasoning tokens)", 1024),
     ThinkingLevel("", "Off (no thinking)", 0),
-    ThinkingLevel("low", "Low  (~1K reasoning tokens)", 1024),
-    ThinkingLevel("medium", "Medium  (~4K reasoning tokens)", 4096),
-    ThinkingLevel("high", "High  (~16K reasoning tokens)", 16384),
 )
 
 #: Static *family* defaults; ``max_context_by_quant`` is only consulted for
