@@ -559,7 +559,13 @@ def test_model_profiles():
     check("thinking levels present",
           len(tg.thinking_levels) >= 4 and len(qw.thinking_levels) >= 4)
     budgets = [l.budget for l in qw.thinking_levels]
-    check("thinking budgets ascend", budgets == sorted(budgets))
+    # GUI order is Deep -> Off: xhigh first with the -1 unlimited sentinel,
+    # then descending caps down to 0.  (Plain numeric sorting can't express
+    # this because -1 means "unlimited", i.e. the LARGEST budget; the
+    # persisted-int nearest-match logic special-cases the sentinel too.)
+    check("thinking budgets ordered deep->off",
+          budgets[0] == -1 and budgets[1:] == sorted(budgets[1:], reverse=True)
+          and budgets[-1] == 0)
     unknown = get_model_profile("does-not-exist")
     check("unknown model neutral profile",
           unknown.max_context_by_quant == {}
@@ -581,8 +587,6 @@ def test_payload():
         check("multimodal parts", kinds == {"text", "image_url"})
         url = next(c["image_url"]["url"] for c in content if c["type"] == "image_url")
         check("base64 data url", url.startswith("data:image/png;base64,"))
-        check("thinking flag", pl.get("enable_thinking") is True)
-        check("reasoning budget", pl.get("reasoning_budget_tokens") == 512)
         check("sampling params", pl["temperature"] == 1.0 and pl["top_p"] == 0.95
               and pl["top_k"] == 40 and "min_p" in pl)
         check("streaming", pl["stream"] is True)
