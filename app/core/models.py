@@ -599,6 +599,8 @@ def get_model_profile(key: str | None, quant: str | None = None,
 # ---------------------------------------------------------------------------
 STORAGE_DEFAULT = "default"
 STORAGE_UNSLOTH = "unsloth"
+#: One or more extra GGUF folders supplied by the user (custom locations).
+STORAGE_CUSTOM = "custom"
 
 #: Subfolders scanned inside an Unsloth Desktop data directory.  Unsloth UI
 #: keeps its GGUF downloads under ``models/`` (newer builds also use
