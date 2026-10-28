@@ -173,15 +173,19 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
 class CaptionClient:
     """Thin async wrapper around one running llama-server instance."""
 
-    def __init__(self, base_url: str, timeout: float = 600.0):
+    def __init__(self, base_url: str, timeout: float = 600.0,
+                 api_key: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        # Optional bearer token.  The server normally starts *without*
-        # --api-key (localhost-only, no auth); if the user adds one manually
-        # via Tab 2 'Extra args', set MOSS_API_KEY / APPCAP_API_KEY in the
-        # environment so requests carry the matching Authorization header.
-        self.api_key = (os.environ.get("MOSS_API_KEY")
-                        or os.environ.get("APPCAP_API_KEY") or "")
+        # Optional bearer token.  Priority: explicit ``api_key`` argument
+        # (the GUI passes the Tab 2 'API Key:' field through AppContext) ->
+        # MOSS_API_KEY / APPCAP_API_KEY env vars (kept for headless / legacy
+        # setups) -> no auth at all, which matches a server started without
+        # --api-key (the localhost default).
+        if api_key is None:
+            api_key = (os.environ.get("MOSS_API_KEY")
+                       or os.environ.get("APPCAP_API_KEY") or "")
+        self.api_key = api_key or ""
 
     def _headers(self) -> dict[str, str]:
         if self.api_key:

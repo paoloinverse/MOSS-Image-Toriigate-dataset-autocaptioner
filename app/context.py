@@ -19,7 +19,7 @@ from PySide6.QtCore import QObject, Signal
 from app.core.hardware import HardwareManager
 from app.core.models import ModelSpec, StorageManager, build_registry
 from app.core.presets import DEFAULT_PRESETS, CaptionPreset, _clone
-from app.core.server import ServerManager
+from app.core.server import ServerConfig, ServerManager
 
 
 @dataclass
@@ -41,6 +41,9 @@ class InferenceSettings:
     flash_attn: str = "auto"         # Tab 2 switch: auto | on | off (--flash-attn)
     host: str = "127.0.0.1"
     port: int = 8080
+    api_key: str = ""                # Tab 2 'API Key:' - server --api-key AND
+                                     # the Bearer token used by this GUI's own
+                                     # caption requests (Tab 4 / batch worker)
     binary: str = "llama-server"     # Tab 2 'Binary:' (autodetected / chosen)
     run_model_key: str = ""          # Tab 2 explicit override ('' = follow Tab 1)
     run_quant: str = ""              # Tab 2 quant/filename override ('' = follow)
@@ -333,3 +336,49 @@ class AppContext(QObject):
         spec = self.active_model_spec
         return self.active_preset.effective_system_prompt(
             explicit=self.explicit_mode, abliterated_model=spec.abliterated)
+
+    # ------------------------------------------------------------- server URL
+    @staticmethod
+    def _client_host(host: str) -> str:
+        """Map a *bind* address to an address this GUI can CONNECT to.
+
+        Wildcard binds (0.0.0.0 / ::) mean "all local interfaces"; the
+        matching client target is loopback.  Anything else - including real
+        LAN IPs and remote hostnames - is used as-is.
+        """
+        h = (host or "").strip().strip("[]").lower()
+        if h in ("", "0.0.0.0", "::"):
+            return "127.0.0.1"
+        return h
+
+    def base_url(self) -> str:
+        """Base URL for caption requests against the configured endpoint.
+
+        Prefers the live ServerConfig of the running/attached server; falls
+        back to the Tab 2 host/port fields before the first start().  Local
+        wildcard hosts collapse to 127.0.0.1 so '0.0.0.0' still works.
+        """
+        cfg = self.server.config
+        if cfg is not None:
+            return f"http://{self._client_host(cfg.host)}:{cfg.port}"
+        s = self.settings
+        return f"http://{self._client_host(s.host)}:{int(s.port)}"
+
+    def api_key(self) -> str:
+        """Bearer token for our own requests (Tab 2 'API Key:' field).
+
+        Empty when no key was set; falls back to MOSS_API_KEY /
+        APPCAP_API_KEY so env-var setups keep working unchanged.
+        """
+        key = (self.settings.api_key or "").strip()
+        if not key:
+            import os
+            key = (os.environ.get("MOSS_API_KEY")
+                   or os.environ.get("APPCAP_API_KEY") or "")
+        return key
+
+    def make_client(self, timeout: float = 600.0):
+        """CaptionClient wired to the current host/port/API key."""
+        from app.core.api_client import CaptionClient
+        return CaptionClient(self.base_url(), timeout=timeout,
+                             api_key=self.api_key())

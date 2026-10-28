@@ -181,6 +181,11 @@ class ServerManager(QObject):
         self._lock = threading.RLock()
         self.ready = False
         self._shutdown_requested = False
+        # True when we ATTACHED to an already-running llama-server (found via
+        # the host-aware preflight probe) instead of spawning our own child.
+        # While attached there is no subprocess to supervise: "stop" merely
+        # detaches and the remote/local server keeps running.
+        self.attached = False
 
     def _preferred_binary(self) -> str:
         """Current Tab 2 'Binary:' choice, with sane fallbacks.
@@ -495,11 +500,42 @@ class ServerManager(QObject):
                 "'Refresh Plan' in Tab 2.")
         return errors
 
+    # -- attaching to an existing server --------------------------------------
+    def _adopt_existing(self, cfg: ServerConfig, status: str) -> None:
+        """Attach to a llama-server that is already answering on cfg.base_url.
+
+        Called from :meth:`_preflight` when the host-aware probe finds a
+        healthy server (HTTP 200, or 401-confirmed-with-token) at the
+        configured address - either our own local bind being reused, or a
+        remote instance the user started separately.  There is nothing to
+        spawn in that case: we mirror the "ready" state exactly like
+        ``_watch_ready`` does after a normal launch, so Start becomes a no-op
+        and Stop later just detaches (see :meth:`stop`).
+        """
+        with self._lock:
+            if self.proc and self.proc.poll() is None:
+                return                      # we already own a child process
+            self.config = cfg
+            self.attached = True
+            self.ready = True
+            how = ("API-key authenticated" if status == "running-auth"
+                   else "no authentication")
+            self.log.emit(
+                f"[server] NOTE: a llama-server is ALREADY running at "
+                f"{cfg.base_url} ({how}) - attaching to it instead of "
+                "starting a new one.\n"
+                "    This GUI cannot control that external process: 'Stop' "
+                "only detaches, and OOM auto-recovery is unavailable. To "
+                "let this app manage the server, stop the other instance "
+                "or pick a different port in Tab 2.")
+            self.state_changed.emit("ready")
+
     def start(self, cfg: ServerConfig) -> bool:
         with self._lock:
             if self.proc and self.proc.poll() is None:
                 self.log.emit("[server] already running")
                 return True
+            self.attached = False
             self.config = cfg
 
             problems = self._preflight(cfg)
@@ -563,8 +599,18 @@ class ServerManager(QObject):
     def stop(self, graceful_ms: int = 3000):
         with self._lock:
             self._shutdown_requested = True
+            was_attached = self.attached
             self.ready = False
+            self.attached = False
             if not self.proc:
+                # Either we never started anything, or we had ATTACHED to an
+                # external server (no child process of ours exists).  An
+                # external llama-server must never be killed by this GUI.
+                if was_attached:
+                    self.log.emit("[server] detached from external server "
+                                  f"({self.config.base_url if self.config else ''}"
+                                  ") - that process keeps running; it is not "
+                                  "managed by this GUI.")
                 self.state_changed.emit("stopped")
                 return
             try:
@@ -583,7 +629,10 @@ class ServerManager(QObject):
             self.proc = None
 
     def is_running(self) -> bool:
-        return bool(self.proc and self.proc.poll() is None)
+        if self.proc and self.proc.poll() is None:
+            return True
+        # Attached mode: no child process, but the external server answers.
+        return bool(self.attached and self.ready)
 
     # -- output tailing & OOM watchdog -----------------------------------------
     def _read_output(self):

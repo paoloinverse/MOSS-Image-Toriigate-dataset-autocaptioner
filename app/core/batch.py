@@ -42,7 +42,7 @@ class BatchWorker(QThread):
 
     def __init__(self, base_url: str, preset: CaptionPreset,
                  system_prompt: str, images: list[str], parent=None,
-                 settings=None, verbose: bool = False):
+                 settings=None, verbose: bool = False, api_key: str = ""):
         super().__init__(parent)
         self.base_url = base_url
         self.preset = preset
@@ -51,6 +51,8 @@ class BatchWorker(QThread):
         # Live Tab 2 InferenceSettings (temperature/top_k/... + thinking
         # budget); None keeps the pure preset behaviour.
         self.settings = settings
+        # Bearer token from the Tab 2 'API Key:' field ('' -> env fallback).
+        self.api_key = api_key or ""
         # Verbose llama-server conversation logging: full prompts sent,
         # streamed answers AND thinking/reasoning deltas land on self.log.
         self.verbose = verbose
@@ -69,7 +71,7 @@ class BatchWorker(QThread):
         self.finished_all.emit(ok and not self.cancel_event.is_set())
 
     async def _run_async(self) -> bool:
-        client = CaptionClient(self.base_url)
+        client = CaptionClient(self.base_url, api_key=self.api_key)
         total = len(self.images)
         fmt = self.preset.output_format
         done = 0
