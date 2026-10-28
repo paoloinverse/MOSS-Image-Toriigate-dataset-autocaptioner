@@ -215,12 +215,14 @@ class BatchTab(QWidget):
             return
         self.ctx.batch_selection = images
         preset = self.ctx.active_preset
-        worker = BatchWorker(self.ctx.server.config.base_url
-                             if self.ctx.server.config else
-                             f"http://{self.ctx.settings.host}:{self.ctx.settings.port}",
+        # ctx.base_url() maps wildcard binds (0.0.0.0) to 127.0.0.1 and
+        # prefers the live ServerConfig; ctx.api_key() is the Tab 2 'API
+        # Key:' field (env-var fallback), so authenticated servers work.
+        worker = BatchWorker(self.ctx.base_url(),
                              preset, self.ctx.effective_system_prompt(),
                              images, self, settings=self.ctx.settings,
-                             verbose=bool(self.ctx.settings.verbose_logging))
+                             verbose=bool(self.ctx.settings.verbose_logging),
+                             api_key=self.ctx.api_key())
         worker.log.connect(self.append_log)
         worker.progress.connect(self.on_progress)
         worker.chunk.connect(self.on_chunk)

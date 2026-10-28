@@ -36,6 +36,31 @@ from app.core.models import (KV_CACHE_TYPES, ensure_mmproj_downloaded,
 from app.core.resources import ResourcePlanError, plan_resources
 
 
+class ProbeWorker(QThread):
+    """Background host/port reachability check for Tab 2.
+
+    Wraps :func:`app.core.server.probe_server` (HTTP /health + TCP fallback)
+    so typing an address or pressing 'Check' never blocks the UI thread on a
+    dead remote host.  Emits (status, detail, base_url, local) - see
+    ``probe_server`` for the status vocabulary.
+    """
+
+    log = Signal(str)
+    done = Signal(str, str, str, bool)
+
+    def __init__(self, base_url: str, api_key: str = "", parent=None):
+        super().__init__(parent)
+        self.base_url = base_url
+        self.api_key = api_key
+
+    def run(self):
+        from app.core.server import is_local_host, probe_server
+        status, detail = probe_server(self.base_url, self.api_key)
+        self.done.emit(status, detail, self.base_url,
+                       is_local_host(self.base_url.split("//")[-1]
+                                     .split(":")[0]))
+
+
 class MmprojFetchWorker(QThread):
     """Background 'Fetch mmproj' action for the run-target model (Tab 2).
 
@@ -131,6 +156,62 @@ class InferenceTab(QWidget):
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(st.port)
+        # ---- API key ------------------------------------------------------
+        # Manual bearer token for the REST endpoints.  When this GUI starts
+        # the server it is forwarded as '--api-key <key>'; when connecting to
+        # an EXTERNAL server (remote host or a local instance we merely
+        # attach to) every request carries 'Authorization: Bearer <key>'.
+        # Empty = no auth (the localhost default).  MOSS_API_KEY /
+        # APPCAP_API_KEY remain the env-var fallback when the field is blank.
+        self.api_key_edit = QLineEdit(st.api_key)
+        self.api_key_edit.setEchoMode(QLineEdit.Password)
+        self.api_key_edit.setPlaceholderText(
+            "empty = no authentication")
+        self.api_key_edit.setToolTip(
+            "Optional API key ('--api-key') for the llama-server endpoints.\n"
+            "\n"
+            "Started by this GUI : passed verbatim to llama-server so the\n"
+            "                      API requires this token.\n"
+            "External server     : used as the Bearer token in every request\n"
+            "                      this app sends (Tab 4 preview, Tab 5\n"
+            "                      batch runs, health checks).\n"
+            "\n"
+            "Falls back to $MOSS_API_KEY / $APPCAP_API_KEY when left empty.")
+        self.show_key_btn = QPushButton("Show")
+        self.show_key_btn.setCheckable(True)
+        self.show_key_btn.setToolTip("Toggle plaintext visibility of the key")
+        self.show_key_btn.toggled.connect(
+            lambda on: self.api_key_edit.setEchoMode(
+                QLineEdit.Normal if on else QLineEdit.Password))
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.api_key_edit, stretch=1)
+        key_row.addWidget(self.show_key_btn)
+        form.addRow("API Key:", key_row)
+        # ---- Host / Port + reachability check ------------------------------
+        # On commit (Enter / focus-out) of either field the app probes the
+        # endpoint in the background and reports what it found:
+        #   * local host    - whether a server is already answering (Start
+        #                     then attaches instead of spawning a duplicate;
+        #                     free port keeps the normal start-your-own flow)
+        #   * external host - network reachability + whether a server is
+        #                     already running there (Start attaches to it)
+        # A wildcard bind (0.0.0.0) stays local: the server binds ALL
+        # interfaces and caption requests connect via 127.0.0.1.
+        self.check_host_btn = QPushButton("Check")
+        self.check_host_btn.setToolTip(
+            "Probe http://<host>:<port>/health right now:\n"
+            "shows whether a llama-server is already running there and,\n"
+            "for remote hosts, whether the machine is reachable at all.\n"
+            "(Runs automatically when you finish editing Host or Port.)")
+        hp_row = QHBoxLayout()
+        hp_row.addWidget(self.host_edit, stretch=1)
+        hp_row.addWidget(self.port_spin)
+        hp_row.addWidget(self.check_host_btn)
+        self.host_status = QLabel("")
+        self.host_status.setWordWrap(True)
+        self.host_status.setStyleSheet("color: gray;")
+        form.addRow("Host / Port:", hp_row)
+        form.addRow(self.host_status)
         self.split_combo = QComboBox()
         # 'layer' is llama.cpp's recommended multi-GPU split and is the
         # shipped default (InferenceSettings.split_mode / ServerConfig);
@@ -146,8 +227,6 @@ class InferenceTab(QWidget):
             "layer: distribute whole layers across devices (default)\n"
             "row  : split individual tensors row-wise\n"
             "graph: split at the computation-graph level")
-        form.addRow("Host:", self.host_edit)
-        form.addRow("Port:", self.port_spin)
         form.addRow("Split mode (multi-GPU):", self.split_combo)
         # ---- Run-target model -------------------------------------------------
         # Explicit, always-current choice of which GGUF llama-server loads.
@@ -308,6 +387,17 @@ class InferenceTab(QWidget):
             lambda t: setattr(self.ctx.settings, "host", t.strip() or "127.0.0.1"))
         self.port_spin.valueChanged.connect(
             lambda v: setattr(self.ctx.settings, "port", v))
+        # API key -> live settings (persisted with everything else).
+        self.api_key_edit.textChanged.connect(
+            lambda t: setattr(self.ctx.settings, "api_key", t.strip()))
+        # Reachability check fires when the user FINISHES editing Host or
+        # Port (Enter / focus-out) - never on every keystroke - plus a manual
+        # 'Check' button for re-probing on demand.
+        self.host_edit.editingFinished.connect(self._on_endpoint_committed)
+        self.port_spin.editingFinished.connect(self._on_endpoint_committed)
+        self.check_host_btn.clicked.connect(self._run_reachability_check)
+        self._probe_thread: ProbeWorker | None = None
+        self._last_probe_url = ""
 
         self.refresh_plan_btn.clicked.connect(self.refresh_plan)
         self.start_btn.clicked.connect(self.start_server)
@@ -348,6 +438,9 @@ class InferenceTab(QWidget):
         self.port_spin.blockSignals(True)
         self.port_spin.setValue(int(st.port))
         self.port_spin.blockSignals(False)
+        self.api_key_edit.blockSignals(True)
+        self.api_key_edit.setText(st.api_key)
+        self.api_key_edit.blockSignals(False)
         sm = (st.split_mode or "layer").strip().lower()
         if self.split_combo.findText(sm) >= 0:
             self.split_combo.setCurrentText(sm)
@@ -1009,6 +1102,7 @@ class InferenceTab(QWidget):
             extra_args=self.extra_args.toPlainText().strip(),
             explicit_mode=ctx.explicit_mode,
             binary=self.binary_edit.text().strip() or "llama-server",
+            api_key=self.api_key_edit.text().strip(),
         )
         ctx.log.emit("[server] requested start with plan: " + plan.summary())
         # start() runs its own preflight checks and emits every problem into
@@ -1025,3 +1119,100 @@ class InferenceTab(QWidget):
         running = state in ("starting", "ready")
         self.start_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
+
+    # ------------------------------------------------------------------
+    # Host/port reachability check (Tab 2)
+    # ------------------------------------------------------------------
+    def _endpoint_base_url(self) -> str:
+        """http://host:port for the current Host/Port fields."""
+        host = self.host_edit.text().strip() or "127.0.0.1"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"                     # bare IPv6 literal
+        return f"http://{host}:{self.port_spin.value()}"
+
+    def _on_endpoint_committed(self):
+        """editingFinished on Host or Port: probe unless unchanged."""
+        self._run_reachability_check(force=False)
+
+    def _run_reachability_check(self, force: bool = True):
+        """Fire a background ProbeWorker against the current endpoint.
+
+        Called on commit (force=False -> deduped via ``_last_probe_url`` so
+        tabbing through the fields without changing them doesn't re-probe)
+        and from the 'Check' button (force=True -> always re-probes).
+        """
+        base = self._endpoint_base_url()
+        if not force and base == self._last_probe_url \
+                and self.ctx.settings.api_key == getattr(
+                    self, "_last_probe_key", ""):
+            return
+        if self._probe_thread is not None and self._probe_thread.isRunning():
+            self._probe_thread.done.disconnect()
+            self._probe_thread.quit()
+            self._probe_thread.wait(2000)
+        self._last_probe_url = base
+        self._last_probe_key = self.ctx.settings.api_key
+        self.host_status.setStyleSheet("color: gray;")
+        self.host_status.setText(f"Checking {base} ...")
+        self.check_host_btn.setEnabled(False)
+        t = ProbeWorker(base, self.api_key_edit.text().strip(), self)
+        t.log.connect(lambda m: self.ctx.log.emit(m))
+        t.done.connect(self._apply_probe_result)
+        t.finished.connect(lambda: self.check_host_btn.setEnabled(True))
+        self._probe_thread = t
+        t.start()
+
+    def _apply_probe_result(self, status: str, detail: str,
+                            base_url: str, local: bool):
+        """Colour/text the host_status label per local-vs-remote semantics.
+
+        Local endpoints are advisory only: nothing is ever attached to
+        automatically - the user keeps starting the server themselves with
+        the configured options (bound to the specified address; 0.0.0.0
+        means all interfaces, clients connect via localhost).  Remote
+        endpoints that answer /health switch the Start button into
+        'attach' mode - pressing it joins the existing server instead of
+        spawning one.
+        """
+        key = self.api_key_edit.text().strip()
+        if status in ("running", "running-auth"):
+            if local:
+                self.host_status.setStyleSheet("color: palette(mid);")
+                self.host_status.setText(
+                    f"{base_url}: a server already answers here. Starting "
+                    "from Tab 2 will reuse it (Stop only detaches).")
+            else:
+                self.host_status.setStyleSheet("color: darkgreen;")
+                self.host_status.setText(
+                    f"{base_url}: reachable - remote server is running. "
+                    "'Start Server' attaches to it; no local process is "
+                    "launched.")
+        elif status == "auth-required":
+            self.host_status.setStyleSheet("color: darkorange;")
+            self.host_status.setText(
+                f"{base_url}: server is up but demands an API key - fill "
+                "the 'API Key' field above.")
+        elif status == "auth-failed":
+            self.host_status.setStyleSheet("color: red;")
+            self.host_status.setText(
+                f"{base_url}: server rejected the configured API key.")
+        elif status == "down":
+            if local:
+                self.host_status.setStyleSheet("color: palette(mid);")
+                self.host_status.setText(
+                    f"{base_url}: port open, no server answering yet. Use "
+                    "'Start Server' to launch one with these options.")
+            else:
+                self.host_status.setStyleSheet("color: darkorange;")
+                self.host_status.setText(
+                    f"{base_url}: host reachable, but no llama-server "
+                    "answers there yet ('Start Server' launches a local "
+                    "one instead).")
+        else:                                    # unreachable / anything else
+            self.host_status.setStyleSheet("color: red;")
+            self.host_status.setText(
+                f"{base_url}: unreachable ({detail})"
+                + ("" if key else ""))
+        self.ctx.log.emit(f"[server] reachability {status or '?'}: "
+                          f"{base_url} {('- ' + detail) if detail else ''}"
+                          .rstrip())

@@ -406,6 +406,118 @@ def test_server_args():
         _lc.probe_capabilities = orig_probe2
 
 
+# ------------------------------------------------- host/API-key/probe/attach
+def test_host_apikey_probe_attach():
+    import socket
+    import app.core.llamacpp as _lc
+    from app.core.server import ServerManager, ServerConfig, is_local_host
+
+    # --api-key now comes from the Tab 2 field (cfg.api_key), env still works
+    modern = {"has_api_key": True, "has_single_turn": True,
+              "has_reasoning_budget": False, "flash_attn_auto": True,
+              "flash_attn_on_off": False, "cuda": False, "gpu": False}
+    orig = _lc.probe_capabilities
+    try:
+        _lc.probe_capabilities = lambda *a, **k: dict(modern)
+        sm = ServerManager(FakeHW([]))
+        a = sm.build_args(ServerConfig(model=cfg_model(), plan=cfg_plan(),
+                                       api_key="tabfield",
+                                       binary="/usr/bin/llama-server"))
+        check("cfg.api_key passed as --api-key",
+              "--api-key" in a and a[a.index("--api-key") + 1] == "tabfield")
+        tok = dict(os.environ)
+        try:
+            os.environ.pop("MOSS_API_KEY", None)
+            os.environ["APPCAP_API_KEY"] = "envtok"
+            b = sm.build_args(ServerConfig(model=cfg_model(), plan=cfg_plan(),
+                                           binary="/usr/bin/llama-server"))
+            check("field-empty falls back to env token",
+                  "--api-key" in b and b[b.index("--api-key") + 1] == "envtok")
+        finally:
+            os.environ.clear(); os.environ.update(tok)
+    finally:
+        _lc.probe_capabilities = orig
+
+    # local-vs-remote classification
+    for h in ("localhost", "127.0.0.5", "::1", "0.0.0.0", "", "ip6-localhost"):
+        check(f"is_local_host({h!r})", is_local_host(h))
+    check("LAN IP is NOT local", not is_local_host("192.0.2.55"))
+    check("unresolvable name is NOT local", not is_local_host("no.such.host.invalid"))
+
+    # probe_server outcome vocabulary against a live stub server
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            auth = self.headers.get("Authorization", "")
+            gated = self.path in ("/health", "/v1/models")
+            if gated and AUTHED["on"] and auth != "Bearer " + AUTHED["key"]:
+                self.send_response(401)
+            else:
+                self.send_response(200)
+            self.end_headers(); self.wfile.write(b"{}")
+        def log_message(self, *a): pass
+    AUTHED = {"on": False, "key": "sekret"}
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+    try:
+        from app.core.server import probe_server
+        base = f"http://127.0.0.1:{port}"
+        check("probe running", probe_server(base)[0] == "running")
+        AUTHED["on"] = True
+        check("probe auth-required", probe_server(base)[0] == "auth-required")
+        check("probe running-auth (good key)",
+              probe_server(base, "sekret")[0] == "running-auth")
+        check("probe auth-failed (bad key)",
+              probe_server(base, "wrong")[0] == "auth-failed")
+        dead = socket.socket(); dead.bind(("127.0.0.1", 0))
+        dport = dead.getsockname()[1]; dead.close()
+        st, det = probe_server(f"http://127.0.0.1:{dport}", timeout=1.0)
+        check("probe down/unreachable on closed port",
+              st in ("down", "unreachable"), st + ":" + det)
+        check("probe never raises on garbage host",
+              probe_server("http://no.such.host.invalid:9", timeout=1.0)[0]
+              == "unreachable")
+
+        # _adopt_existing: attach to the live stub, then stop() DETACHES
+        sm2 = ServerManager(FakeHW([]))
+        msgs = []
+        sm2.log = type("LogCapture", (), {"emit": staticmethod(
+            lambda *a, **k: msgs.append(a[0] if a else ""))})()
+        sm2.find_binary = lambda: "/usr/bin/llama-server"
+        okc = ServerConfig(host="127.0.0.1", port=port,
+                           api_key="sekret", model=None,
+                           plan=cfg_plan())
+        err = sm2._preflight(okc)
+        check("preflight attaches instead of erroring",
+              sm2.attached and err == [], str(err))
+        check("is_running while attached", sm2.is_running())
+        check("attach NOTE logged",
+              any("attach" in m.lower() for m in msgs), "\n".join(msgs))
+        msgs.clear()
+        sm2.stop()
+        check("stop detaches (no kill of foreign process)",
+              not sm2.attached
+              and any("detach" in m.lower() for m in msgs)
+              and not any("stopped the server" in m.lower() for m in msgs),
+              "\n".join(msgs))
+        check("stub server survived detach",
+              probe_server(base, "sekret")[0].startswith("running"))
+    finally:
+        srv.shutdown(); srv.server_close()
+
+
+from app.core.resources import ResourcePlan          # noqa: E402
+
+
+def cfg_model():
+    return ModelFile("fake.gguf", "Q8_0", "x/y", 27)
+
+
+def cfg_plan():
+    return ResourcePlan(context_tokens=4096, n_gpu_layers=0)
+
+
 # ------------------------------------------------------------------ profiles
 def test_model_profiles():
     from app.core.models import (KV_CACHE_TYPES, _MODEL_FAMILY_DEFAULTS,
@@ -542,5 +654,6 @@ if __name__ == "__main__":
     test_payload()
     test_collect_images()
     test_split_default_and_startup_config()
+    test_host_apikey_probe_attach()
     print("\n%d failure(s): %s" % (len(FAILURES), FAILURES or "none"))
     sys.exit(1 if FAILURES else 0)

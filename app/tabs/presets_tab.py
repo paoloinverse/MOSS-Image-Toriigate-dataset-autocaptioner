@@ -192,10 +192,19 @@ class PresetsTab(QWidget):
         self.reload_combos()
         # Push the new values into the other tabs' widgets: Tab 2 (binary +
         # sliders/host/port) and Tab 1 (storage + model/quant selectors).
+        # Use duck-typing instead of an isinstance check against MainWindow:
+        # importing app.main_window here would be a circular import (it builds
+        # the tabs), and hard-coupling the tab to the window class previously
+        # raised NameError at runtime.
         mw = self.window()
-        if isinstance(mw, MainWindow):
-            mw.tab_inference.refresh_from_context()
-            mw.tab_hardware.refresh_from_context()
+        for attr in ("tab_inference", "tab_hardware"):
+            tab = getattr(mw, attr, None)
+            refresher = getattr(tab, "refresh_from_context", None)
+            if callable(refresher):
+                try:
+                    refresher()
+                except Exception as exc:  # never break the import flow
+                    self.ctx.report_error(exc, context=f"refreshing {attr}")
 
     def reload_combos(self):
         self.preset_combo.blockSignals(True)
