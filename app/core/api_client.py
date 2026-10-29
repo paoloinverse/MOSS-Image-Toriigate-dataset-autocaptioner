@@ -205,7 +205,13 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
         "temperature": float(getattr(settings, "temperature",
                                      params.temperature)),
         "top_p": float(getattr(settings, "top_p", params.top_p)),
-        "max_tokens": max_tokens or params.max_tokens,
+        # Explicit argument wins; then the live Tab 2 'Max Tokens' spinbox
+        # (settings.max_tokens); finally the per-preset GenerationParams
+        # default.  Before the GUI control existed this line was
+        # ``max_tokens or params.max_tokens`` only, so the saved/loaded
+        # setting could never take effect from the interface.
+        "max_tokens": int(max_tokens or getattr(settings, "max_tokens", None)
+                          or params.max_tokens),
         "stream": True,
     }
     # llama-server accepts sampling extras at top level of the request body.

@@ -1303,11 +1303,33 @@ def export_full_config(ctx) -> dict:
 
 
 def _coerce(value, target_type, default):
-    """Best-effort type coercion for imported scalars; keeps *default* on junk."""
+    """Best-effort type coercion for imported scalars; keeps *default* on junk.
+
+    Booleans are honoured only for bool fields: JSON ``true``/``false``
+    landing on an int/float setting (e.g. ``port``, ``top_k``,
+    ``max_tokens`` — a frequent accident when hand-editing configs that mix
+    thinking flags with sampling values) used to coerce to ``1``/``0`` and
+    silently mangle the generation settings.  Such mismatches now keep the
+    current/default value so :func:`import_full_config` can warn about it.
+    Numeric strings still coerce normally (legacy configs store numbers as
+    text); numeric types are never accepted for bool fields — only real
+    booleans or their textual ``true``/``false`` spellings.
+    """
     try:
         if target_type is bool:
-            return bool(value)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) \
+                    and value.strip().lower() in ("true", "false"):
+                return value.strip().lower() == "true"
+            if isinstance(value, str):
+                raise TypeError(f"cannot map string {value!r} to bool")
+            return default              # numbers never flip a bool field
+        if isinstance(value, bool):
+            return default              # bools never fill numeric/str fields
         if target_type in (int,):
+            if isinstance(value, str):
+                return int(value.strip(), 10)
             return int(value)
         if target_type in (float,):
             return float(value)
@@ -1361,7 +1383,42 @@ def import_full_config(ctx, raw: str) -> list[str]:
                 warnings.append(f"ignored unknown setting key '{k}'")
                 continue
             cur = getattr(ctx.settings, k)
-            setattr(ctx.settings, k, _coerce(v, type(cur), cur))
+            new = _coerce(v, type(cur), cur)
+            if new == cur and type(new) is type(cur) and v is not None \
+                    and not isinstance(v, type(cur)) \
+                    and str(v) != str(cur):
+                # Coercion refused the value (bool into a numeric field,
+                # garbage string, ...): keep the live value and say so
+                # instead of silently mangling generation settings.
+                warnings.append(f"setting '{k}': value {v!r} is not a valid "
+                                f"{type(cur).__name__}; kept current "
+                                f"{cur!r}.")
+            setattr(ctx.settings, k, new)
+    elif st is None and ctx.presets:
+        # Legacy preset-only files (v1 / hand-written captioner_config.json)
+        # carry no 'settings' block at all.  Without syncing, Tab 2 would
+        # keep showing hardwired defaults while every request actually ran
+        # with the freshly imported preset params — the classic "generation
+        # settings get mangled after import" report.  Seed the shared knobs
+        # from the active preset so GUI state matches what gets sent.
+        try:
+            p = ctx.presets.get(ctx.active_preset_key) \
+                or next(iter(ctx.presets.values()), None)
+        except Exception:
+            p = None
+        if p is not None:
+            gp = p.params
+            mapped = ("temperature", "top_p", "top_k", "min_p",
+                      "enable_thinking", "reasoning_budget", "max_tokens")
+            for name in mapped:
+                if name in ctx.settings.__dataclass_fields__:
+                    setattr(ctx.settings, name, getattr(gp, name))
+            warnings.append("no 'settings' section - inference parameters "
+                            "synced from the active preset's generation "
+                            "params.")
+        else:
+            warnings.append("no 'settings' section - inference parameters "
+                            "left unchanged.")
     else:
         warnings.append("no 'settings' section - inference parameters left "
                         "unchanged.")

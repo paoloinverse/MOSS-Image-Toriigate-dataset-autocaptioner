@@ -581,15 +581,58 @@ def export_config(presets: dict[str, CaptionPreset], active_key: str,
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+def _coerce_param(name: str, value):
+    """Type-safe coercion of one imported generation parameter.
+
+    Mirrors the field types of :class:`GenerationParams` and — unlike a bare
+    ``int(value)``/``float(value)`` — refuses booleans for numeric fields:
+    JSON files hand-edited from thinking flags can otherwise smuggle
+    ``true``/``false`` into ``max_tokens`` / ``top_k`` (becoming 1/0), which
+    silently mangles every generation setting on import.  Garbage input
+    falls back to the dataclass default instead of corrupting the preset.
+    """
+    f = GenerationParams.__dataclass_fields__[name]
+    target = f.type
+    default = f.default
+    if isinstance(value, bool):
+        if target is bool:
+            return value
+        return default
+    try:
+        if target is int:
+            return int(value)
+        if target is float:
+            return float(value)
+        if target is bool:
+            return bool(value)
+    except (TypeError, ValueError):
+        return default
+    return value
+
+
 def import_config(raw: str) -> tuple[dict[str, CaptionPreset], str, bool]:
+    """Parse a preset config payload into fresh :class:`CaptionPreset` objects.
+
+    Non-destructive: the parsed mapping is never mutated (the old in-place
+    ``pop("params")`` corrupted any dict shared with the caller, so a second
+    import of the same object silently lost *all* generation parameters).
+    Unknown keys are ignored; known keys are coerced type-safely so numeric
+    settings can never be clobbered by boolean JSON values.
+    """
     data = json.loads(raw)
+    param_names = set(asdict(GenerationParams()))
+    preset_names = set(CaptionPreset.__dataclass_fields__)
     presets: dict[str, CaptionPreset] = {}
     for key, pd in (data.get("presets") or {}).items():
-        gp = pd.pop("params", {}) or {}
-        pd["params"] = GenerationParams(**{k: v for k, v in gp.items()
-                                           if k in asdict(GenerationParams())})
+        if not isinstance(pd, dict):
+            continue
+        pd = dict(pd)                                # never mutate the input
+        gp = pd.pop("params", None)
+        gp = gp if isinstance(gp, dict) else {}
+        pd["params"] = GenerationParams(**{
+            k: _coerce_param(k, v) for k, v in gp.items() if k in param_names})
         presets[key] = CaptionPreset(**{k: v for k, v in pd.items()
-                                        if k in CaptionPreset.__dataclass_fields__})
+                                       if k in preset_names})
     if not presets:
         presets = {k: _clone(v) for k, v in DEFAULT_PRESETS.items()}
     active = data.get("active_preset") or next(iter(presets))
