@@ -384,6 +384,30 @@ class InferenceTab(QWidget):
         self.cb_preserve.toggled.connect(
             lambda v: setattr(self.ctx.settings, "preserve_thinking", bool(v)))
         gf.addRow(self.cb_preserve)
+        # ---- Max Tokens ------------------------------------------------------
+        # Response token cap sent as payload 'max_tokens'.  This used to be a
+        # preset-only value (saved in captioner_config.json but with no GUI
+        # control); the spinbox now writes straight into
+        # InferenceSettings.max_tokens, which build_payload honours over the
+        # active preset's GenerationParams default.
+        self.max_tokens_spin = QSpinBox()
+        self.max_tokens_spin.setRange(16, 131072)
+        self.max_tokens_spin.setSingleStep(64)
+        self.max_tokens_spin.setWrapping(False)
+        self.max_tokens_spin.setValue(max(self.max_tokens_spin.minimum(),
+                                          min(self.max_tokens_spin.maximum(),
+                                              int(getattr(st, "max_tokens",
+                                                          2048) or 2048))))
+        self.max_tokens_spin.setToolTip(
+            "Hard cap on generated response tokens ('max_tokens' in the\n"
+            "chat-completion request).\n"
+            "Wins over the per-preset 'params.max_tokens' stored in the\n"
+            "config; presets keep acting as the default for values inside\n"
+            "their range.  Raise it for long JSON captions, lower it for\n"
+            "quick tag runs.")
+        self.max_tokens_spin.valueChanged.connect(
+            lambda v: setattr(self.ctx.settings, "max_tokens", int(v)))
+        gf.addRow("Max Tokens:", self.max_tokens_spin)
         hint = QLabel(
             "Reasoning knobs travel PER REQUEST: effort / enable / preserve "
             "via chat_template_kwargs (needs llama-server --jinja, added "

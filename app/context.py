@@ -40,6 +40,11 @@ class InferenceSettings:
     preserve_thinking: bool = True
     reasoning_budget: int = -1
     thinking_level: str = "xhigh"    # reasoning_effort key ("" = off) - persisted
+    # Response token cap sent as payload 'max_tokens' (Tab 2 spinbox).
+    # Previously this value only lived inside each preset's GenerationParams
+    # ('max_tokens' in captioner_config.json), so it was saved/exported but
+    # had no GUI control and could not be adjusted from Tab 2 at all.
+    max_tokens: int = 2048
     cache_type: str = "q8_0"
     # Multi-GPU tensor split mode passed to llama-server as '-sm <mode>'.
     # Default is 'layer' (llama.cpp's recommended split for pipeline-style
@@ -63,20 +68,33 @@ class InferenceSettings:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
     def apply_dict(self, d: dict) -> None:
-        """Copy recognised keys from *d* with type coercion; ignore the rest."""
+        """Copy recognised keys from *d* with type coercion; ignore the rest.
+
+        Booleans are only accepted for bool fields — ``int(True) == 1`` used
+        to let a stray JSON ``true`` clobber numeric settings (port, top_k,
+        max_tokens...) exactly like the unified importer does now (see
+        :func:`app.core.models._coerce`).  Numeric strings still coerce.
+        """
         for k, v in (d or {}).items():
             if k not in self.__dataclass_fields__:
                 continue
             try:
                 f = self.__dataclass_fields__[k]
-                if f.type in ("float", float):
+                if f.type in ("bool", bool):
+                    if isinstance(v, bool):
+                        setattr(self, k, v)
+                    elif isinstance(v, str) \
+                            and v.strip().lower() in ("true", "false"):
+                        setattr(self, k, v.strip().lower() == "true")
+                    # numbers never flip a bool field -> keep current value
+                elif isinstance(v, bool):
+                    pass                # bools never fill numeric/str fields
+                elif f.type in ("float", float):
                     setattr(self, k, float(v))
                 elif f.type in ("int", int):
                     setattr(self, k, int(v))
                 elif f.type in ("str", str):
                     setattr(self, k, str(v))
-                elif f.type in ("bool", bool):
-                    setattr(self, k, bool(v))
                 else:
                     setattr(self, k, v)
             except (TypeError, ValueError):
