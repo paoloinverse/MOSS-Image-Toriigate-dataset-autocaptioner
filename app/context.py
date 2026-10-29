@@ -30,6 +30,18 @@ class InferenceSettings:
     top_p: float = 0.95
     top_k: int = 40
     min_p: float = 0.05
+    # Repetition / presence penalties + batch sizes (Tab 2 Generation
+    # Settings -> ServerConfig -> llama-server argv AND per-request payload):
+    #   repetition_penalty : llama.cpp default 1.10 (1.0 = disabled)
+    #   presence_penalty   : OpenAI-compatible knob, llama.cpp default 0.0;
+    #                        sent per request only when != 0 so a server
+    #                        default is never clobbered by an explicit zero.
+    #   batch_size           : -b   physical prompt batch size   (default 2048)
+    #   ubatch_size          : -ub  logical micro-batch size     (default 512)
+    repetition_penalty: float = 1.1
+    presence_penalty: float = 0.0
+    batch_size: int = 2048
+    ubatch_size: int = 512
     # Qwen3.8-family reasoning controls (Tab 2 -> api_client.build_payload):
     # ``enable_thinking`` is the master switch mapped to
     # chat_template_kwargs.enable_thinking; ``preserve_thinking`` keeps
