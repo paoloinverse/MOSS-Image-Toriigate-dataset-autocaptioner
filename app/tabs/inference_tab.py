@@ -504,6 +504,24 @@ class InferenceTab(QWidget):
         self.run_quant_combo.currentIndexChanged.connect(
             self._on_run_quant_changed)
 
+        # Wiring BEFORE the initial population: Qt fires currentIndexChanged
+        # whenever a programmatic setCurrentIndex actually changes the index,
+        # and with no listeners attached yet those signals used to be lost.
+        # The imported/persisted 'run_model_key' then never reached
+        # _on_run_model_changed, so refresh_from_context()'s re-population
+        # (after a config import) emitted it at a LATER time - which made the
+        # handler believe the model had just switched and run
+        # _apply_profile_defaults(), silently clobbering every imported
+        # sampling value (Temperature / Top-P / Min-P landing on the profile
+        # defaults - 0.6 / 0.95 / 0.0 for Qwen3.8 - or worse).
+        self.ctx.model_changed.connect(self._on_model_changed)
+        self.ctx.binary_changed.connect(self._refresh_binary_status)
+        self.ctx.registry_refreshed.connect(self._on_registry_refreshed)
+        self.run_model_combo.currentIndexChanged.connect(
+            self._on_run_model_changed)
+        self.run_quant_combo.currentIndexChanged.connect(
+            self._on_run_quant_changed)
+
         self._populate_run_models()
         self._profiled_key = self.ctx.run_model_key
         self._refresh_binary_status()
