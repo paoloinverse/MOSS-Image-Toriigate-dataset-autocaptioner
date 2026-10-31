@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QObject, Signal
 
 from app.core.hardware import HardwareManager
-from app.core.models import ModelSpec, StorageManager, build_registry
+from app.core.models import (BUILTIN_SPEC_KEYS, ModelSpec, StorageManager,
+                             build_registry)
 from app.core.presets import DEFAULT_PRESETS, CaptionPreset, _clone
 from app.core.server import ServerConfig, ServerManager
 
@@ -121,6 +122,13 @@ class AppContext(QObject):
         # find_binary() honours the user's choice instead of ignoring it.
         self.binary_changed.connect(self._sync_server_preferred_binary)
         self.registry: dict[str, ModelSpec] = build_registry()
+        # Register this context as the process-wide one so module-level key
+        # lookups (model_profile_for / payload gating) resolve repos added at
+        # runtime through Tab 1 to their family profile instead of degrading
+        # to the neutral one; headless/test processes never set it and keep
+        # using the import-time REGISTRY.
+        import app.core.models as _models_module
+        _models_module._ACTIVE_CTX = self
         self.presets: dict[str, CaptionPreset] = {
             k: _clone(v) for k, v in DEFAULT_PRESETS.items()}
         self.active_preset_key: str = "moss"
@@ -137,6 +145,31 @@ class AppContext(QObject):
         from app.core.models import load_app_settings
         self._persisted = load_app_settings()
         self.settings.apply_dict(self._persisted.get("settings") or {})
+
+        # Restore the persisted Tab 1 model selection (app_settings.json).
+        # A persisted key that no longer exists in the registry - e.g. a
+        # custom repo removed on another machine, or hand-edited out of the
+        # settings file - is logged and the built-in default stays selected:
+        # start-up must never crash on stale selection state.
+        _mdl = self._persisted.get("model") or {}
+        if isinstance(_mdl, dict):
+            _key = str(_mdl.get("key", "") or "")
+            if _key:
+                _spec = self.registry.get(_key)
+                if _spec is None:
+                    # print() as well: at this point no tab exists yet, so a
+                    # signal-only message would be lost before the log panel
+                    # connects (same convention as models.py's start-up output).
+                    warn = (f"[models] persisted model key '{_key}' no longer "
+                            f"exists in the registry (removed custom repo?) - "
+                            f"falling back to '{self.selected_model_key}'.")
+                    print(warn, flush=True)
+                    self.log.emit(warn)
+                else:
+                    self.selected_model_key = _key
+                    _q = str(_mdl.get("quant", "") or "")
+                    if _q and _spec.file_for_quant(_q) is not None:
+                        self.selected_quant = _q
 
         # Startup config override: an optional captioner_config.json sitting
         # next to the launcher (or pointed at by $APPCAP_CONFIG) is imported
@@ -248,7 +281,14 @@ class AppContext(QObject):
         data["storage"] = self.storage.to_dict()
         data["settings"] = self.settings.to_dict()
         data["model"] = {"key": self.selected_model_key,
-                        "quant": self.selected_quant}
+                         "quant": self.selected_quant,
+                         "repo": self.selected_repo_id}
+        # User-added HF repos survive restarts (labels round-trip through the
+        # specs' display names; built-ins are never persisted here - they are
+        # hardwired in build_registry()).
+        data["custom_repos"] = [{"repo": s.source_repo, "label": s.display_name}
+                                for k, s in self.registry.items()
+                                if k not in BUILTIN_SPEC_KEYS]
         try:
             save_app_settings(data)
         except Exception as exc:
@@ -303,6 +343,19 @@ class AppContext(QObject):
     def active_model_spec(self) -> ModelSpec:
         return self.registry[self.selected_model_key]
 
+    # ------------------------------------------------- tracked repo ids (§3.1)
+    @property
+    def selected_repo_id(self) -> str:
+        """Hugging Face repo id of the Tab 1 model selection."""
+        spec = self.registry.get(self.selected_model_key)
+        return spec.source_repo if spec is not None else ""
+
+    @property
+    def run_repo_id(self) -> str:
+        """Hugging Face repo id of the Tab 2 run target (follow-mode aware)."""
+        spec = self.registry.get(self.run_model_key)
+        return spec.source_repo if spec is not None else self.selected_repo_id
+
     # ------------------------------------------------------ run-target model
     @property
     def run_model_key(self) -> str:
@@ -353,6 +406,114 @@ class AppContext(QObject):
         self.log.emit(f"[storage] {self.storage.describe()}")
         self.storage_changed.emit()
         self.model_changed.emit()      # cached-file badges must refresh
+
+    # ------------------------------------------------- custom HF repositories
+    def add_custom_repo(self, repo_id: str,
+                        label: str = "") -> ModelSpec | None:
+        """Register a user-added Hugging Face repository in the live registry.
+
+        Synchronous and offline-safe by contract: the caller (Tab 1's Add
+        flow) has ALREADY verified on its worker thread that the repo lists
+        at least one main GGUF, so :func:`build_spec_from_repo` here works
+        off the TTL-cached Hub listing instead of blocking the GUI.  Dedupes
+        against every known spec (built-ins included - in which case the
+        existing entry is simply returned); persists the 'custom_repos'
+        section and emits ``registry_refreshed`` so Tab 2 picks up the new
+        model immediately.
+
+        Returns the registered :class:`ModelSpec`, or ``None`` when validation
+        failed (the verbose AppError report is surfaced via
+        :meth:`report_error` with a modal dialog).
+        """
+        from app.core.models import build_spec_from_repo, validate_repo_id
+        try:
+            norm = validate_repo_id(repo_id)
+        except Exception as exc:      # AppError (invalid id) or surprise
+            self.report_error(exc, context=f"adding custom repo '{repo_id}'",
+                              dialog=True)
+            return None
+        for s in self.registry.values():
+            if s.source_repo.lower() == norm.lower():
+                # Already known (built-in or previously added): select it
+                # instead of duplicating (plan §6, case 5).
+                self.log.emit(
+                    f"[models] '{norm}' is already available as "
+                    f"'{s.display_name}' - selecting the existing entry.")
+                return s
+        try:
+            spec = build_spec_from_repo(norm, label)
+        except Exception as exc:      # listing failed / no GGUFs in between
+            self.report_error(exc, context=f"adding custom repo '{norm}'",
+                              dialog=True)
+            return None
+        self.registry[spec.key] = spec
+        self.log.emit(
+            f"[models] added custom repository '{norm}' "
+            f"(family: {spec.family}, quants: {len(spec.files)}) - key "
+            f"'{spec.key}'.")
+        try:
+            self.save_settings()
+        except Exception as exc:
+            self.report_error(exc, context="persisting custom repositories",
+                              dialog=False)
+        self.registry_refreshed.emit(spec.key)
+        self.model_changed.emit()
+        return spec
+
+    def remove_custom_repo(self, key: str) -> bool:
+        """Remove a user-added repository from the live registry (Tab 1).
+
+        Refused while that spec is the current Tab 1 selection or an active
+        Tab 2 explicit run target; otherwise removes it, persists, emits
+        ``registry_refreshed`` and lets dependent widgets fall back.  The
+        built-in models can never be removed.  Downloaded files are
+        intentionally NOT touched - they remain on disk in the storage tree.
+        """
+        if key in BUILTIN_SPEC_KEYS:
+            self.log.emit(f"[models] '{key}' is a built-in model and cannot "
+                          "be removed.")
+            return False
+        spec = self.registry.get(key)
+        if spec is None:
+            return True               # already gone: nothing to do
+        if key == self.selected_model_key:
+            self.log.emit(
+                f"[models] cannot remove '{spec.display_name}': it is the "
+                "current selection - switch models first.")
+            return False
+        if key == (self.settings.run_model_key or ""):
+            self.log.emit(
+                f"[models] cannot remove '{spec.display_name}': Tab 2 has it "
+                "as the explicit run target - clear that override first.")
+            return False
+        del self.registry[key]
+        # Fall the persisted selection back to a built-in with a warning so
+        # start-up validation on the next launch stays consistent (plan §6,
+        # case 6).
+        if self.selected_model_key == key:
+            self.log.emit(f"[models] '{spec.display_name}' removed - model "
+                          f"selection falls back to 'toriigate'.")
+            self.selected_model_key = "toriigate"
+            tq = ("Q8_0" if "Q8_0" in self.registry["toriigate"].quants()
+                  else None) or next(iter(self.registry["toriigate"].quants()),
+                                     "")
+            self.selected_quant = tq
+        elif (self.settings.run_model_key or "") == key:
+            self.log.emit(f"[models] '{spec.display_name}' removed - Tab 2 "
+                          "run target cleared (follow mode).")
+            self.settings.run_model_key = ""
+            self.settings.run_quant = ""
+        self.log.emit(f"[models] removed custom repository "
+                      f"'{spec.source_repo}' (key '{key}'). Downloaded files "
+                      "were NOT deleted.")
+        try:
+            self.save_settings()
+        except Exception as exc:
+            self.report_error(exc, context="persisting custom repositories",
+                              dialog=False)
+        self.registry_refreshed.emit("")
+        self.model_changed.emit()
+        return True
 
     @property
     def active_preset(self) -> CaptionPreset:

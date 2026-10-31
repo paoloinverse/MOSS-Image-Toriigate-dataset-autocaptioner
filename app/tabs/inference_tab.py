@@ -569,15 +569,34 @@ class InferenceTab(QWidget):
         self.extra_args.blockSignals(True)
         self.extra_args.setPlainText(st.extra_args or "")
         self.extra_args.blockSignals(False)
-        for slider, label, value in (
-                (self.temp_slider, self.temp_val, st.temperature),
-                (self.top_p_slider, self.top_p_val, st.top_p),
-                (self.top_k_slider, self.top_k_val, st.top_k),
-                (self.min_p_slider, self.min_p_val, st.min_p)):
+        # QSlider is INTEGER-only: Temp/Top-P/Min-P are stored as floats and
+        # the widgets use a 100x scale factor (see _slider / the wiring
+        # loop).  Passing the raw float to setValue() truncated it (0.7 -> 0,
+        # 0.95 -> 0, 0.05 -> 0), which is exactly why every imported sampling
+        # value landed on 0 after a config import.  Scale by the same factor
+        # the live handlers divide by, and render the label from the scaled
+        # slider position so GUI and settings can never disagree.
+        for slider, label, value, div in (
+                (self.temp_slider, self.temp_val, st.temperature, 100),
+                (self.top_p_slider, self.top_p_val, st.top_p, 100),
+                (self.top_k_slider, self.top_k_val, st.top_k, 1),
+                (self.min_p_slider, self.min_p_val, st.min_p, 100)):
             slider.blockSignals(True)
-            slider.setValue(value)
+            slider.setValue(max(slider.minimum(),
+                                min(slider.maximum(),
+                                    int(round(float(value) * div)))))
             slider.blockSignals(False)
-            label.setText(str(slider.value()))
+            v = slider.value() / div
+            label.setText(str(int(v)) if div == 1 else f"{v:.2f}")
+        # Max Tokens spinbox: previously never re-hydrated here, so an
+        # imported/persisted value could sit in the settings while the GUI
+        # kept showing whatever the tab captured at construction time.
+        mt = max(self.max_tokens_spin.minimum(),
+                 min(self.max_tokens_spin.maximum(), int(st.max_tokens or 2048)))
+        self.max_tokens_spin.blockSignals(True)
+        self.max_tokens_spin.setValue(mt)
+        self.max_tokens_spin.blockSignals(False)
+        st.max_tokens = mt
         # Reasoning budget: -1 (unlimited sentinel) is a valid slider value;
         # hydrate the Unlimited checkbox from it and show "Unlimited" instead
         # of the raw number on the value label.
@@ -607,7 +626,14 @@ class InferenceTab(QWidget):
         return get_model_profile(self.ctx.run_model_key)
 
     def _on_registry_refreshed(self, key: str):
-        if key == self.ctx.run_model_key or not self.ctx.settings.run_model_key:
+        """Re-populate when the run target changed OR a NEW registry entry
+        arrived (e.g. Tab 1 just added a custom repo) - previously this only
+        rebuilt in follow mode, so an explicit 'Model to run' override never
+        saw mid-session additions."""
+        have = {self.run_model_combo.itemData(i)
+                for i in range(self.run_model_combo.count())}
+        if (key == self.ctx.run_model_key or not self.ctx.settings.run_model_key
+                or (key and key not in have)):
             self._populate_run_models()
 
     # ---------------------------------------------------------- model profiles

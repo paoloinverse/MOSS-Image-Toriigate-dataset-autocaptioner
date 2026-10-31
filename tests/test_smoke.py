@@ -654,6 +654,23 @@ def test_model_profiles():
     check("profiles registered", set(_MODEL_FAMILY_DEFAULTS) >= {"toriigate",
                                                                  "qwen3.8-27b"})
 
+    # Generalized families (plan section 5 / M4): every auto-detected family
+    # must map onto a real table entry - the neutral fallback is reserved for
+    # truly unknown models, not documented open-weight lineages.
+    from app.core.models import model_profile_for as _mpf
+
+    class _Fam:                 # duck-typed spec stand-in (family-first lookup)
+        def __init__(self, fam): self.family = fam
+    for fam in ("qwen3.5", "qwen3.6", "qwen3.8", "qwen3.8-flash-next"):
+        pf = _mpf(None, None, _Fam(fam))
+        check("family %s: full thinking levels + reasoning kwargs enabled" % fam,
+              [l.key for l in pf.thinking_levels] == ["xhigh", "medium", "low", ""]
+              and pf.supports_reasoning_kwargs is True)
+    glm = _mpf(None, None, _Fam("glm5.3"))
+    check("family glm5.3: no thinking levels, sampling-only payload profile",
+          len(glm.thinking_levels) == 0 and glm.supports_reasoning_kwargs is False
+          and glm.temperature == 0.7)
+
 
 # ------------------------------------------------------------------ payload
 def test_payload():

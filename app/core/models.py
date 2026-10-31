@@ -236,8 +236,9 @@ CACHE_DIR = default_cache_dir()
 # the remote file metadata is unavailable).
 QUANT_BITS = {
     "BF16": 16.0, "F16": 16.0, "Q8_0": 8.5, "Q6_K": 6.6,
-    "Q5_K_M": 5.7, "Q4_K_M": 4.8, "UD-IQ4_XS": 4.4, "IQ4_XS": 4.25,
-    "Q3_K_M": 3.9, "Q2_K": 2.6,
+    "Q5_K_M": 5.7, "Q5_K": 5.77, "Q4_K_M": 4.8, "Q4_K": 4.83,
+    "UD-IQ4_XS": 4.4, "IQ4_XS": 4.25,
+    "Q3_K_M": 3.9, "Q3_K": 3.96, "Q2_K": 2.6,
 }
 
 
@@ -276,29 +277,114 @@ def _lookup_entry(repo_id: str, force: bool = False) -> dict:
     return ent
 
 
+#: Quant span anchored to the END of a filename: optional family prefix
+#: (GSQ-RCO / UD-DW / UD), base quant (BF16/F16/F32, Q4_K, IQ3_XS, ...) and an
+#: optional variant suffix (_P / _XL / _L / -MTP).  The anchor matters: the
+#: old pattern stopped before such suffixes, so six '...-Q*_K_P.gguf' files in
+#: a HauhauCS Qwen3.6 repo all parsed to the bare tag 'P', and selection (which
+#: keys on the tag) resolved to whichever of them came first.
+_QUANT_TAIL_RE = re.compile(
+    r"(?:^|[._-])"
+    r"((?:GSQ-RCO[-_]?|UD-DW[-_]?|UD[-_]?)?"
+    r"(?:BF16|F16|F32"
+    r"|Q\d+(?:_\d)?(?:_[A-Z]{1,4})?"
+    r"|I[MQ]\d+(?:_[A-Z]{1,4})?)"
+    r"(?:[-_]?(?:XL|P|MTP|L|M|S))?)",
+    re.IGNORECASE)
+
+
 def _quant_tag_from_name(name: str) -> str:
     """Extract the quant tag embedded in a real Hub filename.
 
-    Scans underscore-separated tokens left-to-right and returns the first one
-    matching a GGUF quant pattern (``Q8_0``, ``IQ4_XS`` -> ``IQ4-XS``,
-    ``BF16``, ``F16``, ``UD-IQ4_XS`` -> ``UD-IQ4-XS``).  Falls back to the
-    last dot-separated stem token.  This is *parsing* an existing name, not
-    composing one.
+    Primary rule: a quant span anchored to the END of the stem - family
+    prefix (``GSQ-RCO`` / ``UD-DW`` / ``UD``), base quant (``Q8_0``,
+    ``Q4_K_P``, ``IQ3_XS`` ...) and optional variant suffix (``_P``, ``_XL``,
+    ``_L``, ``-MTP``) - so suffixed quants keep their full identity instead
+    of collapsing to a bare 'P'/'XL'/'L' shared by several files.  When the
+    quant sits mid-name, a left-to-right scan for the first GGUF-quant-like
+    underscore token is used; last resort is the last underscore token.
+
+    This is *parsing* an existing name, not composing one.  Tags are a
+    best-effort display key - :func:`_disambiguate_quant_tags` guarantees they
+    stay unique within one repository listing.
     """
     stem = os.path.splitext(os.path.basename(name))[0]
-    m = re.search(r"(?:^|[._-])((?:UD-?)?(?:BF16|F16|F32|Q\d(?:_\d)?(?:_[A-Z]{1,3})?|"
-                  r"I[MQ]\d+(?:_[A-Z]{1,2})?(?:_XL)?))$", stem, re.IGNORECASE)
+    # Tail-anchored match first (standard names end with the quant), then a
+    # mid-name search, then the token scan / last-token fallbacks.
+    m = re.search(_QUANT_TAIL_RE.pattern + r"$", stem, re.IGNORECASE) \
+        or _QUANT_TAIL_RE.search(stem)
+    if m:
+        return m.group(1).upper()
     toks = stem.split("_")
-    cand = None
     for i, t in enumerate(toks):
-        if re.fullmatch(r"(?:UD-?)?(?:BF16|F16|F32|Q\d(?:\d)?|[IQ][M]?Q?\d+[A-Z]*|"
+        if re.fullmatch(r"(?:UD-?)?(?:BF16|F16|F32|Q\d(\d)?|[IQ][M]?Q?\d+[A-Z]*|"
                         r"[A-Z]{2,4})", t, re.IGNORECASE) and \
                 re.search(r"\d|BF16|F16", t):
-            cand = "_".join(toks[i:])
-            break
-    if cand is None:
-        cand = m.group(1) if m else (toks[-1] if toks else stem)
-    return cand.replace("-", "-").upper()
+            return "_".join(toks[i:]).upper()
+    return (toks[-1] if toks else stem).upper()
+
+
+def _disambiguate_quant_tags(
+        entries: "list[tuple[str, str, int]]"
+) -> "list[tuple[str, str, int]]":
+    """Make quant tags UNIQUE within one repository listing.
+
+    ``entries`` are the ``(filename, quant, size_bytes)`` triples from
+    :func:`discover_repo_ggufs`.  The best-effort parser can assign one tag to
+    several files (e.g. two '...-Q4_K.gguf' uploads with different model
+    names, or any scheme this grammar does not know).  Selection, persistence
+    and download planning all key on the tag, so a collision would silently
+    resolve to the FIRST file carrying it.  Colliding tags are therefore
+    extended leftwards over the filename's own ``[_-]`` units - 'K_P' ->
+    'Q2_K_P', 'XL' -> 'Q2_K_XL' - until unique; candidates that contain a
+    digit are preferred (they read as quant names) and the full stem is the
+    last resort.  The first file of a colliding group keeps its parsed tag,
+    later ones extend.  Pure function of the listing: completely deterministic
+    and repo-scoped, so it copes with any future naming scheme.
+    """
+    n = len(entries)
+    if n < 2:
+        return entries
+    tags = [t for _fn, t, _sz in entries]
+
+    def _unique_among_others(cand: str, i: int) -> bool:
+        up = cand.upper()
+        return all(up != tags[j].upper() for j in range(n) if j != i)
+
+    for i in range(n):
+        fn, tag, _sz = entries[i]
+        if tags.count(tag) == 1:
+            continue                          # unique as-is
+        seen_earlier = sum(1 for j in range(i)
+                           if tags[j].upper() == tag.upper())
+        if seen_earlier == 0:
+            continue                          # first of the group: keep it
+        stem = os.path.splitext(os.path.basename(fn))[0]
+        su, tu = stem.upper(), tag.upper()
+        units: list[tuple[str, str]] = []     # (leading separator, text)
+        for u in re.finditer(r"(?:^|([_.-]))([^_.-]+)", stem):
+            units.append((u.group(1) or "", u.group(2)))
+        cands: list[str] = []
+        if tu and su.endswith(tu):
+            for k in range(1, len(units) + 1):
+                span = "".join(s + t for s, t in units[-k:])
+                span = span.lstrip("_.-")
+                if span and span.upper() != tag.upper():
+                    cands.append(span)
+        new_tag = None
+        for cand in cands:                    # digit-bearing candidates first
+            if re.search(r"\d", cand) and _unique_among_others(cand, i):
+                new_tag = cand
+                break
+        if new_tag is None:
+            for cand in cands:
+                if _unique_among_others(cand, i):
+                    new_tag = cand
+                    break
+        if new_tag is None:
+            new_tag = stem                    # last resort: full stem
+        tags[i] = new_tag
+    return [(entries[i][0], tags[i], entries[i][2]) for i in range(n)]
 
 
 def discover_repo_ggufs(repo_id: str, force_refresh: bool = False
@@ -320,7 +406,9 @@ def discover_repo_ggufs(repo_id: str, force_refresh: bool = False
         if not low.endswith(".gguf") or "mmproj" in low:
             continue
         out.append((f, _quant_tag_from_name(f), ent["sizes"].get(f, 0)))
-    return out
+    # Tags must be unique per repo: selection/persistence/download planning
+    # key on them, and a shared tag would resolve to the first file only.
+    return _disambiguate_quant_tags(out)
 
 
 def find_live_filename(repo_id: str, wanted: str) -> "str | None":
@@ -371,6 +459,107 @@ def resolve_mmproj_live(repo_id: str, quant: str,
 
 
 # ---------------------------------------------------------------------------
+# Arbitrary Hugging Face repo ids (generalized model support)
+# ---------------------------------------------------------------------------
+#: A valid plain repo id: exactly two segments of letters/digits/._- .
+REPO_ID_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def normalize_repo_id(raw: str) -> str:
+    """Strip whitespace and a pasted Hub URL down towards ``org/name``.
+
+    'https://huggingface.co/org/name' (scheme optional, optional trailing
+    path segments kept for the validator to reject with a hint) becomes
+    'org/name...'.  Anything else is returned stripped but otherwise
+    untouched - :func:`validate_repo_id` produces the actionable error.
+    """
+    s = (raw or "").strip()
+    if "://" in s:
+        s = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", s)
+    s = re.sub(r"^www\.", "", s, flags=re.IGNORECASE)
+    m = re.match(r"(?:huggingface\.co/)?(.*)$", s, re.IGNORECASE)
+    if m:
+        s = m.group(1)
+    return s.strip()
+
+
+def validate_repo_id(raw: str) -> str:
+    """Validate a Hugging Face repo id; returns the normalised ``org/name``.
+
+    Raises :class:`AppError` with remediation hints for anything that is not
+    exactly two non-empty segments of letters/digits/._-  (pasted URLs are
+    stripped first, then rejected with a 'did you mean' hint when their path
+    starts with a plausible repo id).
+    """
+    rid = normalize_repo_id(raw)
+    if REPO_ID_RE.fullmatch(rid):
+        return rid
+    parts = [p for p in rid.split("/")]
+    detail_bits: list[str] = []
+    if len(parts) != 2:
+        detail_bits.append(f"expected exactly two segments 'org/name' "
+                           f"(got {len([p for p in parts if True])})")
+    elif not all(p.strip() for p in parts):
+        detail_bits.append("empty segment (no leading/trailing slash or double slashes)")
+    else:
+        detail_bits.append("illegal characters "
+                           "(allowed: letters, digits, '.', '_', '-')")
+    suggestions = ["Use the plain repository id shown on huggingface.co, e.g. "
+                   "'DraconicDragon/ToriiGate-0.5-GGUF'.",
+                   "Branch/revision syntax (org/name@rev) is not supported - "
+                   "plain repo ids only."]
+    if "://" in (raw or ""):
+        head = normalize_repo_id(raw).split("/")[:2]
+        if len(head) == 2 and all(head):
+            hint = head[0] + "/" + head[1]
+            suggestions.append(
+                f"Did you mean '{hint}'? (URLs are not needed - paste the repo id)")
+    raise AppError("Invalid Hugging Face repository id",
+                   f"'{raw}' is not a valid 'org/name' repo id - "
+                   + "; ".join(detail_bits),
+                   suggestions)
+
+
+def detect_family(repo_id: str, hf_config: dict | None = None) -> str:
+    """Auto-detect the model family of a repo id (pure, unit-testable).
+
+    Ordered substring heuristics over the lowercased repo id - first match
+    wins.  The Qwen3.8 flash/next variant is deliberately tested BEFORE plain
+    'qwen…3.8' so Flash-Next repos get their own profile entry.  When the
+    name is uninformative, ``config.json``'s ``model_type`` provides a hint;
+    when nothing matches the repo falls back to the neutral ``generic``
+    family (neutral profile - the model still runs with manual sampling).
+    """
+    rid = (repo_id or "").lower()
+
+    def _qwen(minor: str) -> bool:
+        return re.search(r"qwen[._-]?3[._-]?" + minor, rid) is not None
+
+    if "torii" in rid:
+        return "toriigate"
+    if _qwen("8") and ("flash" in rid or "next" in rid):
+        return "qwen3.8-flash-next"          # precedence over plain 3.8
+    for fam, minor in (("qwen3.5", "5"), ("qwen3.6", "6"), ("qwen3.8", "8")):
+        if _qwen(minor):
+            return fam
+    if re.search(r"glm[._-]?5[._-]?3", rid) is not None:
+        return "glm5.3"
+
+    # Name uninformative -> cross-check config.json model_type (if fetched).
+    mt = str(((hf_config or {}).get("model_type") or "")).lower()
+    if mt:
+        for fam, pat in (("qwen3.8-flash-next",
+                          r"(flash|next).*qwen.*3[._-]?8|qwen.*3[._-]?8.*(flash|next)"),
+                         ("qwen3.5", r"qwen.*3[._-]?5"),
+                         ("qwen3.6", r"qwen.*3[._-]?6"),
+                         ("qwen3.8", r"qwen.*3[._-]?8"),
+                         ("glm5.3", r"glm.*5[._-]?3|5[._-]?3.*glm")):
+            if re.search(pat, mt):
+                return fam
+    return "generic"
+
+
+# ---------------------------------------------------------------------------
 # Per-model run-out-of-the-box profiles
 # ---------------------------------------------------------------------------
 #: Valid llama.cpp ``--cache-type-k/-v`` values surfaced in Tab 2 (incl. bf16).
@@ -418,6 +607,12 @@ class ModelProfile:
     top_k: int = 40
     min_p: float = 0.05
     preserve_thinking_default: bool = True
+    #: Whether this family accepts Qwen-style ``chat_template_kwargs``
+    #: (enable_thinking / reasoning_effort / preserve_thinking) plus the
+    #: top-level ``reasoning_budget`` in chat payloads.  False for non-Qwen
+    #: families (GLM5.3, generic): api_client.build_payload() omits that whole
+    #: block so a foreign Jinja template never sees Qwen-only kwargs.
+    supports_reasoning_kwargs: bool = True
     note: str = ""
 
 
@@ -465,6 +660,50 @@ _MODEL_FAMILY_DEFAULTS: dict[str, ModelProfile] = {
              "in chat_template_kwargs per request (--jinja required); the "
              "token cap uses --reasoning-budget on the server plus a "
              "top-level reasoning_budget override per request."),
+    # ---- generalized open-weight families (auto-detected repo ids) --------
+    # Detected via detect_family() for ANY user-added Hugging Face repo; the
+    # values marked 'verify' must be confirmed against each family's model
+    # card / chat template before shipping defaults are considered final.
+    "qwen3.5": ModelProfile(
+        thinking_levels=_QWEN_THINKING_LEVELS, default_thinking="xhigh",
+        temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
+        preserve_thinking_default=True,
+        note="Qwen3.5-family hybrid thinker: same chat_template_kwargs "
+             "contract as Qwen3.8 (verify against the model card)."),
+    "qwen3.6": ModelProfile(
+        thinking_levels=_QWEN_THINKING_LEVELS, default_thinking="xhigh",
+        temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
+        preserve_thinking_default=True,
+        note="Qwen3.6-family hybrid thinker: same chat_template_kwargs "
+             "contract as Qwen3.8 (verify against the model card)."),
+    # Plain (non-Flash) Qwen3.8 repos auto-detected by detect_family(): they
+    # must land here - NOT in the neutral fallback - or acceptance criterion 3
+    # breaks (no thinking levels, T1.0 sampling instead of the family's T0.6).
+    "qwen3.8": ModelProfile(
+        thinking_levels=_QWEN_THINKING_LEVELS, default_thinking="xhigh",
+        temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
+        preserve_thinking_default=True,
+        note="Qwen3.8-family hybrid thinker: same chat_template_kwargs "
+             "contract as Qwen3.5/3.6 (verify against the model card)."),
+    "qwen3.8-flash-next": ModelProfile(
+        thinking_levels=_QWEN_THINKING_LEVELS, default_thinking="xhigh",
+        temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
+        preserve_thinking_default=True,
+        note="Qwen3.8-Flash/Next: Qwen3.8 chat_template_kwargs contract "
+             "(verify; consider a lower default budget if the model card says "
+             "so)."),
+    "glm5.3": ModelProfile(
+        thinking_levels=(), default_thinking="",
+        temperature=0.7, top_p=0.95, top_k=40, min_p=0.05,
+        preserve_thinking_default=True,
+        supports_reasoning_kwargs=False,
+        note="GLM5.3: conservative sampling; NO Qwen chat_template_kwargs / "
+             "reasoning_budget are sent (foreign chat template)."),
+    "generic": ModelProfile(
+        thinking_levels=(), default_thinking="",
+        supports_reasoning_kwargs=False,
+        note="Unknown model family: neutral defaults, user-set sampling only; "
+             "no Qwen-specific payload extras."),
 }
 
 #: Rough VRAM budget (GiB) allowed to the KV cache when deriving per-quant
@@ -521,6 +760,31 @@ def _hf_config_fields(spec: "ModelSpec") -> "ArchInfo | None":
 _CONFIG_ARCH_CACHE: dict[str, tuple] = {}
 
 
+_QUANT_SUFFIX_RE = re.compile(r"[-_](?:XL|P|MTP|L|M|S)$")
+
+
+def _quant_bits_for(quant: str, filename: str) -> float:
+    """Bits per weight for size estimates of a (possibly suffixed) quant.
+
+    Tries the exact tag, then the tag without a variant suffix ('Q4_K_P' ->
+    'Q4_K'), and repeats both with the tag re-parsed from the filename.  So
+    K-P / -XL / -L uploads estimate at their base quant instead of the 8.5-bit
+    unknown-quant default.  Unknown quants still default to 8.5 (conservative).
+    """
+    cands: list[str] = []
+    for raw in (quant, _quant_tag_from_name(filename)):
+        u = raw.upper()
+        if u not in cands:
+            cands.append(u)
+        stripped = _QUANT_SUFFIX_RE.sub("", u)
+        if stripped != u and stripped not in cands:
+            cands.append(stripped)
+    for c in cands:
+        if c in QUANT_BITS:
+            return QUANT_BITS[c]
+    return 8.5
+
+
 def _live_max_context(spec: "ModelSpec", f: "ModelFile") -> int:
     """Derive a per-quant context cap from the LIVE file size + arch math.
 
@@ -529,8 +793,7 @@ def _live_max_context(spec: "ModelSpec", f: "ModelFile") -> int:
     cache inside the profile's total VRAM budget).  Falls back to the family
     static entry, then to nothing (global cap applies).
     """
-    bits = QUANT_BITS.get(f.quant.upper(),
-                          QUANT_BITS.get(_quant_tag_from_name(f.filename), 8.5))
+    bits = _quant_bits_for(f.quant, f.filename)
     params_b = f.params_billions or 0.0
     gib = 0.0
     try:
@@ -559,11 +822,20 @@ def _live_max_context(spec: "ModelSpec", f: "ModelFile") -> int:
 def model_profile_for(key: str | None, quant: str | None = None,
                       spec: "ModelSpec | None" = None) -> ModelProfile:
     """Profile for a registry key, with the per-quant context cap resolved
-    against the LIVE Hub listing (sizes/arch) instead of a fixed table."""
-    base = _MODEL_FAMILY_DEFAULTS.get(key or "", ModelProfile())
-    caps = dict(base.max_context_by_quant)
+    against the LIVE Hub listing (sizes/arch) instead of a fixed table.
+
+    Profile resolution is FAMILY-FIRST: ``spec.family`` (the auto-detected
+    repo family such as 'qwen3.8' or 'glm5.3') wins, then the raw registry
+    key (legacy built-in keys), else the fully neutral profile.  This keeps
+    the two hardwired models working exactly as before while any user-added
+    custom spec maps onto its detected family's defaults.
+    """
     if spec is None and key:
-        spec = REGISTRY.get(key)
+        spec = _active_registry().get(key)
+    fam = getattr(spec, "family", "") or ""     # non-spec stand-ins -> ""
+    base = (_MODEL_FAMILY_DEFAULTS.get(fam)
+            or _MODEL_FAMILY_DEFAULTS.get(key or "", ModelProfile()))
+    caps = dict(base.max_context_by_quant)
     if spec is not None and quant:
         f = spec.file_for_quant(quant)
         if f is not None:
@@ -577,6 +849,7 @@ def model_profile_for(key: str | None, quant: str | None = None,
                         temperature=base.temperature, top_p=base.top_p,
                         top_k=base.top_k, min_p=base.min_p,
                         preserve_thinking_default=base.preserve_thinking_default,
+                        supports_reasoning_kwargs=base.supports_reasoning_kwargs,
                         note=base.note)
 
 
@@ -587,9 +860,19 @@ def get_model_profile(key: str | None, quant: str | None = None,
     When ``quant`` (and optionally the live ``spec``) are given, the
     per-quant context cap is included exactly as configured by the family
     defaults; live-discovered caps come via :func:`model_profile_for`.
+
+    Registry-resolvable keys (built-ins AND user-added custom repos) always
+    get their family profile - even when no quant/caps are known yet.  Only
+    keys that exist in neither the registry nor the family table degrade to
+    a fully neutral profile (legacy behaviour for arbitrary/empty keys, e.g.
+    headless callers without Tab 2 settings).
     """
     prof = model_profile_for(key, quant, spec)
-    if key and key not in _MODEL_FAMILY_DEFAULTS and not prof.max_context_by_quant:
+    if not key:
+        return prof                    # neutral default (headless / legacy)
+    resolved = spec or _active_registry().get(key)
+    if resolved is None and key not in _MODEL_FAMILY_DEFAULTS \
+            and not prof.max_context_by_quant:
         return ModelProfile()          # truly unknown model: fully neutral
     return prof
 
@@ -881,6 +1164,104 @@ class StorageManager:
             state = "space unknown"
         return f"Default app cache: {d} ({state})"
 
+    # ------------------------------------------------------ downloaded listing
+    def _repo_slug_map(self) -> dict:
+        """Reverse map: directory-name forms -> owning :class:`ModelSpec`.
+
+        Used to turn a file's folder name (the repo slug, e.g.
+        ``DraconicDragon--ToriiGate-0.5-GGUF``) back into a human-friendly
+        repository display name for the downloaded-files list.
+        """
+        m: dict = {}
+        for s in _all_specs():
+            rid = s.source_repo
+            for form in (rid, rid.replace("/", "--"), rid.replace("/", "-"),
+                         rid.split("/")[-1]):
+                m.setdefault(form.lower(), s)
+        return m
+
+    def list_downloaded(self) -> list[dict]:
+        """Scan the active storage location for every downloaded ``*.gguf``.
+
+        Returns a list of dicts (one per file) with keys ``repo`` (display
+        name or folder slug), ``repo_id``, ``filename``, ``quant``,
+        ``size_bytes`` and ``path``.  Files are de-duplicated by resolved
+        path and sorted by repo then filename so the GUI list is stable.
+        The walk is depth-bounded (matching :meth:`find_existing`) so huge
+        or FUSE-backed trees stay snappy and never raise.
+        """
+        import os as _os
+        slug_map = self._repo_slug_map()
+        seen: set = set()
+        out: list = []
+
+        def _repo_for(path):
+            """(display_name, repo_id) inferred from ancestor folder names."""
+            d = path.parent
+            for _ in range(4):
+                spec = slug_map.get(d.name.lower())
+                if spec is not None:
+                    return spec.display_name, spec.source_repo
+                parent = d.parent
+                if parent == d:
+                    break
+                d = parent
+            return path.parent.name, ""
+
+        def _walk(root):
+            try:
+                base_depth = str(root).rstrip("/").count("/")
+            except Exception:
+                return
+            try:
+                for dirpath, dirnames, filenames_ in _os.walk(
+                        root, topdown=True, onerror=None, followlinks=False):
+                    if dirpath.count("/") - base_depth >= 5:
+                        dirnames[:] = []      # prune deep levels
+                    for fn in filenames_:
+                        if not fn.lower().endswith(".gguf"):
+                            continue
+                        p = Path(dirpath) / fn
+                        try:
+                            key = str(p.resolve())
+                        except OSError:
+                            key = str(p)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        try:
+                            size = p.stat().st_size
+                        except OSError:
+                            size = 0
+                        disp, rid = _repo_for(p)
+                        out.append({
+                            "repo": disp,
+                            "repo_id": rid,
+                            "filename": fn,
+                            "quant": _quant_tag_from_name(fn),
+                            "size_bytes": size,
+                            "path": str(p),
+                        })
+            except OSError:
+                return
+
+        if self.mode == STORAGE_UNSLOTH and self.unsloth_root.strip():
+            root = Path(os.path.expanduser(self.unsloth_root.strip()))
+            try:
+                if root.is_dir():
+                    _walk(root)
+            except OSError:
+                pass
+        else:
+            d = default_cache_dir()
+            try:
+                if d.is_dir():
+                    _walk(d)
+            except OSError:
+                pass
+        out.sort(key=lambda e: (e["repo"].lower(), e["filename"].lower()))
+        return out
+
 
 # Process-wide active storage configuration (hydrated from app_settings.json
 # at startup; mutated by Tab 1 and read by every path resolver below).
@@ -931,8 +1312,7 @@ class ModelFile:
             sz = 0
         if sz > 0:
             return sz / (1024 * 1024)
-        bits = QUANT_BITS.get(self.quant.upper(),
-                              QUANT_BITS.get(_quant_tag_from_name(self.filename), 8.5))
+        bits = _quant_bits_for(self.quant, self.filename)
         if self.params_billions <= 0:
             self.params_billions = max(0.5, round(sz / 1e9, 2)) if sz else 0.5
         return self.params_billions * 1e9 * bits / 8 / (1024 * 1024)
@@ -1038,14 +1418,14 @@ class ModelFile:
             if hit is not None:
                 return hit, hit.name
 
-        # 4. nothing on disk - report the expected name so downloads fetch it
-        expected = self.mmproj_filename
-        if expected is None:
-            specs = _all_specs()
-            spec = next((s for s in specs if s.source_repo == self.repo_id), None)
-            if spec is not None:
-                expected = resolve_mmproj(spec, self)
-        return None, expected
+        # 4. nothing on disk - report only the ADOPTED/remembered name (if any).
+        # Deliberately NO live Hub lookup in this method: it is called from UI
+        # paths that must stay local (downloaded-files list, follow label,
+        # server preflight), and plan_mmproj_download() performs its own
+        # single live pass - a live fallback in both places queried the same
+        # repo twice per uncached run.  Discovery belongs exclusively to
+        # resolve_mmproj()/plan_mmproj_download().
+        return None, self.mmproj_filename
 
     def mmproj_companion_error(self, companion_path: Path) -> str | None:
         """Return a human-readable incompatibility reason for ``companion_path``.
@@ -1158,6 +1538,7 @@ class ModelSpec:
     mmproj_candidates: list[str] = field(default_factory=list)
     abliterated: bool = False      # safe to inject explicit-mode triggers
     vision: bool = True
+    family: str = "generic"        # detect_family() result; profile key
     last_refresh_error: str = ""   # verbose report of the failed live lookup
     refreshed_at: float = 0.0      # monotonic timestamp of last refresh
     live: bool = False             # True once a live listing populated files
@@ -1225,13 +1606,69 @@ class ModelSpec:
         return None
 
 
+#: Registry keys of the two hardwired models - everything else in the
+#: registry is a user-added custom repository (persisted 'custom_repos').
+BUILTIN_SPEC_KEYS = frozenset({"toriigate", "qwen3.8-27b"})
+
+
+def build_spec_from_repo(repo_id: str, label: str = "") -> ModelSpec:
+    """Create a live :class:`ModelSpec` from an arbitrary HF repo id.
+
+    Validates the id (:func:`validate_repo_id`), lists the repository on the
+    Hub and REFUSES to create a spec when it publishes no main GGUF file -
+    'repo exists but contains no *.gguf files' (safetensors-only repos are
+    not supported) - so the registry never gains a dead entry.  The quant
+    list comes verbatim from the live listing (**no allow-list**),
+    ``config.json`` is fetched for family detection, and ``abliterated`` is
+    set heuristically when the repo id or any filename contains
+    'abliterated'/'uncensored' (keeps Tab 3 Explicit Mode working).
+
+    The spec key is the deterministic repo slug (``org/name`` ->
+    ``org--name``) - the same scheme StorageManager uses for on-disk folders,
+    so registry keys and storage directories stay 1:1.
+
+    Raises :class:`AppError` (verbose, classified) when the id is invalid or
+    the repo cannot be listed; raises a plain AppError with remediation hints
+    when no GGUFs are published.
+    """
+    rid = validate_repo_id(repo_id)
+    _lookup_entry(rid)                     # existence + access (401/403 classified)
+    ggufs = discover_repo_ggufs(rid)       # cached listing; [] when no GGUFs
+    if not ggufs:
+        raise AppError(
+            f"Repository '{rid}' exists but contains no *.gguf files",
+            "safetensors-only (or dataset/empty) repositories are not "
+            "supported - this app runs GGUF models through llama-server.",
+            ["Pick a repo that publishes .gguf quantizations, e.g. one of the "
+             "'-GGUF' repos on huggingface.co."])
+    cfg = _fetch_hf_config(rid)            # may be None (no config.json); fine
+    family = detect_family(rid, cfg)
+    names_lower = [fn.lower() for fn, _q, _sz in ggufs]
+    abliterated = (("abliterated" in rid or "uncensored" in rid)
+                   or any(("abliterated" in n or "uncensored" in n)
+                          for n in names_lower))
+    key = rid.lower().replace("/", "--")   # 1:1 with StorageManager dir naming
+    display = (label or "").strip() or rid.split("/")[-1]
+    files = [ModelFile(filename=fn, quant=q, repo_id=rid, params_billions=0.0)
+             for fn, q, _sz in ggufs]
+    import time as _t
+    return ModelSpec(key=key, display_name=display, source_repo=rid,
+                     hf_config_repo=rid, seed_files=[], files=files,
+                     abliterated=abliterated, family=family,
+                     refreshed_at=_t.monotonic(), live=True)
+
+
 def build_registry(refresh: bool = True) -> dict[str, ModelSpec]:
-    """Supported-model catalogue.
+    """Supported-model catalogue: built-ins + user-added custom repos.
 
     Only *repositories* are hardwired here; the concrete GGUF filenames and
     available quants are looked up live from the Hugging Face Hub when the
     registry is built (``refresh=True``, the default).  The seed entries act
-    strictly as offline fallbacks.
+    strictly as offline fallbacks.  User-added repositories persisted in
+    ``app_settings.json['custom_repos']`` are merged after the built-ins,
+    deduplicated by source repo, and created OFFLINE-SAFE: no network access
+    happens here beyond the existing live refresh - custom specs start with
+    empty file lists that the late-bound background listing fills in.
     """
     torii_repo = "DraconicDragon/ToriiGate-0.5-GGUF"
     qwen_repo = "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF"
@@ -1247,6 +1684,7 @@ def build_registry(refresh: bool = True) -> dict[str, ModelSpec]:
                       mmproj_filename="ToriiGate-0.5-Q8_0.mmproj.gguf"),
         ],
         mmproj_candidates=["ToriiGate-0.5-Q8_0.mmproj.gguf"],
+        family="toriigate",                # explicit: family-first profile lookup
     )
 
     qwen = ModelSpec(
@@ -1266,8 +1704,46 @@ def build_registry(refresh: bool = True) -> dict[str, ModelSpec]:
             "mmproj-F16.gguf",
         ],
         abliterated=True,
+        family="qwen3.8-27b",              # explicit: family-first profile lookup
     )
     specs = {torii.key: torii, qwen.key: qwen}
+
+    # ---- merge persisted user-added repos (offline-safe) ------------------
+    data = load_app_settings()
+    crepos = data.get("custom_repos") if isinstance(data, dict) else None
+    if isinstance(crepos, list):
+        for entry in crepos:
+            if not isinstance(entry, dict):
+                continue
+            repo_raw = str(entry.get("repo", "")).strip()
+            if not repo_raw:
+                continue
+            try:
+                norm = validate_repo_id(repo_raw)
+            except AppError as exc:
+                print(f"[models] skipping invalid persisted custom repo "
+                      f"{repo_raw!r}: {exc.message}", flush=True)
+                continue
+            if any(s.source_repo.lower() == norm.lower()
+                   for s in specs.values()):
+                continue                    # dedupe by source_repo (built-ins win)
+            label = str(entry.get("label", "") or "").strip()
+            key = norm.lower().replace("/", "--")
+            if key in specs:
+                continue
+            try:
+                specs[key] = ModelSpec(
+                    key=key,
+                    display_name=label or norm.split("/")[-1],
+                    source_repo=norm,
+                    hf_config_repo=norm,
+                    family=detect_family(norm),
+                    abliterated=("abliterated" in norm.lower()
+                                 or "uncensored" in norm.lower()),
+                )            # empty file list; live listing fills it later
+            except Exception as exc:        # never break registry construction
+                print(f"[models] could not create custom spec for {norm!r}: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
     if refresh:
         for spec in specs.values():
             spec.refresh(force=True)
@@ -1277,8 +1753,10 @@ def build_registry(refresh: bool = True) -> dict[str, ModelSpec]:
 # ---------------------------------------------------------------------------
 # Unified application configuration (export / import)
 # ---------------------------------------------------------------------------
-#: Current schema version of the single-file config bundle.
-CONFIG_VERSION = 2
+#: Current schema version of the single-file config bundle.  v3 adds the
+#: model's Hugging Face repo id and the 'custom_repos' list; v1/v2 bundles
+#: import unchanged (see import_full_config).
+CONFIG_VERSION = 3
 
 
 def export_full_config(ctx) -> dict:
@@ -1298,7 +1776,12 @@ def export_full_config(ctx) -> dict:
         "presets": presets_payload,
         "settings": ctx.settings.to_dict(),
         "storage": ctx.storage.to_dict(),
-        "model": {"key": ctx.selected_model_key, "quant": ctx.selected_quant},
+        "model": {"key": ctx.selected_model_key,
+                  "quant": ctx.selected_quant,
+                  "repo": getattr(ctx, "selected_repo_id", "")},
+        "custom_repos": [{"repo": s.source_repo, "label": s.display_name}
+                         for k, s in ctx.registry.items()
+                         if k not in BUILTIN_SPEC_KEYS],
     }
 
 
@@ -1438,11 +1921,59 @@ def import_full_config(ctx, raw: str) -> list[str]:
             warnings.append(f"invalid storage mode '{mode}' - storage left "
                             "unchanged.")
 
+    # ---- user-added HF repositories (v3) ----------------------------------
+    crepos = data.get("custom_repos")
+    if isinstance(crepos, list):
+        for entry in crepos:
+            if not isinstance(entry, dict):
+                continue
+            repo_raw = str(entry.get("repo", "")).strip()
+            label = str(entry.get("label", "") or "").strip()
+            if not repo_raw:
+                continue
+            try:
+                norm = validate_repo_id(repo_raw)
+            except AppError:
+                warnings.append(f"custom_repos: invalid repo id {repo_raw!r} - skipped.")
+                continue
+            if any(s.source_repo.lower() == norm.lower()
+                   for s in ctx.registry.values()):
+                continue                    # already known (built-in or added)
+            try:
+                spec = build_spec_from_repo(norm, label)
+            except AppError as exc:
+                warnings.append(
+                    f"custom repo '{norm}' could not be verified right now "
+                    f"({exc.message}) - it will appear once the Hub is reachable.")
+                continue
+            ctx.registry[spec.key] = spec
+
     # ---- model selection (Tab 1)
     mdl = data.get("model")
     if isinstance(mdl, dict):
         key = str(mdl.get("key", ""))
         quant = str(mdl.get("quant", ""))
+        repo_raw = str(mdl.get("repo", "") or "").strip()
+        # v3 bundles name the repository explicitly: when the key is unknown
+        # but a valid, reachable repo id accompanies it, (re)create the spec
+        # so an exported profile reproduces the exact model on another
+        # machine.  Invalid/unreachable repos only warn - never abort.
+        if key and key not in ctx.registry and repo_raw:
+            try:
+                norm = validate_repo_id(repo_raw)
+            except AppError:
+                warnings.append(f"model section carries an invalid repo id "
+                                f"{repo_raw!r} - ignored.")
+                norm = ""
+            if norm and not any(s.source_repo.lower() == norm.lower()
+                                for s in ctx.registry.values()):
+                try:
+                    added = build_spec_from_repo(norm)
+                    ctx.registry[added.key] = added
+                except AppError as exc:
+                    warnings.append(
+                        f"model repo '{norm}' could not be verified "
+                        f"({exc.message}) - model selection left unchanged.")
         if key in ctx.registry:
             ctx.selected_model_key = key
             spec = ctx.registry[key]
@@ -1453,7 +1984,7 @@ def import_full_config(ctx, raw: str) -> list[str]:
                                       else spec.quants()[0])
                 warnings.append(f"quant '{quant}' not valid for model '{key}' "
                                 f"- using '{ctx.selected_quant}'.")
-        else:
+        elif key:
             warnings.append(f"unknown model key '{key}' - model selection "
                             "left unchanged.")
     return warnings
@@ -1466,14 +1997,28 @@ def import_full_config(ctx, raw: str) -> list[str]:
 # (the import must never block on or crash because of the network).
 REGISTRY: dict[str, ModelSpec] = build_registry()
 
+#: The live AppContext once a GUI session exists.  Module-level helpers that
+#: resolve profiles by key consult ITS registry first (see below) so repos
+#: added at runtime through Tab 1 get their detected family profile instead
+#: of degrading to the neutral one.  Set from ``AppContext.__init__``; stays
+#: None in headless/test processes, which then use REGISTRY as before.
+_ACTIVE_CTX: "object | None" = None
+
+
+def _active_registry() -> dict[str, ModelSpec]:
+    """The registry key lookups should consult: the active context's when a
+    GUI session is running (it holds runtime-added custom repos), else the
+    import-time module REGISTRY."""
+    ctx = _ACTIVE_CTX
+    if ctx is not None and getattr(ctx, "registry", None):
+        return dict(ctx.registry)
+    return REGISTRY
+
 
 def _all_specs() -> list[ModelSpec]:
     """All known specs, preferring the live AppContext registry if present."""
     try:
-        import app.core.models as _m
-        ctx = getattr(_m, "_ACTIVE_CTX", None)
-        if ctx is not None and getattr(ctx, "registry", None):
-            return list(ctx.registry.values())
+        return list(_active_registry().values())
     except Exception:
         pass
     return list(REGISTRY.values())

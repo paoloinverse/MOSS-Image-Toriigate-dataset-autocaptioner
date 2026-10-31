@@ -273,128 +273,6 @@ def test_plan_prefers_companion_repo_override(tmp_path, monkeypatch):
     """MMPROJ_REPO_OVERRIDE puts the companion repo FIRST in the lookup
     order; the main repo remains as fallback candidate."""
     _install_storage(tmp_path, monkeypatch)
-    companion = "unsloth/Huihui-Qwen3.8-27B-Vision"   # distinct from main repo
-    # _FakeSpec.key == source_repo, so key the override by repo id
-    monkeypatch.setattr(M, "MMPROJ_REPO_OVERRIDE", {QWEN_REPO: companion})
-    seen = []
-
-    def fake_live(repo, quant, force_refresh=False):
-        seen.append(repo)
-        if repo == QWEN_REPO:
-            return None          # main repo publishes no projector
-        return f"mmproj-{repo.split('/')[-1]}-F16.gguf"
-
-    monkeypatch.setattr(M, "resolve_mmproj_live", fake_live)
-    needed, msg, _p = M.plan_mmproj_download(_qwen_file())
-    assert needed is True
-    assert seen[0] == companion                 # companion queried first
-    assert seen[1:] == [QWEN_REPO]              # de-duplicated, main as fallback
-    assert companion in msg                     # exact filename from it
-
-
-def test_plan_offline_falls_back_to_remembered_name(tmp_path, monkeypatch):
-    """Hub unreachable (resolve_mmproj_live -> None): a previously adopted
-    name may still be used to queue the download."""
-    _install_storage(tmp_path, monkeypatch)
-    qwen = _qwen_file()
-    qwen.mmproj_filename = "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
-    monkeypatch.setattr(M, "resolve_mmproj_live",
-                        lambda *a, **k: None)
-    needed, msg, _p = M.plan_mmproj_download(qwen)
-    assert needed is True
-    assert msg == qwen.mmproj_filename
-
-
-def test_plan_reports_unavailability_when_nothing_found(tmp_path, monkeypatch):
-    """No local file, no live listing, no remembered name, no bundled
-    candidates -> honest report instead of a composed guess."""
-    _install_storage(tmp_path, monkeypatch)
-    qwen = _qwen_file()
-    monkeypatch.setattr(M, "resolve_mmproj_live",
-                        lambda *a, **k: None)
-    needed, msg, path = M.plan_mmproj_download(qwen)
-    assert needed is False and path is None
-    assert "unavailable" in msg and QWEN_REPO in msg
-
-
-def test_ensure_mmproj_downloaded_success(tmp_path, monkeypatch):
-    _install_storage(tmp_path, monkeypatch)
-    qwen = _qwen_file()
-    monkeypatch.setattr(M, "resolve_mmproj_live",
-                        lambda *a, **k: "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf")
-    got_dir = (tmp_path / "big_models_cache_huggingface" / "unsloth"
-               / QWEN_REPO.replace("/", "--"))
-    made = got_dir / "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
-
-    def fake_dl(repo, files):
-        assert repo == QWEN_REPO and files == \
-            ["mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"]
-        made.write_bytes(b"x" * 2048)
-        return [made]
-
-    monkeypatch.setattr(M, "download_model_files", fake_dl)
-    logs = []
-    ok, msg = M.ensure_mmproj_downloaded(qwen, log_cb=logs.append)
-    assert ok is True and "projector ready" in msg
-    assert any("[mmproj]" in l for l in logs)
-
-
-def test_ensure_mmproj_downloaded_failure_report(tmp_path, monkeypatch):
-    _install_storage(tmp_path, monkeypatch)
-    qwen = _qwen_file()
-    monkeypatch.setattr(M, "resolve_mmproj_live",
-                        lambda *a, **k: "mmproj-Qwen-F16.gguf")
-
-    def boom(repo, files):
-        raise M.AppError("File or repository not found on the Hub",
-                         detail="404 Client Error",
-                         suggestions=["verify filenames in the registry"])
-
-    monkeypatch.setattr(M, "download_model_files", boom)
-    ok, msg = M.ensure_mmproj_downloaded(qwen)
-    assert ok is False
-    assert "not found" in msg.lower() and "404" in msg
-
-
-# --------------------------------------------------------------------------
-# 5. plan_mmproj_download - unified discovery pipeline (both tabs)
-#    local cache -> live main-repo listing -> companion repo -> offline
-# --------------------------------------------------------------------------
-def test_plan_reuses_cached_local_projector(tmp_path, monkeypatch):
-    """ToriiGate-style: cached same-repo mmproj -> no download needed."""
-    _install_storage(tmp_path, monkeypatch)
-    monkeypatch.setattr(M, "resolve_mmproj_live",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("must not hit the network")))
-    needed, msg, path = M.plan_mmproj_download(_torii_file())
-    assert needed is False
-    assert path is not None and path.name == "ToriiGate-0.5-Q8_0.mmproj.gguf"
-    assert "re-using cached projector" in msg
-
-
-def test_plan_discovers_qwen_style_name_from_live_listing(tmp_path, monkeypatch):
-    """Qwen-style 'mmproj-*.gguf' names come verbatim from the live Hub
-    listing - never composed locally - and are adopted onto the ModelFile."""
-    _install_storage(tmp_path, monkeypatch)
-    qwen = _qwen_file()
-    seen = []
-
-    def fake_live(repo, quant, force_refresh=False):
-        seen.append(repo)
-        return "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
-
-    monkeypatch.setattr(M, "resolve_mmproj_live", fake_live)
-    needed, msg, path = M.plan_mmproj_download(qwen)
-    assert needed is True and path is None
-    assert msg == "mmproj-Huihui-Qwen3.8-27B-abliterated-F16.gguf"
-    assert qwen.mmproj_filename == msg          # adopted for verify/preflight
-    assert seen == [QWEN_REPO]                  # main repo tried first
-
-
-def test_plan_prefers_companion_repo_override(tmp_path, monkeypatch):
-    """MMPROJ_REPO_OVERRIDE puts the companion repo FIRST in the lookup
-    order; the main repo remains as fallback candidate."""
-    _install_storage(tmp_path, monkeypatch)
     companion = "unsloth/Huihui-Qwen3.8-27B-Vision"
     # _FakeSpec.key == source_repo, so key the override by repo id
     monkeypatch.setattr(M, "MMPROJ_REPO_OVERRIDE", {QWEN_REPO: companion})
@@ -408,7 +286,7 @@ def test_plan_prefers_companion_repo_override(tmp_path, monkeypatch):
     needed, msg, _p = M.plan_mmproj_download(_qwen_file())
     assert needed is True
     assert seen[0] == companion                 # companion queried first
-    assert companion in msg                     # exact filename from it
+    assert msg == "mmproj-Huihui-Qwen3.8-27B-Vision-F16.gguf"   # its exact Hub name (msg is a FILENAME by contract, not a repo id)
 
 
 def test_plan_offline_falls_back_to_remembered_name(tmp_path, monkeypatch):
@@ -473,6 +351,60 @@ def test_ensure_mmproj_downloaded_failure_report(tmp_path, monkeypatch):
     ok, msg = M.ensure_mmproj_downloaded(qwen)
     assert ok is False
     assert "not found" in msg.lower() and "404" in msg
+
+
+
+# --------------------------------------------------------------------------
+# custom-style repo id (plan section 6 case 7 / M4): scoping must hold for
+# ANY org/name added from Tab 1 - not just the two built-in repos
+# --------------------------------------------------------------------------
+CUSTOM_REPO = "Acme/Glass-VLM-GGUF"
+
+
+def test_custom_repo_projector_scoping(tmp_path, monkeypatch):
+    """A user-added arbitrary repo picks up a projector only when it sits in
+    THAT repo's folder; text-only custom repos never leak someone else's."""
+    root = tmp_path / "big_models_cache_huggingface" / "unsloth"
+    custom_dir = root / CUSTOM_REPO.replace("/", "--")
+    _write_gguf(custom_dir / "GlassVLM-Q8_0.gguf", "qwen2vl")
+    _write_gguf(custom_dir / "mmproj-GlassVLM-Q8_0.gguf", "qwen2vl")
+    # the well-known foreign projector in the same tree must stay out of scope:
+    torii_dir = root / TORII_REPO.replace("/", "--")
+    _write_gguf(torii_dir / "ToriiGate-0.5-Q8_0.gguf", "qwen2vl")
+    _write_gguf(torii_dir / "ToriiGate-0.5-Q8_0.mmproj.gguf", "qwen2vl")
+
+    monkeypatch.setattr(M, "STORAGE", M.StorageManager(mode=M.STORAGE_UNSLOTH,
+                                                       unsloth_root=str(root)))
+    monkeypatch.setattr(M, "_all_specs", lambda: [
+        _FakeSpec(CUSTOM_REPO), _FakeSpec(TORII_REPO)])
+
+    # the generic plumbing resolves arbitrary custom repo ids too ...
+    assert M.spec_for_repo(CUSTOM_REPO) is not None
+    assert M.spec_for_repo("Nope/Nobody") is None
+
+    f = M.ModelFile(filename="GlassVLM-Q8_0.gguf", quant="Q8_0",
+                    repo_id=CUSTOM_REPO)
+    path, name = f.resolve_mmproj_companion()
+    assert path == (custom_dir / "mmproj-GlassVLM-Q8_0.gguf"), \
+        f"custom-repo projector must come from its own folder: {path}"
+
+    # text-only custom repo: no local projector -> nothing foreign leaks in,
+    # and the companion lookup performs NO network discovery of its own.
+    other = "Beta/TextOnly-Model-GGUF"
+    (root / other.replace("/", "--")).mkdir(parents=True)
+    o_f = M.ModelFile(filename="TextOnly-Q8_0.gguf", quant="Q8_0", repo_id=other)
+    calls = []
+
+    def _deny_live(*a, **k):
+        calls.append((a, k))
+        return None
+
+    monkeypatch.setattr(M, "resolve_mmproj_live", _deny_live)
+    o_path, o_name = o_f.resolve_mmproj_companion()
+    assert o_path is None and not calls, \
+        f"companion lookup must stay local: path={o_path} live_calls={calls}"
+    if o_name:
+        assert "toriigate" not in o_name.lower().replace("-", "")
 
 
 if __name__ == "__main__":

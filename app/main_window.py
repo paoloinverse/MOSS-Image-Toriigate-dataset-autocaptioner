@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QMainWindow, QSplitter, QTabWidget)
+from PySide6.QtWidgets import (QMainWindow, QScrollArea, QSplitter,
+                               QTabWidget)
 
 from app import APP_NAME, __version__
 from app.context import AppContext
@@ -20,9 +21,9 @@ class MainWindow(QMainWindow):
         self.ctx = ctx
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
         self.resize(1500, 900)
+        self.setMinimumSize(960, 640)          # enforce a minimum window size
 
         splitter = QSplitter(Qt.Horizontal)
-        self.setCentralWidget(splitter)
 
         # ---- tabs -------------------------------------------------------------
         self.tabs = QTabWidget()
@@ -44,6 +45,14 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([1100, 400])
+
+        # ---- vertical scroll wrapper ----------------------------------------
+        scroll = QScrollArea()
+        scroll.setWidget(splitter)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setCentralWidget(scroll)
 
         # Focus changes in the explorer drive the side panel.
         ctx.image_focused.connect(self.side_panel.set_image)

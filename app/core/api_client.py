@@ -149,7 +149,16 @@ def image_to_data_url(path: str) -> str:
 
 def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
                   max_tokens: int | None = None,
-                  settings=None) -> dict:
+                  settings=None, model_key: str | None = None) -> dict:
+    """Build the /v1/chat/completions payload (see module docstring).
+
+    ``model_key`` is the resolved registry key of the run target (Tab 2's
+    explicit override or the Tab 1 selection in follow mode).  It drives the
+    family gate below: profiles with ``supports_reasoning_kwargs=False``
+    (GLM5.3, generic/unknown custom repos) get a plain sampling-only payload.
+    Empty keys keep the legacy full Qwen-family behaviour for headless and
+    pre-gating callers (see tests/test_smoke.py::test_payload).
+    """
     params: GenerationParams = preset.params
     # Tab 2 live settings win over the preset when provided (AppContext's
     # InferenceSettings); this keeps server-side --reasoning-budget and the
@@ -217,6 +226,18 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
     # llama-server accepts sampling extras at top level of the request body.
     payload["top_k"] = int(getattr(settings, "top_k", params.top_k))
     payload["min_p"] = float(getattr(settings, "min_p", params.min_p))
+
+    # ---- family gate (generalized model support, plan §4.5) --------------
+    # Non-Qwen families must NOT receive Qwen-only extras: sending
+    # enable_thinking / reasoning_effort / preserve_thinking into a foreign
+    # Jinja chat template is at best silently ignored and at worst a hard
+    # error.  Empty/legacy keys resolve to the neutral profile whose flag
+    # defaults to True, so headless callers keep today's payload exactly.
+    from app.core.models import get_model_profile
+    _key = model_key or getattr(settings, "run_model_key", "") or ""
+    if not get_model_profile(_key).supports_reasoning_kwargs:
+        return payload                     # plain sampling payload only
+
     # ---- Qwen3.8-family reasoning block ----------------------------------
     # chat_template_kwargs reaches the Jinja template only when the server
     # runs with --jinja (see server.build_args / llamacpp.probe_capabilities).
@@ -266,8 +287,13 @@ class CaptionClient:
     async def caption(self, image_path: str, preset: CaptionPreset,
                       system_prompt: str, on_chunk: ChunkCb = None,
                       cancel_event=None, settings=None,
+                      model_key: str | None = None,
                       log_cb: LogCb = None) -> str:
         """Stream a chat completion and return the full assistant text.
+
+        ``model_key`` is the resolved registry key of the run target; it gates
+        family-specific payload extras (models with
+        ``supports_reasoning_kwargs=False`` get sampling-only payloads).
 
         ``on_chunk(text)`` receives each delta for live GUI log tailing.
         ``cancel_event`` (threading.Event/asyncio-friendly bool check) allows
@@ -284,7 +310,7 @@ class CaptionClient:
             log_cb = None    # stay completely quiet unless asked
         url = f"{self.base_url}/v1/chat/completions"
         payload = build_payload(image_path, preset, system_prompt,
-                                settings=settings)
+                                settings=settings, model_key=model_key)
 
         # ---- verbose: dump the exact conversation being sent ----------------
         _emit(log_cb, f"[llama] >>> POST {url}  "

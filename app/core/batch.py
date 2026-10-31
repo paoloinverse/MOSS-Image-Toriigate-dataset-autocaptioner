@@ -42,7 +42,8 @@ class BatchWorker(QThread):
 
     def __init__(self, base_url: str, preset: CaptionPreset,
                  system_prompt: str, images: list[str], parent=None,
-                 settings=None, verbose: bool = False, api_key: str = ""):
+                 settings=None, verbose: bool = False, api_key: str = "",
+                 model_key: str | None = None):
         super().__init__(parent)
         self.base_url = base_url
         self.preset = preset
@@ -51,6 +52,9 @@ class BatchWorker(QThread):
         # Live Tab 2 InferenceSettings (temperature/top_k/... + thinking
         # budget); None keeps the pure preset behaviour.
         self.settings = settings
+        # Resolved run-target registry key at start time: gates family-
+        # specific payload extras in api_client.build_payload (plan §4.5).
+        self.model_key = model_key or ""
         # Bearer token from the Tab 2 'API Key:' field ('' -> env fallback).
         self.api_key = api_key or ""
         # Verbose llama-server conversation logging: full prompts sent,
@@ -95,6 +99,7 @@ class BatchWorker(QThread):
                     img, self.preset, self.system_prompt,
                     on_chunk=on_chunk, cancel_event=self.cancel_event,
                     settings=self.settings,
+                    model_key=self.model_key or None,
                     log_cb=on_log if self.verbose else None)
                 if self.cancel_event.is_set():
                     break

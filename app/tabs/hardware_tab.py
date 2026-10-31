@@ -15,15 +15,16 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QProgressBar, QPushButton, QSlider,
-                               QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMessageBox, QProgressBar,
+                               QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from app.core.hardware import GPUInfo, HardwareManager
-from app.core.models import (AppError, STORAGE_DEFAULT, STORAGE_UNSLOTH,
-                             ModelFile, StorageLocationError,
+from app.core.models import (AppError, BUILTIN_SPEC_KEYS, STORAGE_DEFAULT,
+                             STORAGE_UNSLOTH, ModelFile, StorageLocationError,
                              download_model_files, estimate_download_mb,
-                             plan_mmproj_download, verify_downloaded)
+                             plan_mmproj_download, validate_repo_id,
+                             verify_downloaded)
 from app.context import AppContext
 
 
@@ -55,6 +56,49 @@ class RepoRefreshWorker(QThread):
             msg = self.spec.last_refresh_error or \
                 "live listing unavailable - kept previously known files."
             self.done.emit(False, msg)
+
+
+class RepoVerifyWorker(QThread):
+    """Pre-add verification that a repo publishes >= 1 main GGUF (off GUI thread).
+
+    Runs the same listing pipeline as :func:`build_spec_from_repo` so the Add
+    flow can confirm reachability, access rights and GGUF presence BEFORE any
+    registry entry is committed.  Errors surface as the standard verbose
+    AppError reports (gated/private repos already carry the 'hf auth login /
+    HF_TOKEN' remediation from :meth:`AppError.classify`).
+    """
+    done = Signal(bool, str)          # ok, message-or-verbose-report
+    log = Signal(str)
+
+    def __init__(self, repo_id: str, parent=None):
+        super().__init__(parent)
+        self.repo_id = repo_id
+
+    def run(self):
+        from app.core.models import _lookup_entry, discover_repo_ggufs
+        try:
+            self.log.emit(f"[models] verifying '{self.repo_id}': listing files "
+                          "on the Hub ...")
+            _lookup_entry(self.repo_id)              # existence + access check
+            ggufs = discover_repo_ggufs(self.repo_id)   # cached; [] == no GGUFs
+        except AppError as exc:
+            self.done.emit(False, exc.report())      # already a verbose report
+            return
+        except Exception as exc:                     # never crash the worker thread
+            err = AppError.classify(exc, context=f"verifying repo '{self.repo_id}'")
+            self.done.emit(False, err.report())
+            return
+        if not ggufs:
+            self.done.emit(False,
+                           f"[models] ERROR: repository '{self.repo_id}' exists "
+                           "but contains no *.gguf files.\n"
+                           "    reason : safetensors-only (or dataset/empty) repos "
+                           "are not supported - this app runs GGUFs via llama-server\n"
+                           "    fix    : pick a repo that publishes .gguf "
+                           "quantizations.")
+            return
+        self.done.emit(True, f"{self.repo_id}: {len(ggufs)} GGUF file(s) found - "
+                             "ready to add.")
 
 
 class DownloadWorker(QThread):
@@ -135,6 +179,7 @@ class HardwareModelsTab(QWidget):
         self.hw: HardwareManager = ctx.hw
         self._gpu_rows: dict[int, GpuRow] = {}
         self._worker: DownloadWorker | None = None
+        self._verify_worker: RepoVerifyWorker | None = None
 
         root = QVBoxLayout(self)
 
@@ -166,8 +211,8 @@ class HardwareModelsTab(QWidget):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Model:"))
         self.model_combo = QComboBox()
-        for spec in ctx.registry.values():
-            self.model_combo.addItem(spec.display_name, spec.key)
+        for key, spec in ctx.registry.items():      # built-ins first (insertion order)
+            self.model_combo.addItem(self._model_combo_text(key, spec), key)
         row1.addWidget(self.model_combo, stretch=1)
         ml.addLayout(row1)
 
@@ -184,6 +229,43 @@ class HardwareModelsTab(QWidget):
             "lowercase '-bf16.gguf') are picked up automatically.")
         row2.addWidget(self.refresh_models_btn)
         ml.addLayout(row2)
+
+        # ---- Custom Hugging Face repositories -------------------------------
+        custom_box = QGroupBox("Custom Hugging Face repositories")
+        cl = QVBoxLayout(custom_box)
+        crow1 = QHBoxLayout()
+        self.custom_repo_edit = QLineEdit()
+        self.custom_repo_edit.setPlaceholderText("org/model-name-gguf")
+        self.custom_repo_edit.setToolTip(
+            "Any public Hugging Face repository that publishes GGUF files, e.g.\n"
+            "'DraconicDragon/ToriiGate-0.5-GGUF'.  Quantizations are discovered\n"
+            "live from the Hub - nothing is allow-listed locally.")
+        crow1.addWidget(self.custom_repo_edit, stretch=1)
+        self.add_custom_btn = QPushButton("Add model")
+        self.add_custom_btn.setToolTip(
+            "Verifies that the repo publishes at least one main *.gguf file on a\n"
+            "background thread, then adds it to the Model dropdown above (quants\n"
+            "listed live) and persists it across restarts.")
+        crow1.addWidget(self.add_custom_btn)
+        cl.addLayout(crow1)
+
+        self.custom_list = QListWidget()
+        self.custom_list.setMaximumHeight(96)
+        self.custom_list.setToolTip(
+            "User-added repositories (display label — org/name).")
+        cl.addWidget(self.custom_list)
+
+        crow2 = QHBoxLayout()
+        self.remove_custom_btn = QPushButton("Remove selected repo")
+        self.remove_custom_btn.setEnabled(False)
+        self.remove_custom_btn.setToolTip(
+            "Removes the highlighted repository from this app's registry.\n"
+            "Downloaded files are NOT deleted.  Refused while that model is the\n"
+            "current selection or the Tab 2 run target (switch away first).")
+        crow2.addWidget(self.remove_custom_btn)
+        crow2.addStretch(1)
+        cl.addLayout(crow2)
+        ml.addWidget(custom_box)
 
         self.mmproj_label = QLabel("mmproj: —")
         self.mmproj_label.setWordWrap(True)
@@ -219,6 +301,17 @@ class HardwareModelsTab(QWidget):
         self.apply_storage_btn = QPushButton("Apply storage location")
         sl.addWidget(self.apply_storage_btn)
 
+        # ---- complete, scrollable list of downloaded model files ----------
+        self.downloaded_label = QLabel("")
+        self.downloaded_label.setStyleSheet("color: gray;")
+        sl.addWidget(self.downloaded_label)
+        self.downloaded_list = QListWidget()
+        self.downloaded_list.setMinimumHeight(180)
+        self.downloaded_list.setToolTip(
+            "Complete, scrollable list of every GGUF file currently present "
+            "in the selected storage location (repository · quantization · size).")
+        sl.addWidget(self.downloaded_list)
+
         row3 = QHBoxLayout()
         self.download_btn = QPushButton("Download & Verify")
         self.dl_bar = QProgressBar()
@@ -240,6 +333,9 @@ class HardwareModelsTab(QWidget):
         self.hw.ram_updated.connect(self.on_ram_updated)
         self.model_combo.currentIndexChanged.connect(self.refresh_quants)
         self.quant_combo.currentIndexChanged.connect(self.refresh_mmproj_label)
+        self.custom_list.itemSelectionChanged.connect(self._sync_remove_btn)
+        self.add_custom_btn.clicked.connect(self._on_add_custom_repo)
+        self.remove_custom_btn.clicked.connect(self._on_remove_custom_repo)
         self.download_btn.clicked.connect(self.start_download)
         self.refresh_models_btn.clicked.connect(self.refresh_from_hub)
         self.storage_combo.currentIndexChanged.connect(self._update_storage_widgets)
@@ -253,6 +349,8 @@ class HardwareModelsTab(QWidget):
         self._update_storage_widgets()
         self.refresh_storage_ui()
         self.refresh_quants()
+        self._refresh_custom_list()
+        self._sync_model_tooltip()
         # Late-bound live listing: if start-up fell back to the seed files
         # (offline), pull the real Hub filenames now without blocking the UI.
         for spec in self.ctx.registry.values():
@@ -325,7 +423,10 @@ class HardwareModelsTab(QWidget):
         key = self.model_combo.currentData()
         self.ctx.selected_model_key = key
         spec = self.ctx.registry[key]
-        prev_q = self.quant_combo.currentText()
+        # Data (the quant TAG), never the display text: 'Q4_K_P  [file.gguf]'
+        # can never match a tag, so restoring from currentText() used to reset
+        # the selection to the topmost quant on every re-population.
+        prev_q = self.quant_combo.currentData() or ""
         self.quant_combo.blockSignals(True)
         self.quant_combo.clear()
         for f in spec.files:
@@ -340,9 +441,10 @@ class HardwareModelsTab(QWidget):
                              if q.upper().replace("_", "-") == "Q8-0")
         elif spec.quants():
             default_q = spec.quants()[0]
-        idx = self.quant_combo.findText(default_q) \
-            if default_q else -1
-        if idx < 0:
+        # Data-based lookup only: findText() substring-matches the display
+        # text ('Q8_0' would hit any entry whose filename contains it).
+        idx = -1
+        if default_q:
             for i in range(self.quant_combo.count()):
                 if self.quant_combo.itemData(i) == default_q:
                     idx = i
@@ -389,6 +491,143 @@ class HardwareModelsTab(QWidget):
             self.refresh_quants()
         else:
             self.ctx.model_changed.emit()
+
+    # -------------------------------------------------- model combo management
+    @staticmethod
+    def _model_combo_text(key: str, spec) -> str:
+        """Built-ins keep curated names; custom repos append 'org/name' so two
+        models with similar labels stay tellable apart in the dropdown."""
+        if key in BUILTIN_SPEC_KEYS:
+            return spec.display_name
+        return f"{spec.display_name}  ({spec.source_repo})"
+
+    def _populate_model_combo(self, select_key: str | None = None):
+        """Rebuild the Model dropdown from the live registry.
+
+        Insertion order is built-ins first (the registry merge guarantees it),
+        then user-added repos.  Data stays ``spec.key`` so :meth:`refresh_quants`
+        and every downstream widget work unchanged for any repo id.
+        """
+        prev = self.model_combo.currentData() or ""
+        want = select_key if select_key is not None \
+               else (prev if prev in self.ctx.registry else "")
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for key, spec in self.ctx.registry.items():
+            self.model_combo.addItem(self._model_combo_text(key, spec), key)
+        idx = self.model_combo.findData(want)
+        self.model_combo.setCurrentIndex(max(0, idx))
+        self.model_combo.blockSignals(False)
+        self.ctx.selected_model_key = self.model_combo.currentData() or ""
+        self.refresh_quants()
+        self._sync_model_tooltip()
+
+    def _sync_model_tooltip(self):
+        spec = self.ctx.registry.get(self.model_combo.currentData() or "")
+        if spec is not None:
+            fam = getattr(spec, "family", "?")
+            self.model_combo.setToolTip(
+                f"Repository : {spec.source_repo}\nDetected family: {fam}")
+        else:
+            self.model_combo.clearToolTip()
+
+    def refresh_from_context(self):
+        """Re-hydrate this tab from the context (called by MainWindow after a
+        startup-config import and by Tab 3's Import Config - both can add new
+        repos or change the selection while this tab is alive)."""
+        key = self.ctx.selected_model_key \
+              if self.ctx.selected_model_key in self.ctx.registry \
+              else next(iter(self.ctx.registry), "")
+        self._populate_model_combo(select_key=key)
+        self.refresh_storage_ui()
+
+    # ------------------------------------------- custom repo management (Tab 1)
+
+    def _refresh_custom_list(self, select_key: str | None = None):
+        """Re-render the user-added-repos list; built-ins never appear here."""
+        self.custom_list.blockSignals(True)
+        self.custom_list.clear()
+        for key, spec in self.ctx.registry.items():
+            if key in BUILTIN_SPEC_KEYS:
+                continue
+            item = QListWidgetItem(f"{spec.display_name}  —  {spec.source_repo}")
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setToolTip(spec.source_repo)
+            self.custom_list.addItem(item)
+            if select_key is not None and key == select_key:
+                self.custom_list.setCurrentItem(item)
+        self.custom_list.blockSignals(False)
+
+    def _sync_remove_btn(self):
+        self.remove_custom_btn.setEnabled(
+            self.custom_list.currentItem() is not None)
+
+    def _on_add_custom_repo(self):
+        """Add flow (plan §4.3): client-side format check -> dedupe against
+        every known spec (built-ins included: select instead of adding) ->
+        background verification worker confirms >= 1 main GGUF on the Hub ->
+        ctx.add_custom_repo commits, persists and notifies Tab 2."""
+        raw = self.custom_repo_edit.text()
+        try:
+            rid = validate_repo_id(raw)
+        except AppError as exc:
+            self.ctx.report_error(exc, context="validating repository id",
+                                  dialog=True)
+            return
+        if self._verify_worker is not None and self._verify_worker.isRunning():
+            self.status_label.setText("Already verifying a repository - wait "
+                                      "for it to finish.")
+            return
+        for key, s in self.ctx.registry.items():
+            if s.source_repo.lower() == rid.lower():
+                self._populate_model_combo(select_key=key)
+                self.status_label.setText(f"'{rid}' is already available - "
+                                          f"it is now selected ({key}).")
+                return
+        w = RepoVerifyWorker(rid, self)
+        w.log.connect(self.ctx.log.emit)
+        w.done.connect(lambda ok, msg, r=rid: self._on_repo_verified(ok, msg, r))
+        self._verify_worker = w
+        self.add_custom_btn.setEnabled(False)
+        self.add_custom_btn.setText("Verifying…")
+        self.custom_repo_edit.setEnabled(False)
+        self.status_label.setText(f"Verifying '{rid}' against the Hub …")
+        w.start()
+
+    def _on_repo_verified(self, ok: bool, msg: str, repo_id: str):
+        self.add_custom_btn.setEnabled(True)
+        self.add_custom_btn.setText("Add model")
+        self.custom_repo_edit.setEnabled(True)
+        if not ok:
+            self.ctx.log.emit(msg if "[models]" in msg else f"[models] {msg}")
+            self.status_label.setText(
+                "Repository could not be verified - see Log (Tab 5).")
+            # Gated/private repos already carry the 'hf auth login / HF_TOKEN'
+            # hint; no-GGUF and network failures their own remediation lines.
+            self.ctx.report_error(msg, context=f"verifying custom repo "
+                                 f"'{repo_id}'", dialog=True)
+            return
+        spec = self.ctx.add_custom_repo(repo_id, label="")
+        if spec is None:                # add_custom_repo reported the problem
+            return
+        self.custom_repo_edit.clear()
+        self._refresh_custom_list(select_key=spec.key)
+        self._populate_model_combo(select_key=spec.key)
+        self.status_label.setText(
+            f"Added '{repo_id}' (family {getattr(spec, 'family', '?')}) - "
+            f"{len(spec.files)} GGUF file(s), ready to Download & Verify.")
+
+    def _on_remove_custom_repo(self):
+        item = self.custom_list.currentItem()
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        # ctx.remove_custom_repo enforces the selection/run-target/built-in
+        # rules and logs the refusal reason; it never deletes downloaded files.
+        if not self.ctx.remove_custom_repo(key):
+            return
+        self._refresh_custom_list()
+        self._populate_model_combo(select_key=None)
 
     def current_file(self):
         spec = self.ctx.active_model_spec
@@ -511,6 +750,51 @@ class HardwareModelsTab(QWidget):
         self.unsloth_path_edit.blockSignals(False)
         self._update_storage_widgets()
         self._preview_storage(self.ctx.storage.mode, self.ctx.storage.unsloth_root)
+        self.refresh_downloaded_list()
+
+    def refresh_downloaded_list(self):
+        """Fill the scrollable list with every GGUF in the active storage.
+
+        Called from :meth:`refresh_storage_ui`, i.e. on start-up, whenever the
+        storage location changes, and after 'Apply storage location' - so the
+        list always reflects the folder the app is actually using.
+        """
+        from app.core.models import STORAGE
+        try:
+            entries = STORAGE.list_downloaded()
+        except Exception as exc:
+            self.ctx.report_error(exc, context="listing downloaded model files",
+                                  dialog=False)
+            entries = []
+        self.downloaded_list.clear()
+        if not entries:
+            item = QListWidgetItem("(no GGUF files found in this location yet)")
+            item.setForeground(Qt.GlobalColor.gray)
+            self.downloaded_list.addItem(item)
+            self.downloaded_label.setText(
+                "Downloaded model files in this location: 0")
+            return
+        for e in entries:
+            mm = "  [mmproj]" if "mmproj" in e["filename"].lower() else ""
+            text = (f"{e['repo']}   ·   {e['quant']}{mm}   ·   "
+                    f"{self._human_size(e['size_bytes'])}")
+            item = QListWidgetItem(text)
+            item.setToolTip(f"{e['filename']}\n{e['path']}")
+            self.downloaded_list.addItem(item)
+        total = sum(e["size_bytes"] for e in entries)
+        self.downloaded_label.setText(
+            f"Downloaded model files in this location: {len(entries)}  "
+            f"({self._human_size(total)} total)")
+
+    @staticmethod
+    def _human_size(num_bytes) -> str:
+        """Human-readable byte count (B / KiB / MiB / GiB / TiB)."""
+        n = float(num_bytes or 0)
+        for unit in ("B", "KiB", "MiB", "GiB"):
+            if n < 1024.0:
+                return f"{int(n)} B" if unit == "B" else f"{n:.2f} {unit}"
+            n /= 1024.0
+        return f"{n:.2f} TiB"
 
     def apply_storage(self):
         mode = self.storage_combo.currentData()

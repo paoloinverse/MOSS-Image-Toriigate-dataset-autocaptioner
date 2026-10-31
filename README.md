@@ -1,6 +1,16 @@
 # MOSS-Image-Toriigate-dataset-autocaptioner
 
-Dataset auto-captioner for MOSS-Image, using the Minthy/ToriiGate-0.5 model (and Qwen3.8-27B as an alternate) for captioning. Manages local [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` instances with multi-GPU support, dynamic KV-cache sizing, and specialized captioning presets (MOSS-Image JSON schema, Booru/Danbooru tags).
+Dataset auto-captioner for MOSS-Image. Ships with two built-in models -
+Minthy/ToriiGate-0.5 and Huihui-Qwen3.8-27B-abliterated - and accepts **any
+public Hugging Face GGUF repository** added from Tab 1: quantizations are
+discovered live from the Hub (no allow-lists), so renamed or newly uploaded
+files keep working. Family-aware defaults kick in automatically - Qwen3.5 /
+3.6 / 3.8 (+Flash-Next) repos get full thinking-level and `reasoning_effort`
+controls, GLM5.3 runs conservatively without foreign-template kwargs, and
+unknown families fall back to a neutral profile with manual sampling only.
+Manages local [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`
+instances with multi-GPU support, dynamic KV-cache sizing, and specialized
+captioning presets (MOSS-Image JSON schema, Booru/Danbooru tags).
 
 ## Requirements
 
@@ -88,6 +98,41 @@ Afterwards just start the app again with `./run.sh`.
 | **Batch Processing** | Select folders/images, Start Auto-Caption / Stop / Save All, **Batch Save Extant Captions** (re-saves every existing sidecar of the checked images in the active preset's format — MOSS JSON → `.json`, tags → cleaned `.txt` — no server round-trip; images without a caption are skipped), progress bar + live `llama-server` log; clicking anywhere on an image row toggles its checkbox; **"Verbose conversation log"** checkbox dumps the full llama-server exchange into the Log Output: every prompt sent (system + user text, base64 images shown as size placeholders), streamed answer deltas, thinking/reasoning output (`delta.reasoning_content`) tagged `[thinking]`, raw SSE chunks, finish reason and token usage — all prefixed with `[llama]` |
 
 The **global side panel** always shows the focused image's caption editor (loads existing `.txt`/`.json` captions) with a manual "Save Caption" button.
+
+### Adding your own model (Tab 1)
+
+Besides the two built-ins, Tab 1's **Custom repositories** group accepts any
+public Hugging Face repository id (`org/name`):
+
+- paste `org/name` - a bare `huggingface.co/org/name` URL is stripped and
+  accepted; branch/tag syntax and extra path segments are rejected with a
+  "did you mean" hint pointing at the plausible repo id;
+- the app lists the repository **live** and offers every published main GGUF
+  verbatim (no quant allow-lists), so renamed or newly uploaded files keep
+  working instead of 404-ing mid-download;
+- repos that publish only safetensors (or nothing usable) are refused at Add
+  time with a clear report, keeping the registry clean;
+- re-pasting an already-known repo (built-in included) dedupes into selecting
+  it. Removal is possible any time except while the model is selected in Tab 1
+  or pinned as Tab 2's explicit run target - and downloaded files are never
+  deleted by removal.
+
+Family defaults are **auto-detected from the repository id** (the repo's
+`config.json` `model_type` serves as a hint for uninformative names):
+
+| family | detection | out-of-the-box behaviour |
+| --- | --- | --- |
+| Qwen3.5 / 3.6 / 3.8 (+ Flash-Next) | name heuristic (Flash/Next checked before plain 3.8) | full thinking-level combo + `reasoning_effort` per-request kwargs, T0.6 sampling |
+| GLM5.3 | name heuristic or config hint | conservative sampling (T0.7 / k40), **no** Qwen-only payload extras, thinking combo disabled |
+| anything else | - | neutral profile: model downloads and runs end-to-end with your manual temperature/top-p settings |
+
+*(Initial per-family defaults are marked "verify" in the source until confirmed against each family's model card / chat template; they degrade gracefully either way.)*
+
+**Gated or private repos:** listing and downloading require credentials - run
+`hf auth login` once (or export `HF_TOKEN`). The app classifies 401/403 into a
+"Repository access denied (gated/private repo)" report containing exactly those steps, and never half-registers an inaccessible repository.
+
+Custom model selections persist across restarts (`app_settings.json`) and round-trip through the unified Export/Import config: v3 bundles carry `model.repo` plus the full `custom_repos` list, so a profile exported on one machine reproduces the exact custom model on another.
 
 ### Startup configuration override (`captioner_config.json`)
 

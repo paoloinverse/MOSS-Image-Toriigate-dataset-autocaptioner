@@ -107,10 +107,17 @@ class PresetsTab(QWidget):
         self.ctx.explicit_mode = checked
         spec = self.ctx.active_model_spec
         if checked and not spec.abliterated:
+            # Name whichever registered model actually is abliterated (built-in
+            # or a user-added repo detected by the 'abliterated'/'uncensored'
+            # filename/repo-id heuristic) instead of hardcoding Qwen3.8-27B.
+            abl = next((s for s in self.ctx.registry.values() if s.abliterated),
+                       None)
+            hint = (f"switch to {abl.display_name} for uncensored captions."
+                    if abl else
+                    "select an abliterated build for uncensored captions.")
             self.ctx.log.emit(
                 f"[presets] Explicit mode ON but '{spec.display_name}' is not an "
-                "abliterated build - trigger injection skipped; switch to "
-                "Qwen3.8-27B-abliterated for uncensored captions.")
+                f"abliterated build - trigger injection skipped; {hint}")
         else:
             self.ctx.log.emit(f"[presets] Explicit mode {'enabled' if checked else 'disabled'}")
         self.ctx.preset_changed.emit()
