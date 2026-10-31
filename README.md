@@ -1,4 +1,7 @@
 Warning: this project was executed initially by Qwen Code, web app. Once the code base grew, I moved to local on unsloth-desktop with Qwen3.8-27b-Q8. That worked surprisingly well: albeit slowly the grunt work was finalized and the tests performed thoroughly. Unsurprisingly, I'm not fond of this result, the code is probably overengineered and in dire need of simplification. I don't have the time nor the will to do that, despite my sincere guidance with the algo and the debugging I can shamefully call this thing vibe-coded. Yet, it performs its job, which is running models for autocaptioning image datasets in a decently flexible way. Qwen3.6-27b-q8 is still the best one model for captioning and OCR. I suggest using that one. 
+
+This project was first born to test the ToriiGate-0.5 which looked like a nice alternative, lightweight model for captioning. It probably still is, but has troubles building the json output due to its small size. Plus, it has more limited world knowledge. A pity, because it is otherwise very well trained. Yet Qwen3.6-27b at the time of writing this, is superior and also beats Qwen3.8-27b at this job. I'm truly impressed. 
+
 I'm not entirely sure this app can do booru-style captioning efficiently and truthfully. I have other means to do that. This one app however looks good for the first dataset captioning stage for modern LLM-based models. That's it for October, 2026. ToDo: implement presence and penalty inference parameters. 
 
 # MOSS-Image-Toriigate-dataset-autocaptioner
