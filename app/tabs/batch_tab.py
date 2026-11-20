@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QGroupBox,
 
 from app.context import AppContext
 from app.core.batch import BatchWorker, collect_images
-from app.core.presets import load_existing_caption, save_caption
+from app.core.presets import (companion_base, load_existing_caption,
+                              save_caption)
 
 
 class _WideCheckListWidget(QListWidget):
@@ -202,7 +203,48 @@ class BatchTab(QWidget):
     def start_batch(self):
         if self._worker and self._worker.isRunning():
             return
-        if not self.ctx.server.ready:
+        ext_model = ""
+        if self.ctx.using_external_server:
+            # External server mode: no local ServerManager involved.
+            # Do a quick liveness probe before starting the batch.
+            base = self.ctx.base_url()
+            key = self.ctx.api_key()
+            self.append_log(f"[batch] probing external server {base} …")
+            try:
+                from app.core.server import probe_server
+                status, detail = probe_server(base, key, timeout=5.0)
+                if status in ("running", "running-auth"):
+                    self.append_log(f"[batch] external server OK ({status}).")
+                    # Explicit Tab 2 choice, else the single loaded model
+                    # from /v1/models, else 'default' (currently loaded).
+                    ext_model = self.ctx.resolve_external_model_id()
+                elif status == "auth-required":
+                    self.append_log(
+                        "[batch] CANNOT START: external server requires an "
+                        "API key.\n    fix  : set the API Key in Tab 2.")
+                    return
+                elif status == "auth-failed":
+                    self.append_log(
+                        "[batch] CANNOT START: external server rejected the "
+                        "configured API key.\n    fix  : verify the API Key in Tab 2.")
+                    return
+                else:
+                    self.append_log(
+                        f"[batch] CANNOT START: external server is not "
+                        f"reachable (status={status}).\n"
+                        "    fix  : check the URL and connectivity.\n"
+                        "    hint : the URL is the server BASE address, e.g.\n"
+                        "           http://192.168.1.5:8888 — '/v1' (or even\n"
+                        "           '/v1/chat/completions') is stripped\n"
+                        "           automatically, never required.\n"
+                        f"    detail: {detail}")
+                    return
+            except Exception as exc:
+                self.append_log(
+                    f"[batch] CANNOT START: probe failed: {exc}\n"
+                    "    fix  : verify the external URL in Tab 2.")
+                return
+        elif not self.ctx.server.ready:
             state = getattr(self.ctx.server, "state", None) or "stopped"
             self.append_log(
                 f"[batch] CANNOT START: llama-server is not ready (state={state}).\n"
@@ -225,10 +267,13 @@ class BatchTab(QWidget):
                              images, self, settings=self.ctx.settings,
                              verbose=bool(self.ctx.settings.verbose_logging),
                              api_key=self.ctx.api_key(),
-                             model_key=self.ctx.run_model_key)
+                             model_key=self.ctx.run_model_key,
+                             external_model=ext_model,
+                             external=self.ctx.using_external_server)
         worker.log.connect(self.append_log)
         worker.progress.connect(self.on_progress)
         worker.chunk.connect(self.on_chunk)
+        worker.image_result.connect(self._remember_result)
         worker.image_done.connect(self.on_image_done)
         worker.image_failed.connect(self.on_image_failed)
         worker.finished_all.connect(self.on_finished)
@@ -250,13 +295,19 @@ class BatchTab(QWidget):
             self.append_log("[batch] stop requested…")
 
     def save_all(self):
+        # Count existing sidecars honouring the custom load naming from Tab 2.
+        st = self.ctx.settings
+        load_suffix = getattr(st, "caption_load_suffix", "") or ""
+        load_ext = getattr(st, "caption_load_ext", "") or ""
+        keep = bool(getattr(st, "caption_keep_image_ext", False))
+        exts = [load_ext.strip().lstrip(".")] if load_ext else ["json", "txt", "md"]
         n = 0
         for i in range(self.list.count()):
             it = self.list.item(i)
             p = it.data(Qt.UserRole)
             if p:
-                base = os.path.splitext(p)[0]
-                if os.path.isfile(base + ".txt") or os.path.isfile(base + ".json"):
+                base = companion_base(p, keep) + load_suffix
+                if any(os.path.isfile(base + "." + e) for e in exts):
                     n += 1
         self.append_log(f"[batch] {n} caption file(s) present on disk for this list.")
 
@@ -276,14 +327,24 @@ class BatchTab(QWidget):
                             "rows before batch-saving captions.")
             return
         fmt = self.ctx.active_preset.output_format
+        # Honour the custom companion-file naming from Tab 2 for BOTH the
+        # existing-caption lookup and the re-save target.
+        st = self.ctx.settings
+        load_suffix = getattr(st, "caption_load_suffix", "") or ""
+        load_ext = getattr(st, "caption_load_ext", "") or ""
+        save_suffix = getattr(st, "caption_save_suffix", "") or ""
+        save_ext = getattr(st, "caption_save_ext", "") or ""
+        keep = bool(getattr(st, "caption_keep_image_ext", False))
         saved = skipped = failed = 0
         for img in images:
-            kind, text = load_existing_caption(img)
+            kind, text = load_existing_caption(img, suffix=load_suffix,
+                                               ext=load_ext, keep_image_ext=keep)
             if not kind or not text.strip():
                 skipped += 1
                 continue
             try:
-                target = save_caption(img, text, fmt)
+                target = save_caption(img, text, fmt, suffix=save_suffix,
+                                      ext=save_ext, keep_image_ext=keep)
                 saved += 1
                 self.append_log(f"[batch] saved caption -> {target}")
             except Exception as exc:      # noqa: BLE001 - keep going per-file
@@ -324,6 +385,15 @@ class BatchTab(QWidget):
             sb = self.log_view.verticalScrollBar()
             sb.setValue(sb.maximum())
 
+    def _remember_result(self, img: str, text: str):
+        """Keep the raw JSON of the latest run for the Tab 4 box overlay.
+
+        The overlay prefers this over a sidecar on disk, so boxes show up as soon
+        as an image is analysed - even when saving is off or the save naming
+        differs from the load naming.
+        """
+        self.ctx.remember_result(img, text)
+
     def on_image_done(self, img: str, caption_path: str):
         for i in range(self.list.count()):
             it = self.list.item(i)
@@ -344,6 +414,10 @@ class BatchTab(QWidget):
         self.stop_btn.setEnabled(False)
         self.append_log(f"[batch] {'completed' if completed else 'cancelled'}."
                         f" Progress bar shows successful captions only.")
+        # Refresh the side panel for the currently focused image so the
+        # freshly written caption appears immediately without re-clicking.
+        if completed and self.ctx.focused_image:
+            self.ctx.image_focused.emit(self.ctx.focused_image)
 
     def on_server_state(self, state: str):
         self.server_state_label.setText(f"server: {state}")

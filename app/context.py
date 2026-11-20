@@ -10,11 +10,15 @@ message box when ``dialog=True``.
 """
 from __future__ import annotations
 
+import os
+import re
+import threading
 import traceback
+import urllib.request
 
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from app.core.hardware import HardwareManager
 from app.core.models import (BUILTIN_SPEC_KEYS, ModelSpec, StorageManager,
@@ -31,6 +35,11 @@ class InferenceSettings:
     top_p: float = 0.95
     top_k: int = 40
     min_p: float = 0.05
+    # llama.cpp sampler penalties sent per request (build_payload).  These were
+    # never exposed before, so the server always used its own defaults; the
+    # values here mirror those defaults (0.0 / 1.1) -> unchanged behaviour.
+    presence_penalty: float = 0.0      # -1..2, default 0
+    repetition_penalty: float = 1.1    # 0..2,  default 1.1
     # Qwen3.8-family reasoning controls (Tab 2 -> api_client.build_payload):
     # ``enable_thinking`` is the master switch mapped to
     # chat_template_kwargs.enable_thinking; ``preserve_thinking`` keeps
@@ -59,11 +68,59 @@ class InferenceSettings:
                                      # the Bearer token used by this GUI's own
                                      # caption requests (Tab 4 / batch worker)
     binary: str = "llama-server"     # Tab 2 'Binary:' (autodetected / chosen)
+    external_url: str = ""           # Full base URL for an external OpenAI-
+                                     # compatible server (e.g. http://10.0.1.5:8080
+                                     # or https://api.example.com/v1).  When set,
+                                     # this takes precedence over host:port for
+                                     # all requests; no local llama-server is needed.
+    external_model: str = ""         # Tab 2 'External server model' - explicit
+                                     # /v1/models id sent as 'model'; '' = auto
+                                     # (the single loaded model, else 'default')
     run_model_key: str = ""          # Tab 2 explicit override ('' = follow Tab 1)
     run_quant: str = ""              # Tab 2 quant/filename override ('' = follow)
     verbose_logging: bool = False    # dump llama-server conversation detail
                                      # (prompts sent, answers + thinking) to
                                      # the Log Output panel
+    # Companion caption file naming (Tab 2 'Companion caption files').
+    # Each sidecar is stored as '<image_name><suffix>.<ext>' next to its
+    # image.  Load and save may use DIFFERENT names so you can read one set of
+    # files and write another.  An empty suffix means none; an empty extension
+    # means "follow the active preset's output format" ('json' for MOSS, 'txt'
+    # for tag presets) when saving, or ".json then .txt" (historical search)
+    # when loading.  All-empty defaults reproduce the original naming exactly,
+    # so existing datasets keep working unchanged.
+    caption_load_suffix: str = ""
+    caption_load_ext: str = ""
+    caption_save_suffix: str = ""
+    caption_save_ext: str = ""
+    # When True the image's own extension is KEPT in the caption file name
+    # (cat.png -> cat.png.md); when False (default) it is dropped (cat.md).
+    caption_keep_image_ext: bool = False
+    # ---- In-RAM upscaling before analysis (Tab 2 'Upscale Before Analysis') ---
+    # When enabled, each image is resized in RAM right before its request is
+    # built (Lanczos/bicubic; independent X/Y factors of 1/2/4) and the
+    # re-encoded result is embedded in the payload instead of the raw file
+    # bytes.  Source files are never modified and nothing hits the disk.
+    # Off by default -> payloads stay byte-identical to the pre-feature app.
+    upscale_enabled: bool = False
+    upscale_method: str = "lanczos"     # key into app.core.upscale.METHODS
+    upscale_scale_x: int = 2
+    upscale_scale_y: int = 2
+    # ---- Tab 4 bounding-box overlay ---------------------------------------------
+    # 'overlay_box_layout' / 'overlay_coord_scale' are keys into
+    # app.core.boxes.LAYOUTS / SCALES.  Their real home is the *preset*, so they
+    # travel inside a preset/config export; the copy here is only a restart
+    # mirror, because app_settings.json persists settings while presets are
+    # rebuilt from defaults unless a captioner_config.json was imported.
+    # Precedence: hardwired preset default -> this mirror -> imported config.
+    overlay_enabled: bool = True
+    overlay_box_layout: str = "yxyx"
+    overlay_coord_scale: str = "0-1000"
+    overlay_colour_mode: str = "vivid"   # 'vivid' (bright band) | 'raw' (md5 bytes)
+    overlay_labels: str = "none"         # 'none' | 'number' | 'text' (always-on chips)
+    #: power-user override: draw geometry even for tag/prose presets (Booru,
+    #: Markdown), whose prompts ask for none but whose JSON may carry some.
+    overlay_any_preset: bool = False
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -106,6 +163,7 @@ class AppContext(QObject):
     model_changed = Signal()            # model/quant selection changed
     preset_changed = Signal()           # active preset/explicit mode changed
     image_focused = Signal(str)         # path of focused image (Tab 4 -> panel)
+    box_clicked = Signal(str, str)      # (image path, box text) — Tab 4 overlay
     server_state = Signal(str)          # mirrored from ServerManager.state_changed
     storage_changed = Signal()          # model storage location changed (Tab 1)
     log = Signal(str)                   # global log sink (Tab 5 text box)
@@ -140,6 +198,16 @@ class AppContext(QObject):
         self.recursive: bool = True
         self.focused_image: str | None = None
         self.batch_selection: list[str] = []      # checked images (Tab 5)
+        # Raw JSON of the most recent analysis per image.  The Tab 4 overlay
+        # prefers this over a sidecar on disk, so freshly analysed images show
+        # their boxes immediately - and still show them when saving is off or the
+        # save naming differs from the load naming.
+        self.last_results: dict[str, str] = {}
+        # When each of those results was produced.  A sidecar written *after*
+        # the run (Caption Editor save, external tool, second batch) must win
+        # again, so the cache is age-aware rather than absolute (see
+        # app.core.boxes.resolve_box_source).
+        self.last_results_ts: dict[str, float] = {}
 
         # Hydrate persisted settings (storage + inference incl. binary path).
         from app.core.models import load_app_settings
@@ -186,9 +254,150 @@ class AppContext(QObject):
         self.hw.log_message.connect(self.log.emit)
         self.error_log.connect(self._on_error_log)
 
+        # ---- Periodic server/memory monitor (60 s) ------------------------
+        # Lightweight health + memory readout emitted to the GUI log every 60s
+        # while the server is ready (local) or an external URL is configured.
+        # Uses only /proc/meminfo and sysfs VRAM paths (no nvidia-smi, no
+        # subprocess).  Zero disk writes — output goes exclusively through
+        # self.log.emit() to the in-memory QPlainTextEdit widget.
+        self._monitor_timer = QTimer(self)
+        self._monitor_timer.setInterval(60_000)   # 60 s
+        self._monitor_timer.timeout.connect(self._monitor_tick)
+        self.server.state_changed.connect(self._on_monitor_server_state)
+
         # One-shot llama-server autodetection at startup (cheap --version
         # probes only; never downloads or compiles anything).
         self.autodetect_binary(silent=True)
+
+    # ------------------------------------------------------- latest-run cache
+    def remember_result(self, image_path: str, text: str) -> None:
+        """Store the newest analysis JSON for *image_path* (+ its timestamp).
+
+        The timestamp is what makes the Tab 4 overlay's in-session cache
+        self-invalidating: a sidecar written after the run wins again.
+        """
+        import time
+        self.last_results[image_path] = text
+        self.last_results_ts[image_path] = time.time()
+
+    def forget_results(self, image_path: str | None = None) -> None:
+        """Drop one image's cached result, or every one of them."""
+        if image_path is None:
+            self.last_results.clear()
+            self.last_results_ts.clear()
+        else:
+            self.last_results.pop(image_path, None)
+            self.last_results_ts.pop(image_path, None)
+
+    # ------------------------------------------------------------------ monitor
+    @staticmethod
+    def _read_sys_memory() -> str:
+        """Read system RAM from /proc/meminfo (pure file read, no subprocess)."""
+        try:
+            with open("/proc/meminfo", "r") as f:
+                info = {}
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        info[parts[0].strip()] = int(parts[1].split()[0])  # kB
+            total_gb = info.get("MemTotal", 0) / 1_048_576
+            avail_gb = info.get("MemAvailable", 0) / 1_048_576
+            used_gb = total_gb - avail_gb
+            return f"RAM {used_gb:.1f}/{total_gb:.1f}G"
+        except (OSError, ValueError, IndexError):
+            return "RAM ?"
+
+    @staticmethod
+    def _read_gpu_vram() -> str:
+        """Read GPU VRAM from sysfs (NVIDIA/AMD) — no nvidia-smi needed.
+
+        NVIDIA: /sys/class/drm/card*/device/mem_info_vram_{used,total}
+        AMD:    /sys/class/drm/card*/device/mem_info_vram_{used,total}  (amdgpu)
+        Returns a short string or '' when no GPU sysfs is available.
+        """
+        import glob
+        # Try all DRM card devices
+        for pattern in ("/sys/class/drm/card[0-9]*/device/mem_info_vram_total",
+                        "/sys/class/drm/card[0-9]*/device/vram_total"):
+            for total_path in sorted(glob.glob(pattern)):
+                used_path = total_path.replace("total", "used")
+                try:
+                    with open(total_path) as f:
+                        total_b = int(f.read().strip())
+                    with open(used_path) as f:
+                        used_b = int(f.read().strip())
+                    # Identify which card
+                    card_id = os.path.basename(os.path.dirname(os.path.dirname(
+                        total_path)))
+                    return (f"VRAM {used_b / (1024**3):.1f}/"
+                            f"{total_b / (1024**3):.1f}G ({card_id})")
+                except (OSError, ValueError):
+                    continue
+        return ""
+
+    def _monitor_tick(self):
+        """60-second periodic: probe server + read memory stats -> log line.
+
+        Runs in a short-lived daemon thread so the 3 s HTTP timeout never
+        blocks the GUI event loop.  Zero disk writes — only emits to
+        self.log (in-memory QPlainTextEdit).
+        """
+        def _do_probe():
+            base = self.base_url()
+            url = base.rstrip("/") + "/health"
+            key = self.api_key()
+            headers = {}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            # --- server status ---
+            if self.using_external_server:
+                # External servers (Unsloth studio et al.) may have NO /health
+                # - use the models-first probe instead of logging HTTP 404s.
+                from app.core.server import probe_server
+                st, det = probe_server(base, key, timeout=3)
+                srv_status = st + (f" ({det})" if det else "")
+            else:
+                srv_status = "?"
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=3) as r:
+                        srv_status = f"OK ({r.status})"
+                except Exception as e:
+                    # Distinguish 'loading' from 'dead'
+                    import urllib.error
+                    if isinstance(e, urllib.error.HTTPError):
+                        body = ""
+                        try:
+                            body = e.read().decode("utf-8", "replace")[:80]
+                        except Exception:
+                            pass
+                        srv_status = f"HTTP {e.code}"
+                        if "Loading model" in body:
+                            srv_status += " (loading)"
+                    else:
+                        srv_status = "down"
+            # --- memory ---
+            mem_parts = [self._read_sys_memory()]
+            vram = self._read_gpu_vram()
+            if vram:
+                mem_parts.append(vram)
+            line = f"[monitor] server={srv_status} | {'  |  '.join(mem_parts)}"
+            self.log.emit(line)
+
+        t = threading.Thread(target=_do_probe, daemon=True,
+                             name="server-monitor")
+        t.start()
+
+    def _on_monitor_server_state(self, state: str):
+        """Start/stop the monitor timer based on server readiness."""
+        active = (state in ("starting", "ready") or
+                  self.using_external_server)
+        if active and not self._monitor_timer.isActive():
+            self._monitor_timer.start()
+            # Fire once immediately so the first readout appears promptly.
+            self._monitor_tick()
+        elif not active and self._monitor_timer.isActive():
+            self._monitor_timer.stop()
 
     # ------------------------------------------------------------------ binary
     def _sync_server_preferred_binary(self):
@@ -538,13 +747,28 @@ class AppContext(QObject):
             return "127.0.0.1"
         return h
 
+    @property
+    def using_external_server(self) -> bool:
+        """True when the user has configured an external server URL."""
+        return bool((self.settings.external_url or "").strip())
+
     def base_url(self) -> str:
         """Base URL for caption requests against the configured endpoint.
 
-        Prefers the live ServerConfig of the running/attached server; falls
-        back to the Tab 2 host/port fields before the first start().  Local
-        wildcard hosts collapse to 127.0.0.1 so '0.0.0.0' still works.
+        Priority:
+          1. Tab 2 'External Server URL' (full URL like http://host:port)
+          2. Live ServerConfig of the running/attached local server
+          3. Tab 2 host/port fields (before the first start())
+
+        Local wildcard hosts collapse to 127.0.0.1 so '0.0.0.0' still works.
         """
+        ext = (self.settings.external_url or "").strip()
+        if ext:
+            # Bare origin, '.../v1' or '.../v1/chat/completions' all mean the
+            # same server - normalise to the bare base; CaptionClient appends
+            # its own /v1/... paths.
+            from app.core.api_client import normalize_base_url
+            return normalize_base_url(ext)
         cfg = self.server.config
         if cfg is not None:
             return f"http://{self._client_host(cfg.host)}:{cfg.port}"
@@ -563,6 +787,14 @@ class AppContext(QObject):
             key = (os.environ.get("MOSS_API_KEY")
                    or os.environ.get("APPCAP_API_KEY") or "")
         return key
+
+    def resolve_external_model_id(self, timeout: float = 5.0) -> str:
+        """Model id for EXTERNAL chat requests (see api_client docstring)."""
+        from app.core.api_client import resolve_external_model
+        return resolve_external_model(
+            self.base_url(), self.api_key(),
+            explicit=(self.settings.external_model or "").strip(),
+            log_cb=self.log.emit, timeout=timeout)
 
     def make_client(self, timeout: float = 600.0):
         """CaptionClient wired to the current host/port/API key."""

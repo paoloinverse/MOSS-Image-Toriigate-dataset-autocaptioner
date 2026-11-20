@@ -14,7 +14,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QPushButton,
                                QSizePolicy, QTextEdit, QVBoxLayout, QWidget)
 
-from app.core.presets import load_existing_caption
+from app.core.presets import companion_base, resolve_caption_file
 
 
 class CaptionSidePanel(QWidget):
@@ -55,7 +55,8 @@ class CaptionSidePanel(QWidget):
         root.addWidget(meta_box)
 
         self.editor = QTextEdit()
-        self.editor.setPlaceholderText("Caption (.txt) or MOSS JSON (.json) for the focused image…")
+        self.editor.setPlaceholderText(
+            "Caption (Markdown / .txt tags / MOSS .json) for the focused image…")
         root.addWidget(self.editor, stretch=1)
 
         btns = QHBoxLayout()
@@ -93,7 +94,13 @@ class CaptionSidePanel(QWidget):
         except OSError:
             size_kb = 0
         self.info_label.setText(f"{name}\nResolution: {res} | Size: {size_kb:.0f} KiB\nPath: {path}")
-        kind, text = load_existing_caption(path)
+        # Honour the custom companion-file naming from Tab 2 (ctx may be None
+        # when the panel is used standalone -> plain historical lookup).
+        # Shared with the Tab 4 bounding-box overlay, so the panel and the drawn
+        # boxes can never disagree about which sidecar a caption came from
+        # (load naming first, then the save naming a batch actually wrote).
+        st = self.ctx.settings if self.ctx is not None else None
+        kind, text = resolve_caption_file(path, st)
         self.editor.setPlainText(text)
         self.meta_label.setText(self._describe_meta(kind, text))
         self.status_label.setText(f"Loaded existing .{kind}" if kind else "No caption file yet.")
@@ -102,21 +109,60 @@ class CaptionSidePanel(QWidget):
         if self.current_path:
             self.set_image(self.current_path)
 
+    def highlight_text(self, text: str) -> bool:
+        """Select *text* in the editor — Tab 4 clicked one of the drawn boxes.
+
+        The box overlay and the Caption Editor show two views of the same JSON,
+        so clicking a box jumps to the string it describes.  Returns False (and
+        says so in the status line) when the excerpt is not in the caption, e.g.
+        the boxes came from a different sidecar than the loaded text.
+        """
+        needle = " ".join((text or "").split())
+        if not needle:
+            return False
+        doc = self.editor.document()
+        cursor = doc.find(needle)
+        if cursor.isNull() and len(needle) > 24:
+            cursor = doc.find(needle[:24])   # tolerate truncation / rewording
+        if cursor.isNull():
+            self.status_label.setText(
+                f"Box text not found in the caption: '{needle[:40]}'")
+            return False
+        self.editor.setTextCursor(cursor)
+        self.editor.ensureCursorVisible()
+        self.status_label.setText(f"Selected in caption: '{needle[:40]}'")
+        return True
+
     def save_now(self):
         if not self.current_path:
             return
         text = self.editor.toPlainText().strip()
-        target = os.path.splitext(self.current_path)[0]
+        # Custom companion-file save naming from Tab 2 ('<name><suffix>.<ext>').
+        # A custom extension overrides the content-based default (json/txt) for
+        # both branches; an empty one keeps the original behaviour.  ctx may be
+        # None when the panel is used standalone -> plain historical names.
+        st = self.ctx.settings if self.ctx is not None else None
+        suffix = getattr(st, "caption_save_suffix", "") if st else ""
+        custom_ext = getattr(st, "caption_save_ext", "") if st else ""
+        keep = bool(getattr(st, "caption_keep_image_ext", False)) if st else False
+        root = companion_base(self.current_path, keep)
+        # With no custom extension the non-JSON branch follows the active
+        # preset: Markdown mode writes '.md', tag presets write '.txt'.
+        fmt = (self.ctx.active_preset.output_format
+               if self.ctx is not None else "txt")
+        default_plain = "md" if fmt == "md" else "txt"
         try:
             if text.startswith("{"):
                 obj = json.loads(text)          # validate before writing
-                with open(target + ".json", "w", encoding="utf-8") as fh:
+                ext = (custom_ext.strip().lstrip(".") or "json")
+                written = f"{root}{suffix}.{ext}"
+                with open(written, "w", encoding="utf-8") as fh:
                     json.dump(obj, fh, ensure_ascii=False, indent=2)
-                written = target + ".json"
             else:
-                with open(target + ".txt", "w", encoding="utf-8") as fh:
+                ext = (custom_ext.strip().lstrip(".") or default_plain)
+                written = f"{root}{suffix}.{ext}"
+                with open(written, "w", encoding="utf-8") as fh:
                     fh.write(text + "\n")
-                written = target + ".txt"
             self.status_label.setText(f"Saved -> {os.path.basename(written)}")
             self.caption_saved.emit(written)
         except json.JSONDecodeError as exc:

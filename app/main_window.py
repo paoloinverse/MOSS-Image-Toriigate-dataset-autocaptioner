@@ -58,6 +58,12 @@ class MainWindow(QMainWindow):
         ctx.image_focused.connect(self.side_panel.set_image)
         self.side_panel.caption_saved.connect(lambda p: ctx.log.emit(
             f"[panel] manual caption saved -> {p}"))
+        # Clicking a drawn box jumps the Caption Editor to exactly that text, and
+        # a manual save leaves a sidecar newer than the in-session run, so Tab 4
+        # re-resolves its overlay (see AppContext.last_results_ts).
+        ctx.box_clicked.connect(
+            lambda _path, text: self.side_panel.highlight_text(text))
+        self.side_panel.caption_saved.connect(self.tab_explorer.on_caption_saved)
 
         # ---- startup config override ------------------------------------------
         # Tabs are built from the hardwired/persisted defaults, so if a

@@ -1,4 +1,5 @@
 PySide6>=6.6
+Pillow>=10
 psutil>=5.9
 httpx>=0.27
 huggingface_hub>=0.23

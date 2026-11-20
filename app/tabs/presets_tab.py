@@ -41,6 +41,14 @@ class PresetsTab(QWidget):
         self.explicit_check = QCheckBox("Explicit Mode (NSFW)")
         self.explicit_check.setChecked(ctx.explicit_mode)
         top.addWidget(self.explicit_check)
+
+        self.filename_check = QCheckBox("Include image filename in prompt")
+        self.filename_check.setToolTip(
+            "When checked, each request's system prompt gets a final line:\n"
+            '    "image_filename": "<actual file basename>"\n'
+            "so the model can echo the correct filename in its output.\n"
+            "Default ON for the OCR Transcript preset.")
+        top.addWidget(self.filename_check)
         root.addLayout(top)
 
         self.explicit_hint = QLabel(
@@ -77,6 +85,7 @@ class PresetsTab(QWidget):
         # ---- wiring ------------------------------------------------------------
         self.preset_combo.currentIndexChanged.connect(self.load_preset)
         self.explicit_check.toggled.connect(self.on_explicit_toggled)
+        self.filename_check.toggled.connect(self.save_edits)
         self.system_edit.textChanged.connect(self.save_edits)
         self.user_edit.textChanged.connect(self.save_edits)
         self.export_btn.clicked.connect(self.export_cfg)
@@ -92,6 +101,8 @@ class PresetsTab(QWidget):
         self._loading = True
         self.system_edit.setPlainText(preset.system_prompt)
         self.user_edit.setPlainText(preset.user_prompt)
+        self.filename_check.setChecked(
+            bool(getattr(preset, "include_image_filename", False)))
         self._loading = False
         self.ctx.preset_changed.emit()
 
@@ -102,6 +113,7 @@ class PresetsTab(QWidget):
         preset = self.ctx.presets[key]
         preset.system_prompt = self.system_edit.toPlainText()
         preset.user_prompt = self.user_edit.toPlainText()
+        preset.include_image_filename = self.filename_check.isChecked()
 
     def on_explicit_toggled(self, checked: bool):
         self.ctx.explicit_mode = checked

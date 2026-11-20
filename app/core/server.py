@@ -100,74 +100,94 @@ def is_local_host(host: str) -> bool:
 
 def probe_server(base_url: str, api_key: str = "", timeout: float = 3.0,
                  connect_timeout: float = 3.0) -> tuple[str, str]:
-    """Probe ``base_url/health``; returns one of:
+    """Probe an OpenAI-compatible endpoint; returns ``(status, detail)``.
 
-    * ``("running", "")``            - HTTP 200: server up, no auth needed
-    * ``("running-auth", "")``       - HTTP 401: server up, token accepted
-                                       (or unauthenticated health endpoint)
-    * ``("auth-required", msg)``     - HTTP 401/403 with NO token configured
-    * ``("auth-failed", msg)``       - HTTP 401/403 WITH a token: it is wrong
-    * ``("down", msg)``              - TCP reachable, nothing answering HTTP
-    * ``("unreachable", msg)``       - DNS/TCP/connect failure
+    Status vocabulary (unchanged):
 
-    ``("running", ...)`` and ``("running-auth", ...)`` both mean "the server
-    answers requests" - the suffix only records whether a token was supplied.
+    * ``"running"``              - server answers, no token supplied
+    * ``"running-auth"``         - server answers, Bearer token was sent
+    * ``"auth-required"``        - HTTP 401/403 with NO token configured
+    * ``"auth-failed"``          - HTTP 401/403 WITH a token: it is wrong
+    * ``"down"``                 - TCP reachable, but no usable HTTP endpoint
+    * ``"unreachable"``          - DNS/TCP/connect failure
+
+    Probe order - ``/v1`` FIRST, ``/health`` second (the rework):
+
+    1. ``GET {base}/v1/models``  - the exact endpoint every caption request
+       depends on.  Some OpenAI-compatible servers (notably the Unsloth
+       studio server) expose NO ``/health`` at all: the old /health-first
+       probe got a 404 there, reported the healthy server as ``"down"`` and
+       killed the batch before the first image was sent.
+    2. ``GET {base}/health``     - llama.cpp servers: kept for the 503
+       'Loading model' body readers and for servers without a listing.
+    3. raw TCP connect           - distinguishes 'port closed' from 'no
+       route' when neither endpoint answers HTTP at all.
+
+    The Bearer token (when configured) is sent on BOTH probes.  A 401/403
+    on one endpoint does not immediately mean 'wrong key' - some builds
+    gate the endpoints inconsistently even for VALID keys, so the second
+    endpoint still gets a chance before ``"auth-failed"`` is declared.
     Never raises; every outcome carries a short human-readable detail.
     """
-    url = base_url.rstrip("/") + "/health"
+    from app.core.api_client import normalize_base_url
+    base = normalize_base_url(base_url)
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    def _ok(status: int) -> tuple[str, str]:
-        label = "running-auth" if api_key else "running"
-        return (label, "" if status == 200 else f"HTTP {status}")
-
-    try:
+    def _get(path: str):
+        """GET one endpoint; return (status, body) or raise urllib error."""
         import urllib.request as _ur
-        req = _ur.Request(url, headers=headers)
+        req = _ur.Request(base + path, headers=headers)
         with _ur.urlopen(req, timeout=timeout) as r:
-            return _ok(r.status)
-    except Exception as exc:
-        import urllib.error as _ue
-        status = None
-        if isinstance(exc, _ue.HTTPError):
-            status = exc.code
-        if status in (401, 403):
-            if not api_key:
-                return ("auth-required",
-                        f"HTTP {status}: server requires an API key")
-            # A token WAS sent but /health refused it.  Some llama-server
-            # builds gate /health inconsistently even for VALID keys, so
-            # confirm against /v1/models before declaring the key wrong:
-            # accepted there => server is fine for us (running-auth);
-            # denied there too => the key really is bad (auth-failed).
-            try:
-                req2 = _ur.Request(base_url.rstrip("/") + "/v1/models",
-                                   headers=headers)
-                with _ur.urlopen(req2, timeout=timeout) as r2:
-                    if r2.status < 400:
-                        return ("running-auth", "")
-            except _ue.HTTPError as e2:
-                if e2.code in (401, 403):
-                    return ("auth-failed",
-                            f"HTTP {e2.code}: server rejected the API key")
-            except Exception:
-                pass
-            return ("auth-failed",
-                    f"HTTP {status}: server rejected the API key")
-        # No HTTP answer at all - distinguish "port closed" from "no route".
+            return r.status, r.read()
+
+    last_http: tuple[str, int] | None = None
+    auth_rejected: tuple[str, int] | None = None
+    for path in ("/v1/models", "/health"):
         try:
-            import socket as _sk
-            from urllib.parse import urlparse as _up
-            pr = _up(base_url)
-            s = _sk.create_connection((pr.hostname or "127.0.0.1",
-                                       pr.port or 8080),
-                                       timeout=connect_timeout)
-            s.close()
-            return ("down", f"{type(exc).__name__}: {exc}")
-        except OSError as exc2:
-            return ("unreachable", f"{type(exc2).__name__}: {exc2}")
+            status, _body = _get(path)
+            label = "running-auth" if api_key else "running"
+            return (label, f"HTTP {status} from {path}")
+        except Exception as exc:
+            import urllib.error as _ue
+            if isinstance(exc, _ue.HTTPError):
+                last_http = (path, exc.code)
+                if exc.code in (401, 403):
+                    if not api_key:
+                        return ("auth-required",
+                                f"HTTP {exc.code} from {path}: server "
+                                "requires an API key")
+                    # Token sent but refused HERE - give the other endpoint
+                    # a chance before declaring the key wrong.  Remember the
+                    # rejection separately: a later 404 (no /health) must not
+                    # erase it, or a models-only server with a bad key would
+                    # be reported 'down' instead of 'auth-failed'.
+                    auth_rejected = (path, exc.code)
+                continue     # 404/405/5xx on one endpoint -> try the other
+    if auth_rejected is not None:
+        path, code = auth_rejected
+        return ("auth-failed",
+                f"HTTP {code} from {path}: server rejected the API key")
+    if last_http is not None:
+        path, code = last_http
+        return ("down",
+                f"TCP reachable, but neither /v1/models nor /health exists "
+                f"(last: {path} -> HTTP {code}). Check that the URL points "
+                "at the server root (e.g. http://192.168.1.5:8888) - a page "
+                "or a full /v1/chat/completions path will 404 here.")
+    # No HTTP answer at all - distinguish "port closed" from "no route".
+    try:
+        import socket as _sk
+        from urllib.parse import urlparse as _up
+        pr = _up(base)
+        s = _sk.create_connection((pr.hostname or "127.0.0.1",
+                                   pr.port or 8080),
+                                   timeout=connect_timeout)
+        s.close()
+        return ("down", "port open, but no HTTP endpoint answered")
+    except OSError as exc2:
+        return ("unreachable", f"{type(exc2).__name__}: {exc2}")
 
 
 class ServerManager(QObject):
@@ -282,6 +302,15 @@ class ServerManager(QObject):
             args += ["-sm", "none"]
 
         args += ["-c", str(plan.context_tokens)]
+        # Single slot: prevents the prompt cache from accumulating one ~500 MB
+        # visual-encoding entry per parallel slot (default 4).  With identical
+        # system prompts across a batch, llama-server's LCP-based slot reuse
+        # would otherwise keep multiple cached encodings alive simultaneously
+        # until VRAM is exhausted.  n_slots=1 forces each new request to
+        # REPLACE the previous cache entry instead of adding alongside it.
+        # No downside for this app: all processing is sequential (one image
+        # at a time), so parallel slots would sit idle anyway.
+        args += ["--parallel", "1"]
         if selected:
             args += ["--cache-type-k", cfg.cache_type_k,
                      "--cache-type-v", cfg.cache_type_v]

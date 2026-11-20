@@ -36,6 +36,26 @@ When ``log_cb`` is supplied (or the module-level logger is enabled with
 
 The raw SSE lines themselves are also recorded (again with base64 elided) so
 the exact wire traffic can be reconstructed from the log.
+
+External servers (OpenAI-compatible)
+------------------------------------
+``external_url`` / ``CaptionClient`` also work against any *external*
+OpenAI-compatible server (llama.cpp on another box, the Unsloth studio
+server, vLLM, …).  Two things that used to be flaky are now handled:
+
+* **URL spelling.**  Users paste different things - the bare origin
+  (``http://192.168.1.5:8888``), the API prefix (``.../v1``) or even the
+  full chat endpoint (``.../v1/chat/completions``).  All of them mean the
+  same server; :func:`normalize_base_url` strips them to the bare origin so
+  this client can append its own ``/v1/...`` paths.  The user is only ever
+  asked for the server address.
+* **Model selection.**  The ``model`` field is NOT required.  By default
+  the app assumes there is a single loaded model: :func:`fetch_models`
+  reads ``/v1/models`` (with the Bearer key) and
+  :func:`resolve_external_model` sends that model's exact ``id`` when
+  exactly one is loaded, otherwise the literal ``"default"`` - which the
+  server routes to whatever model is currently loaded.  The user can still
+  force a specific id (Tab 2 'External server model:').
 """
 from __future__ import annotations
 
@@ -50,6 +70,11 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from app.core.presets import CaptionPreset, GenerationParams
+
+#: Literal model id used when no single loaded model can be determined.
+#: llama.cpp / Unsloth-studio servers route ``"default"`` to the model that
+#: is currently loaded, so an unqualified chat request still works.
+DEFAULT_MODEL_ID = "default"
 
 ChunkCb = Optional[Callable[[str], None]]
 LogCb = Optional[Callable[[str], None]]
@@ -147,9 +172,153 @@ def image_to_data_url(path: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+# ------------------------------------------------------------------ external servers
+
+def normalize_base_url(url: str) -> str:
+    """Normalise any accepted endpoint spelling to a bare server base URL.
+
+    Users paste different things for the *same* server - the bare origin
+    (``http://192.168.1.5:8888``), the API prefix (``.../v1``) or the full
+    chat endpoint (``.../v1/chat/completions``).  This strips everything
+    back down to the origin (plus any non-``/v1`` path prefix, e.g. a
+    reverse-proxy mount like ``/api``), no trailing slash, so callers can
+    append their own ``/v1/...`` paths safely.  A missing scheme defaults
+    to ``http://``.  Pure string work - never raises.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "http://" + u
+    u = u.rstrip("/")
+    # A pasted full chat endpoint: cut back to the (prefix +) origin.
+    while u.endswith("/chat/completions"):
+        u = u[: -len("/chat/completions")]
+    # Trailing '/v1' is the API prefix, not part of the base (repeats too).
+    while u.endswith("/v1"):
+        u = u[: -len("/v1")]
+    return u.rstrip("/")
+
+
+def fetch_models(base_url: str, api_key: str = "", timeout: float = 10.0):
+    """GET ``{base}/v1/models`` on an OpenAI-compatible server.
+
+    Returns ``(models, error)``: ``models`` is the raw ``data`` list from
+    the server (each entry carries at least ``id``; llama.cpp / Unsloth
+    studio servers additionally report ``loaded`` / ``status`` / ``quant``),
+    or ``[]`` on failure.  ``error`` is "" on success, else a one-line
+    human-readable reason.  The Bearer token is sent when ``api_key`` is
+    non-empty (the listing is auth-gated on servers started with
+    ``--api-key``).  Never raises.
+    """
+    import urllib.error as _ue
+    import urllib.request as _ur
+    base = normalize_base_url(base_url)
+    if not base:
+        return [], "empty server URL"
+    url = base + "/v1/models"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+        obj = json.loads(body)
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if not isinstance(data, list):
+            return [], "unrecognized /v1/models response (no 'data' list)"
+        return data, ""
+    except _ue.HTTPError as e:
+        if e.code in (401, 403):
+            return [], (f"HTTP {e.code}: "
+                        + ("server rejected the configured API key"
+                           if api_key else "server requires an API key"))
+        return [], f"HTTP {e.code} from {url}"
+    except Exception as e:                     # noqa: BLE001 - never raise
+        return [], f"{type(e).__name__}: {e}"
+
+
+def loaded_models(models) -> list:
+    """Entries of a ``/v1/models`` list that count as *loaded/available*.
+
+    llama.cpp / Unsloth-studio servers report this explicitly via
+    ``loaded: true`` and/or ``status.value == 'loaded'``.  Plain OpenAI
+    servers (vLLM, the real API) carry no load flag at all - every listed
+    model is available there, so entries without any load info count as
+    loaded too.  Entries without an ``id`` are skipped.
+    """
+    out = []
+    for m in models or []:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        status = m.get("status")
+        status_val = status.get("value") if isinstance(status, dict) else None
+        if m.get("loaded") is None and status_val is None:
+            available = True          # no load info -> treat as available
+        else:
+            available = (m.get("loaded") is True) or status_val == "loaded"
+        if available:
+            out.append(m)
+    return out
+
+
+def resolve_external_model(base_url: str, api_key: str = "", explicit: str = "",
+                           log_cb: LogCb = None, timeout: float = 5.0) -> str:
+    """Pick the ``model`` field for chat requests to an EXTERNAL server.
+
+    Policy (the model simply defaults to *what is loaded*):
+
+    * an explicit choice (``explicit``, from Tab 2's 'External server
+      model' combo) wins - sent verbatim, no network round-trip;
+    * otherwise ``/v1/models`` is queried (Bearer key included) and, when
+      EXACTLY ONE model is loaded, that model's exact ``id`` is used;
+    * otherwise - none listed, several loaded, or the listing failed - the
+      literal ``"default"`` is returned, which llama.cpp / Unsloth-studio
+      servers route to the currently loaded model.
+
+    Every decision is reported line-by-line through ``log_cb`` (when given)
+    so the GUI log shows *which* model the batch will talk to.  Never
+    raises; always returns a usable non-empty string.
+    """
+    def _log(line: str) -> None:
+        if log_cb is not None:
+            try:
+                log_cb(line)
+            except Exception:
+                pass                 # logging must never break the flow
+
+    exp = (explicit or "").strip()
+    if exp:
+        _log(f"[ext] using explicit server model: '{exp}'")
+        return exp
+    models, err = fetch_models(base_url, api_key, timeout=timeout)
+    if err:
+        _log(f"[ext] model listing failed ({err}) - sending model='" +
+             f"{DEFAULT_MODEL_ID}' (the server's currently loaded model).")
+        return DEFAULT_MODEL_ID
+    loaded = loaded_models(models)
+    if len(loaded) == 1:
+        mid = str(loaded[0].get("id"))
+        _log(f"[ext] /v1/models lists exactly one loaded model -> using "
+             f"'{mid}' ({len(models)} model(s) registered server-side).")
+        return mid
+    if loaded:
+        ids = ", ".join(str(m.get("id")) for m in loaded)
+        _log(f"[ext] /v1/models lists {len(loaded)} loaded models "
+             f"({ids}) - sending model='{DEFAULT_MODEL_ID}'; pick one "
+             "explicitly in Tab 2 'External server model:' to be sure.")
+        return DEFAULT_MODEL_ID
+    _log(f"[ext] /v1/models lists {len(models)} model(s), none marked "
+         f"loaded - sending model='{DEFAULT_MODEL_ID}'.")
+    return DEFAULT_MODEL_ID
+
+
 def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
                   max_tokens: int | None = None,
-                  settings=None, model_key: str | None = None) -> dict:
+                  settings=None, model_key: str | None = None,
+                  model_id: str | None = None,
+                  image_data_url: str | None = None) -> dict:
     """Build the /v1/chat/completions payload (see module docstring).
 
     ``model_key`` is the resolved registry key of the run target (Tab 2's
@@ -158,6 +327,19 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
     (GLM5.3, generic/unknown custom repos) get a plain sampling-only payload.
     Empty keys keep the legacy full Qwen-family behaviour for headless and
     pre-gating callers (see tests/test_smoke.py::test_payload).
+
+    ``model_id`` is the wire value of the ``model`` field for EXTERNAL
+    servers (a ``/v1/models`` id or the literal ``'default'`` - see
+    :func:`resolve_external_model`).  When set it is sent in the payload AND
+    replaces ``model_key`` as the family-gate input: the Qwen-only extras
+    are gated on the EXTERNAL model's family (``detect_family`` heuristics),
+    not on the local Tab 1/2 registry selection.
+
+    ``image_data_url`` (Tab 2 "Upscale Before Analysis"): a pre-built base64
+    data URL for an in-RAM upscaled copy of the image.  When given it is
+    embedded verbatim instead of re-reading ``image_path``; all legacy
+    callers omit it, so raw file bytes are used and payloads stay
+    byte-identical to the pre-feature app.
     """
     params: GenerationParams = preset.params
     # Tab 2 live settings win over the preset when provided (AppContext's
@@ -207,8 +389,12 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
                 {"type": "text", "text": preset.user_prompt},
+                # Tab 2 upscaling: a pre-built (upscaled) data URL wins;
+                # otherwise the original file bytes, exactly as before.
                 {"type": "image_url",
-                 "image_url": {"url": image_to_data_url(image_path)}},
+                 "image_url": {"url": (image_data_url
+                                       if image_data_url is not None
+                                       else image_to_data_url(image_path))}},
             ]},
         ],
         "temperature": float(getattr(settings, "temperature",
@@ -226,6 +412,19 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
     # llama-server accepts sampling extras at top level of the request body.
     payload["top_k"] = int(getattr(settings, "top_k", params.top_k))
     payload["min_p"] = float(getattr(settings, "min_p", params.min_p))
+    # Presence / repetition penalties (Tab 2 spinboxes win; per-preset default
+    # otherwise).  Both default to llama.cpp's own values, so an untouched
+    # config produces an identical request to before.
+    payload["presence_penalty"] = float(
+        getattr(settings, "presence_penalty", params.presence_penalty))
+    payload["repetition_penalty"] = float(
+        getattr(settings, "repetition_penalty", params.repetition_penalty))
+    # EXTERNAL servers only: the resolved /v1/models id (or literal
+    # 'default') travels as the standard OpenAI 'model' field.  Local
+    # llama-server runs ignore it (one loaded model), so it is omitted
+    # entirely when not set - legacy payloads stay byte-identical.
+    if model_id:
+        payload["model"] = str(model_id)
 
     # ---- family gate (generalized model support, plan §4.5) --------------
     # Non-Qwen families must NOT receive Qwen-only extras: sending
@@ -233,9 +432,15 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
     # Jinja chat template is at best silently ignored and at worst a hard
     # error.  Empty/legacy keys resolve to the neutral profile whose flag
     # defaults to True, so headless callers keep today's payload exactly.
-    from app.core.models import get_model_profile
-    _key = model_key or getattr(settings, "run_model_key", "") or ""
-    if not get_model_profile(_key).supports_reasoning_kwargs:
+    from app.core.models import get_model_profile, profile_for_model_name
+    if model_id:
+        # EXTERNAL server: the run target is the model id sent on the wire,
+        # not the local registry selection - gate on its detected family.
+        _prof = profile_for_model_name(model_id)
+    else:
+        _key = model_key or getattr(settings, "run_model_key", "") or ""
+        _prof = get_model_profile(_key)
+    if not _prof.supports_reasoning_kwargs:
         return payload                     # plain sampling payload only
 
     # ---- Qwen3.8-family reasoning block ----------------------------------
@@ -263,11 +468,21 @@ def build_payload(image_path: str, preset: CaptionPreset, system_prompt: str,
 
 
 class CaptionClient:
-    """Thin async wrapper around one running llama-server instance."""
+    """Thin async wrapper around one running llama-server instance.
+
+    Works against the local server AND external OpenAI-compatible servers
+    (see the module docstring): the base URL accepts the bare origin, a
+    trailing ``/v1`` or a full ``/v1/chat/completions`` paste - all are
+    normalised away, and the Bearer key (when set) is sent with every
+    request, including the ``/v1/models`` listing.
+    """
 
     def __init__(self, base_url: str, timeout: float = 600.0,
                  api_key: str | None = None):
-        self.base_url = base_url.rstrip("/")
+        # Normalise any pasted spelling (bare origin / .../v1 /
+        # .../v1/chat/completions) down to the bare base this client
+        # appends its own /v1/... paths to.
+        self.base_url = normalize_base_url(base_url)
         self.timeout = timeout
         # Optional bearer token.  Priority: explicit ``api_key`` argument
         # (the GUI passes the Tab 2 'API Key:' field through AppContext) ->
@@ -284,16 +499,30 @@ class CaptionClient:
             return {"Authorization": f"Bearer {self.api_key}"}
         return {}
 
+    def fetch_models(self, timeout: float = 10.0):
+        """``/v1/models`` listing for THIS client's server (sync).
+
+        Returns ``(models, error)`` - see :func:`fetch_models`.  Synchronous
+        on purpose: the GUI calls it from a QThread, never the event loop.
+        """
+        return fetch_models(self.base_url, self.api_key, timeout=timeout)
+
     async def caption(self, image_path: str, preset: CaptionPreset,
                       system_prompt: str, on_chunk: ChunkCb = None,
                       cancel_event=None, settings=None,
                       model_key: str | None = None,
+                      model_id: str | None = None,
                       log_cb: LogCb = None) -> str:
         """Stream a chat completion and return the full assistant text.
 
         ``model_key`` is the resolved registry key of the run target; it gates
         family-specific payload extras (models with
         ``supports_reasoning_kwargs=False`` get sampling-only payloads).
+
+        ``model_id`` (EXTERNAL servers only) is the wire value of the
+        ``model`` field - a ``/v1/models`` id or the literal ``'default'``
+        (see :func:`resolve_external_model`).  Omitted for local servers,
+        which use their one loaded model anyway.
 
         ``on_chunk(text)`` receives each delta for live GUI log tailing.
         ``cancel_event`` (threading.Event/asyncio-friendly bool check) allows
@@ -305,16 +534,49 @@ class CaptionClient:
         thinking/reasoning delta, raw SSE traffic, finish reason and usage
         stats are reported line-by-line.  When omitted, lines go to the
         module logger if :func:`set_verbose` was enabled.
+
+        Tab 2 upscaling (``settings.upscale_enabled``): when active with a
+        factor > 1 on either axis, the image is upscaled IN RAM and its
+        re-encoded bytes are embedded instead of the original file; any
+        failure falls back to the original.  See :mod:`app.core.upscale`.
         """
         if log_cb is None and not _verbose_enabled:
             log_cb = None    # stay completely quiet unless asked
+        # ---- Tab 2 "Upscale Before Analysis" (in RAM, per request) --------
+        # Resizes the image with the selected method/factors and embeds the
+        # re-encoded result in the payload; the source file is never touched.
+        # Off / 1x/1x: nothing happens and the payload stays byte-identical
+        # to the pre-feature behaviour.
+        image_data_url: str | None = None
+        if settings is not None and getattr(settings, "upscale_enabled", False):
+            _method = str(getattr(settings, "upscale_method", "lanczos"))
+            try:
+                _sx = int(getattr(settings, "upscale_scale_x", 2) or 1)
+                _sy = int(getattr(settings, "upscale_scale_y", 2) or 1)
+            except (TypeError, ValueError):
+                _sx = _sy = 1
+            if _sx > 1 or _sy > 1:
+                from app.core.upscale import upscale_to_data_url
+                res = upscale_to_data_url(image_path, _method, _sx, _sy)
+                if res is not None:
+                    image_data_url, report = res
+                    _emit(log_cb, f"[upscale] {image_path}: {report} "
+                                  "(in RAM; original file untouched)")
+                else:
+                    _emit(log_cb, f"[upscale] {image_path}: upscaling "
+                                  "unavailable or failed (Pillow missing / "
+                                  "undecodable image?) - sending the "
+                                  "original image")
         url = f"{self.base_url}/v1/chat/completions"
         payload = build_payload(image_path, preset, system_prompt,
-                                settings=settings, model_key=model_key)
+                                settings=settings, model_key=model_key,
+                                model_id=model_id,
+                                image_data_url=image_data_url)
 
         # ---- verbose: dump the exact conversation being sent ----------------
         _emit(log_cb, f"[llama] >>> POST {url}  "
-                      f"(preset '{preset.display_name}', image "
+                      f"(model '{payload.get('model', '(server default)')}', "
+                      f"preset '{preset.display_name}', image "
                       f"'{image_path}')")
         for ln in _format_messages(payload["messages"]):
             _emit(log_cb, f"[llama] >>> {ln}")

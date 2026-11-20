@@ -877,6 +877,23 @@ def get_model_profile(key: str | None, quant: str | None = None,
     return prof
 
 
+def profile_for_model_name(name: str | None) -> ModelProfile:
+    """Profile for a RAW model name (no registry lookup).
+
+    For EXTERNAL servers whose ``/v1/models`` ids (e.g.
+    ``'huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF'`` or the literal
+    ``'default'``) are not keys of the local Tab 1 registry: the name is
+    mapped onto a known family via :func:`detect_family` and that family's
+    defaults are used (drives the Qwen-only payload gate in
+    ``api_client.build_payload``).  Unknown names - including ``'default'``
+    - land on the neutral ``generic`` profile (sampling-only payload, no
+    Qwen ``chat_template_kwargs``), which is the safe choice for a model
+    whose family cannot be determined from the name alone.
+    """
+    fam = detect_family(name or "")
+    return _MODEL_FAMILY_DEFAULTS.get(fam, _MODEL_FAMILY_DEFAULTS["generic"])
+
+
 # ---------------------------------------------------------------------------
 # Storage-location management (default app cache vs Unsloth-desktop folder)
 # ---------------------------------------------------------------------------
@@ -1842,12 +1859,18 @@ def import_full_config(ctx, raw: str) -> list[str]:
             and data.get("scope") != "presets"):
         from app.core.presets import import_config
         presets, active, explicit = import_config(json.dumps(pload))
+        # Rejected preset-level values (e.g. an unknown overlay_box_layout in a
+        # hand-edited captioner_config.json) surface as warnings, never errors.
+        from app.core.presets import IMPORT_WARNINGS
+        warnings.extend(IMPORT_WARNINGS)
         ctx.presets = presets
         ctx.active_preset_key = active
         ctx.explicit_mode = explicit
     elif "presets" in data or "active_preset" in data:
         from app.core.presets import import_config
         presets, active, explicit = import_config(raw)   # legacy Tab-3 format
+        from app.core.presets import IMPORT_WARNINGS
+        warnings.extend(IMPORT_WARNINGS)
         ctx.presets = presets
         ctx.active_preset_key = active
         ctx.explicit_mode = explicit

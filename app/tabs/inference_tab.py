@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
@@ -40,7 +40,10 @@ from app.core.models import (KV_CACHE_TYPES, REASONING_BUDGET_MAX,
                              REASONING_BUDGET_UNLIMITED,
                              ensure_mmproj_downloaded, get_model_profile,
                              plan_mmproj_download, read_arch_info)
+from app.core.presets import companion_ext
 from app.core.resources import ResourcePlanError, plan_resources
+from app.core.upscale import (METHODS as UPSCALE_METHODS,
+                              SCALE_OPTIONS as UPSCALE_SCALES)
 
 
 class ProbeWorker(QThread):
@@ -66,6 +69,34 @@ class ProbeWorker(QThread):
         self.done.emit(status, detail, self.base_url,
                        is_local_host(self.base_url.split("//")[-1]
                                      .split(":")[0]))
+
+
+class ExternalProbeWorker(QThread):
+    """Models-first probe of the EXTERNAL URL + /v1/models in one round trip."""
+    done = Signal(str, str, str, object)     # status, detail, base, models|None
+    def __init__(self, base_url, api_key="", parent=None):
+        super().__init__(parent)
+        self.base_url, self.api_key = base_url, api_key
+    def run(self):
+        from app.core.server import probe_server
+        from app.core.api_client import fetch_models
+        status, detail = probe_server(self.base_url, self.api_key, timeout=5.0)
+        models = None
+        if status.startswith("running"):
+            models, _err = fetch_models(self.base_url, self.api_key, timeout=10.0)
+        self.done.emit(status, detail, self.base_url, models)
+
+
+class ModelsWorker(QThread):
+    """Standalone /v1/models refresh for the model combo."""
+    done = Signal(bool, object, str)         # ok, models, error
+    def __init__(self, base_url, api_key="", parent=None):
+        super().__init__(parent)
+        self.base_url, self.api_key = base_url, api_key
+    def run(self):
+        from app.core.api_client import fetch_models
+        models, err = fetch_models(self.base_url, self.api_key)
+        self.done.emit(not err, models, err)
 
 
 class MmprojFetchWorker(QThread):
@@ -194,6 +225,64 @@ class InferenceTab(QWidget):
         key_row.addWidget(self.api_key_edit, stretch=1)
         key_row.addWidget(self.show_key_btn)
         form.addRow("API Key:", key_row)
+        # ---- External Server URL -----------------------------------------
+        # A full base URL (http://host:port or https://api.example.com/v1)
+        # for an EXTERNAL OpenAI-compatible /v1/chat/completions server.
+        # When non-empty, this takes precedence over Host/Port below and the
+        # local llama-server is NOT required — the app talks directly to this
+        # endpoint.  Works with any compatible backend (llama.cpp on another
+        # machine, vLLM, Ollama with OpenAI shim, remote inference APIs, …).
+        self.external_url_edit = QLineEdit(st.external_url)
+        self.external_url_edit.setPlaceholderText(
+            "e.g. http://192.168.1.5:8888   (empty = use local server below)")
+        self.external_url_edit.setToolTip(
+            "BASE address of an EXTERNAL OpenAI-compatible server.\n"
+            "\n"
+            "  http://192.168.1.5:8888                  <- bare origin\n"
+            "  http://192.168.1.5:8888/v1              <- fine, '/v1' is stripped\n"
+            "  http://192.168.1.5:8888/v1/chat/completions  <- fine, stripped\n"
+            "\n"
+            "Enter the server address only - the app appends /v1/chat/\n"
+            "completions itself (and reads /v1/models for the model list).\n"
+            "The 'API Key' field above is sent as 'Authorization: Bearer\n"
+            "<key>' with every request, including the model listing.\n"
+            "\n"
+            "Works with: llama.cpp on another box, Unsloth studio, vLLM,\n"
+            "Ollama (OpenAI-compatible endpoint), LM Studio, remote APIs.\n"
+            "Leave empty to use the local server (Host/Port below).")
+        ext_row = QHBoxLayout()
+        ext_row.addWidget(self.external_url_edit, stretch=1)
+        self.ext_check_btn = QPushButton("Check")
+        self.ext_check_btn.setToolTip(
+            "Probe this external server now: /v1/models first (the exact\n"
+            "endpoint captions use), then /health.  On success the model\n"
+            "list below is refreshed automatically.")
+        ext_row.addWidget(self.ext_check_btn)
+        form.addRow("External Server URL:", ext_row)
+        self.external_status = QLabel("")
+        self.external_status.setWordWrap(True)
+        self.external_status.setStyleSheet("color: gray;")
+        form.addRow(self.external_status)
+
+        # NEW row: which model the external server should use.
+        self.external_model_combo = QComboBox()
+        self.external_model_combo.addItem("(auto — the loaded model)", "")
+        self.external_model_combo.setToolTip(
+            "Which model the external server uses for captions.\n"
+            "'(auto)' assumes there is a single loaded model: /v1/models\n"
+            "is queried and, when exactly one model is loaded, its id is\n"
+            "sent; otherwise the literal 'default' (the server's current\n"
+            "model) is sent - no repo_name/model_name needed.\n"
+            "With exactly one loaded model it is pre-selected here\n"
+            "automatically.  Pick a specific id to force a different one\n"
+            "(loaded models are marked ✓).")
+        self.refresh_models_btn = QPushButton("Refresh")
+        self.refresh_models_btn.setToolTip(
+            "Re-query /v1/models now (with the API Key) and refresh the list.")
+        ext_model_row = QHBoxLayout()
+        ext_model_row.addWidget(self.external_model_combo, stretch=1)
+        ext_model_row.addWidget(self.refresh_models_btn)
+        form.addRow("External server model:", ext_model_row)
         # ---- Host / Port + reachability check ------------------------------
         # On commit (Enter / focus-out) of either field the app probes the
         # endpoint in the background and reports what it found:
@@ -247,7 +336,9 @@ class InferenceTab(QWidget):
             "Which model llama-server actually loads.\n"
             "'Follow Tab 1 selection' mirrors the Tab 1 model/quant picker;\n"
             "choosing an entry here overrides it explicitly (persisted).\n"
-            "Quant sub-menu lists the live-discovered Hub filenames.")
+            "Quant sub-menu lists the live-discovered Hub filenames.\n"
+            "Applies to LOCAL server launches only — external servers use\n"
+            "'External server model:' above.")
         self.run_quant_combo = QComboBox()
         self.run_quant_combo.setToolTip(
             "Exact GGUF file (quant) to launch - verbatim Hub filename,\n"
@@ -408,6 +499,35 @@ class InferenceTab(QWidget):
         self.max_tokens_spin.valueChanged.connect(
             lambda v: setattr(self.ctx.settings, "max_tokens", int(v)))
         gf.addRow("Max Tokens:", self.max_tokens_spin)
+        # Presence / repetition penalties (llama.cpp samplers).  Not sent before,
+        # so the server used its own defaults; these expose them.  Defaults
+        # mirror llama.cpp (0.0 / 1.1) -> an untouched config is unchanged.
+        self.presence_penalty_spin = QDoubleSpinBox()
+        self.presence_penalty_spin.setRange(-1.0, 2.0)
+        self.presence_penalty_spin.setSingleStep(0.1)
+        self.presence_penalty_spin.setDecimals(2)
+        self.presence_penalty_spin.setValue(
+            float(getattr(st, "presence_penalty", 0.0)))
+        self.presence_penalty_spin.setToolTip(
+            "llama-server 'presence_penalty' (-1 .. 2, default 0).\n"
+            "> 0 discourages repeating tokens/ideas already in the output;\n"
+            "negative rewards them.  0 = no effect (model default).")
+        self.presence_penalty_spin.valueChanged.connect(
+            lambda v: setattr(self.ctx.settings, "presence_penalty", float(v)))
+        gf.addRow("Presence Penalty:", self.presence_penalty_spin)
+        self.repetition_penalty_spin = QDoubleSpinBox()
+        self.repetition_penalty_spin.setRange(0.0, 2.0)
+        self.repetition_penalty_spin.setSingleStep(0.05)
+        self.repetition_penalty_spin.setDecimals(2)
+        self.repetition_penalty_spin.setValue(
+            float(getattr(st, "repetition_penalty", 1.1)))
+        self.repetition_penalty_spin.setToolTip(
+            "llama-server 'repetition_penalty' (0 .. 2, default 1.1).\n"
+            "> 1 penalises repeating recent n-grams; 1 = off.  Raise if the\n"
+            "model loops on a phrase, lower for more variety.")
+        self.repetition_penalty_spin.valueChanged.connect(
+            lambda v: setattr(self.ctx.settings, "repetition_penalty", float(v)))
+        gf.addRow("Repetition Penalty:", self.repetition_penalty_spin)
         hint = QLabel(
             "Reasoning knobs travel PER REQUEST: effort / enable / preserve "
             "via chat_template_kwargs (needs llama-server --jinja, added "
@@ -446,6 +566,102 @@ class InferenceTab(QWidget):
         kf.addRow(self.state_label)
         root.addWidget(kv_box)
 
+        # ---- Companion caption files -------------------------------------
+        # Naming of the sidecar caption stored next to each image:
+        #   <image_name><suffix>.<ext>
+        # Load and save may use DIFFERENT names (read one set, write another).
+        # Empty suffix = none; empty extension = follow the active preset's
+        # output format ('json' for MOSS, 'txt' for tag presets) when saving,
+        # or try '.json' then '.txt' when loading.  All-empty defaults keep the
+        # original naming (<image_name>.json / .txt), so existing datasets work.
+        comp_box = QGroupBox("Companion caption files")
+        cf = QFormLayout(comp_box)
+        self.comp_load_suffix = QLineEdit(st.caption_load_suffix or "")
+        self.comp_load_suffix.setPlaceholderText("none  (load <image_name>.<ext>)")
+        self.comp_load_suffix.setToolTip(
+            "Suffix of the sidecar caption to LOAD (if it exists).\n"
+            "File read = <image_name><suffix>.<load extension>.\n"
+            "Empty: load whatever <image_name>.json / .txt is present.")
+        self.comp_load_ext = QLineEdit(st.caption_load_ext or "")
+        self.comp_load_ext.setPlaceholderText("auto  (.json then .txt)")
+        self.comp_load_ext.setToolTip(
+            "Extension of the sidecar caption to LOAD.\n"
+            "Empty: try <image_name>.json, then <image_name>.txt.")
+        self.comp_save_suffix = QLineEdit(st.caption_save_suffix or "")
+        self.comp_save_suffix.setPlaceholderText("none  (save <image_name>.<ext>)")
+        self.comp_save_suffix.setToolTip(
+            "Suffix of the sidecar caption to SAVE.\n"
+            "File written = <image_name><suffix>.<save extension>.\n"
+            "Empty: no suffix.")
+        self.comp_save_ext = QLineEdit(st.caption_save_ext or "")
+        self.comp_save_ext.setPlaceholderText("follow preset  (json / txt)")
+        self.comp_save_ext.setToolTip(
+            "Extension of the sidecar caption to SAVE.\n"
+            "Empty: use the active preset's format ('.json' for MOSS,\n"
+            "'.txt' for tag presets).  Type 'json' to force JSON always.")
+        cf.addRow("Load suffix:", self.comp_load_suffix)
+        cf.addRow("Load extension:", self.comp_load_ext)
+        cf.addRow("Save suffix:", self.comp_save_suffix)
+        cf.addRow("Save extension:", self.comp_save_ext)
+        self.comp_keep_ext_check = QCheckBox("Preserve image extension")
+        self.comp_keep_ext_check.setChecked(
+            bool(getattr(st, "caption_keep_image_ext", False)))
+        self.comp_keep_ext_check.setToolTip(
+            "Keep the image's own extension in the caption file name.\n"
+            "Off (default): cat.png -> cat.md\n"
+            "On           : cat.png -> cat.png.md")
+        cf.addRow(self.comp_keep_ext_check)
+        # Live example of the resulting file names (recomputed on every edit
+        # and when the active preset changes, since the save default follows it).
+        self.comp_example_label = QLabel("")
+        self.comp_example_label.setWordWrap(True)
+        self.comp_example_label.setStyleSheet(
+            "color: gray; font-family: monospace;")
+        cf.addRow(self.comp_example_label)
+        root.addWidget(comp_box)
+
+        # ---- Upscale before analysis -------------------------------------------------
+        # In-RAM only: each image is resized at request time (Lanczos/
+        # bicubic, independent 1x/2x/4x per axis) and the re-encoded result
+        # is embedded in the payload.  Source files are never modified.
+        up_box = QGroupBox("Upscale Before Analysis")
+        uf = QFormLayout(up_box)
+        self.cb_upscale = QCheckBox("Upscale images in RAM before sending to the model")
+        self.cb_upscale.setChecked(bool(getattr(st, "upscale_enabled", False)))
+        self.cb_upscale.setToolTip(
+            "When enabled, each image is resized IN RAM right before its\n"
+            "request is built and the re-encoded result (same file format)\n"
+            "is sent to the model instead of the original file bytes.\n"
+            "\n"
+            "* Source files are never modified; nothing is written to disk.\n"
+            "* Off: requests are byte-identical to the pre-feature app.")
+        uf.addRow(self.cb_upscale)
+        self.upscale_method_combo = QComboBox()
+        for _mid, (_mlabel, _mfilter) in UPSCALE_METHODS.items():
+            self.upscale_method_combo.addItem(_mlabel, _mid)
+        self.upscale_method_combo.setToolTip(
+            "Resampling filter used for the in-RAM upscale.\n"
+            "  Lanczos - sharper edges (slight ringing on hard lines)\n"
+            "  Bicubic - smoother, softer result (faster)")
+        uf.addRow("Method:", self.upscale_method_combo)
+        self.upscale_scale_x_combo = QComboBox()
+        self.upscale_scale_y_combo = QComboBox()
+        for _s in UPSCALE_SCALES:
+            self.upscale_scale_x_combo.addItem(f"{_s}\u00d7", _s)
+            self.upscale_scale_y_combo.addItem(f"{_s}\u00d7", _s)
+        for _w in (self.upscale_scale_x_combo, self.upscale_scale_y_combo):
+            _w.setToolTip("Upscale factor on this axis (independent).")
+        uf.addRow("Scale X:", self.upscale_scale_x_combo)
+        uf.addRow("Scale Y:", self.upscale_scale_y_combo)
+        up_hint = QLabel(
+            "Applied per request - no server restart needed.  Upscaled "
+            "payloads are larger (2\u00d7 \u2248 4\u00d7 pixels, 4\u00d7 \u2248 16\u00d7): expect "
+            "more API tokens / latency per image.")
+        up_hint.setStyleSheet("color: gray;")
+        up_hint.setWordWrap(True)
+        uf.addRow(up_hint)
+        root.addWidget(up_box)
+
         root.addStretch(1)
 
         # ---- wiring --------------------------------------------------------------
@@ -478,6 +694,70 @@ class InferenceTab(QWidget):
         # API key -> live settings (persisted with everything else).
         self.api_key_edit.textChanged.connect(
             lambda t: setattr(self.ctx.settings, "api_key", t.strip()))
+        # External server URL -> live settings (takes precedence when non-empty).
+        self.external_url_edit.textChanged.connect(
+            lambda t: setattr(self.ctx.settings, "external_url", t.strip()))
+        # External model + live probing/refresh (Tab 2).
+        self.external_model_combo.currentIndexChanged.connect(
+            lambda: setattr(self.ctx.settings, "external_model",
+                            self.external_model_combo.currentData() or ""))
+        self.ext_check_btn.clicked.connect(
+            lambda: self._run_external_check(force=True))
+        self.refresh_models_btn.clicked.connect(self._refresh_external_models)
+        self.external_url_edit.textChanged.connect(self._schedule_external_refresh)
+        self.api_key_edit.textChanged.connect(self._schedule_external_refresh)
+        # Hydrate combo from persisted value:
+        _idx = self.external_model_combo.findData((st.external_model or "").strip())
+        self.external_model_combo.setCurrentIndex(_idx if _idx >= 0 else 0)
+        # Companion caption file naming -> live settings (applied immediately);
+        # persist to app_settings.json only when a field is committed, so we
+        # don't rewrite the file on every keystroke.
+        for _w, _attr in ((self.comp_load_suffix, "caption_load_suffix"),
+                          (self.comp_load_ext, "caption_load_ext"),
+                          (self.comp_save_suffix, "caption_save_suffix"),
+                          (self.comp_save_ext, "caption_save_ext")):
+            _w.textChanged.connect(
+                lambda t, a=_attr: setattr(self.ctx.settings, a, t.strip()))
+            _w.editingFinished.connect(self.ctx.save_settings)
+            _w.textChanged.connect(self._update_comp_example)
+        self.comp_keep_ext_check.toggled.connect(
+            lambda v: (setattr(self.ctx.settings, "caption_keep_image_ext",
+                               bool(v)),
+                       self._update_comp_example(),
+                       self.ctx.save_settings()))
+        self.ctx.preset_changed.connect(self._update_comp_example)
+        self._update_comp_example()
+        # Upscale-before-analysis -> live settings; persist immediately
+        # (combos / checkbox - no keystroke-spam concern).
+        self.cb_upscale.toggled.connect(
+            lambda v: (setattr(self.ctx.settings, "upscale_enabled", bool(v)),
+                       self._sync_upscale_widgets(),
+                       self.ctx.save_settings()))
+        self.upscale_method_combo.currentIndexChanged.connect(
+            lambda: (setattr(self.ctx.settings, "upscale_method",
+                             self.upscale_method_combo.currentData() or "lanczos"),
+                     self.ctx.save_settings()))
+        self.upscale_scale_x_combo.currentIndexChanged.connect(
+            lambda: (setattr(self.ctx.settings, "upscale_scale_x",
+                             int(self.upscale_scale_x_combo.currentData() or 1)),
+                     self.ctx.save_settings()))
+        self.upscale_scale_y_combo.currentIndexChanged.connect(
+            lambda: (setattr(self.ctx.settings, "upscale_scale_y",
+                             int(self.upscale_scale_y_combo.currentData() or 1)),
+                     self.ctx.save_settings()))
+        # Hydrate combos from persisted values (validated against options).
+        _umi = self.upscale_method_combo.findData(
+            str(getattr(st, "upscale_method", "lanczos")))
+        self.upscale_method_combo.setCurrentIndex(_umi if _umi >= 0 else 0)
+        for _c, _a in ((self.upscale_scale_x_combo, "upscale_scale_x"),
+                       (self.upscale_scale_y_combo, "upscale_scale_y")):
+            try:
+                _val = int(getattr(st, _a, 2))
+            except (TypeError, ValueError):
+                _val = 2
+            _ci = _c.findData(_val)
+            _c.setCurrentIndex(_ci if _ci >= 0 else 0)
+        self._sync_upscale_widgets()
         # Reachability check fires when the user FINISHES editing Host or
         # Port (Enter / focus-out) - never on every keystroke - plus a manual
         # 'Check' button for re-probing on demand.
@@ -532,6 +812,133 @@ class InferenceTab(QWidget):
         self._toggle_thinking_controls()
 
     # ------------------------------------------------------------------ plan
+    def _schedule_external_refresh(self, *_):
+        """Debounced re-probe + model refresh after URL/key edits."""
+        from app.core.api_client import normalize_base_url
+        if not normalize_base_url(self.external_url_edit.text()):
+            return
+        if getattr(self, "_ext_refresh_timer", None) is None:
+            self._ext_refresh_timer = QTimer(self)
+            self._ext_refresh_timer.setSingleShot(True)
+            self._ext_refresh_timer.setInterval(800)
+            self._ext_refresh_timer.timeout.connect(
+                lambda: self._run_external_check(force=False))
+        self._ext_refresh_timer.start()
+
+    def _run_external_check(self, force: bool = True):
+        from app.core.api_client import normalize_base_url
+        base = normalize_base_url(self.external_url_edit.text())
+        if not base:
+            return
+        key = self.api_key_edit.text().strip()
+        if not force and base == getattr(self, "_last_ext_probe_url", "") \
+                and key == getattr(self, "_last_ext_probe_key", ""):
+            return
+        if getattr(self, "_ext_probe_thread", None) is not None \
+                and self._ext_probe_thread.isRunning():
+            self._ext_probe_thread.quit(); self._ext_probe_thread.wait(2000)
+        self._last_ext_probe_url, self._last_ext_probe_key = base, key
+        self.external_status.setStyleSheet("color: gray;")
+        self.external_status.setText(f"Checking {base} ...")
+        self.ext_check_btn.setEnabled(False)
+        t = ExternalProbeWorker(base, key, self)
+        t.done.connect(self._apply_external_probe_result)
+        t.finished.connect(lambda: self.ext_check_btn.setEnabled(True))
+        self._ext_probe_thread = t
+        t.start()
+
+    def _apply_external_probe_result(self, status, detail, base, models):
+        from app.core.api_client import loaded_models
+        if status in ("running", "running-auth"):
+            self.external_status.setStyleSheet("color: darkgreen;")
+            txt = f"{base}: external server OK ({status})."
+            if models is not None:
+                loaded = loaded_models(models)
+                txt += f" {len(models)} model(s) listed, {len(loaded)} loaded."
+                if len(loaded) == 1:
+                    txt += f" Auto-selected '{loaded[0].get('id')}'."
+            self.external_status.setText(txt)
+            self._populate_external_models(models)
+        elif status == "auth-required":
+            self.external_status.setStyleSheet("color: darkorange;")
+            self.external_status.setText(
+                f"{base}: up, but demands an API key - fill 'API Key' above "
+                "and press Check again.")
+        elif status == "auth-failed":
+            self.external_status.setStyleSheet("color: red;")
+            self.external_status.setText(f"{base}: rejected the API key ({detail}).")
+        elif status == "down":
+            self.external_status.setStyleSheet("color: darkorange;")
+            self.external_status.setText(
+                f"{base}: reachable, but no OpenAI endpoint answers ({detail}).\n"
+                "Hint: enter the BASE url only, e.g. http://192.168.1.5:8888.")
+        else:
+            self.external_status.setStyleSheet("color: red;")
+            self.external_status.setText(f"{base}: unreachable ({detail}).")
+        self.ctx.log.emit(f"[server] external probe {status}: {base} {detail}".rstrip())
+
+    def _populate_external_models(self, models):
+        from app.core.api_client import loaded_models
+        if not models:
+            return
+        loaded = {m.get("id") for m in loaded_models(models) if isinstance(m, dict)}
+        cur = (self.ctx.settings.external_model or "").strip()
+        self.external_model_combo.blockSignals(True)
+        self.external_model_combo.clear()
+        self.external_model_combo.addItem("(auto — the loaded model)", "")
+        for m in models:
+            mid = (m or {}).get("id")
+            if not mid:
+                continue
+            self.external_model_combo.addItem(
+                ("✓ " if mid in loaded else "   ") + mid, mid)
+        lone = [m for m in loaded_models(models) if isinstance(m, dict)]
+        idx = self.external_model_combo.findData(cur)
+        # Exactly-one-loaded rule: with no explicit pick (auto mode) or a
+        # pick that vanished from the listing, and exactly one model
+        # loaded, visibly land ON that model so the combo shows what will
+        # be sent.  Several or none loaded keep '(auto)' (-> 'default').
+        if len(lone) == 1 and (idx < 0 or cur == ""):
+            idx = self.external_model_combo.findData(lone[0].get("id"))
+        self.external_model_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.external_model_combo.blockSignals(False)
+        self.ctx.settings.external_model = \
+            self.external_model_combo.currentData() or ""
+
+    def _refresh_external_models(self):
+        from app.core.api_client import normalize_base_url
+        base = normalize_base_url(self.external_url_edit.text())
+        if not base:
+            self.external_status.setStyleSheet("color: darkorange;")
+            self.external_status.setText("Enter the external server URL first.")
+            return
+        if getattr(self, "_models_thread", None) is not None \
+                and self._models_thread.isRunning():
+            self._models_thread.quit(); self._models_thread.wait(2000)
+        self.refresh_models_btn.setEnabled(False)
+        self.ctx.log.emit(f"[server] refreshing model list from {base}/v1/models …")
+        t = ModelsWorker(base, self.api_key_edit.text().strip(), self)
+        t.done.connect(self._on_models_fetched)
+        t.finished.connect(lambda: self.refresh_models_btn.setEnabled(True))
+        self._models_thread = t
+        t.start()
+
+    def _on_models_fetched(self, ok, models, err):
+        from app.core.api_client import loaded_models
+        if ok:
+            loaded = loaded_models(models)
+            self.ctx.log.emit(
+                f"[server] /v1/models: {len(models)} model(s), {len(loaded)} "
+                f"loaded: " + (", ".join(m.get("id", "?") for m in loaded) or "-"))
+            self._populate_external_models(models)
+            self.external_status.setStyleSheet("color: darkgreen;")
+            self.external_status.setText(
+                f"{len(models)} model(s) listed, {len(loaded)} loaded.")
+        else:
+            self.ctx.log.emit(f"[server] /v1/models failed: {err}")
+            self.external_status.setStyleSheet("color: red;")
+            self.external_status.setText(f"Model list failed: {err}")
+
     def refresh_from_context(self):
         """Re-hydrate every widget from ``ctx.settings`` / presets.
 
@@ -552,6 +959,48 @@ class InferenceTab(QWidget):
         self.api_key_edit.blockSignals(True)
         self.api_key_edit.setText(st.api_key)
         self.api_key_edit.blockSignals(False)
+        # External server URL field (takes precedence over host/port when set).
+        self.external_url_edit.blockSignals(True)
+        self.external_url_edit.setText(st.external_url or "")
+        self.external_url_edit.blockSignals(False)
+        # External server model combo: re-hydrate from the persisted value.
+        self.external_model_combo.blockSignals(True)
+        _midx = self.external_model_combo.findData(
+            (st.external_model or "").strip())
+        self.external_model_combo.setCurrentIndex(_midx if _midx >= 0 else 0)
+        self.external_model_combo.blockSignals(False)
+        # Companion caption file naming.
+        for _w, _attr in ((self.comp_load_suffix, "caption_load_suffix"),
+                          (self.comp_load_ext, "caption_load_ext"),
+                          (self.comp_save_suffix, "caption_save_suffix"),
+                          (self.comp_save_ext, "caption_save_ext")):
+            _w.blockSignals(True)
+            _w.setText(getattr(st, _attr, "") or "")
+            _w.blockSignals(False)
+        self.comp_keep_ext_check.blockSignals(True)
+        self.comp_keep_ext_check.setChecked(
+            bool(getattr(st, "caption_keep_image_ext", False)))
+        self.comp_keep_ext_check.blockSignals(False)
+        # Upscale-before-analysis controls.
+        self.cb_upscale.blockSignals(True)
+        self.cb_upscale.setChecked(bool(getattr(st, "upscale_enabled", False)))
+        self.cb_upscale.blockSignals(False)
+        _umi = self.upscale_method_combo.findData(
+            str(getattr(st, "upscale_method", "lanczos")))
+        self.upscale_method_combo.blockSignals(True)
+        self.upscale_method_combo.setCurrentIndex(_umi if _umi >= 0 else 0)
+        self.upscale_method_combo.blockSignals(False)
+        for _c, _a in ((self.upscale_scale_x_combo, "upscale_scale_x"),
+                       (self.upscale_scale_y_combo, "upscale_scale_y")):
+            try:
+                _val = int(getattr(st, _a, 2))
+            except (TypeError, ValueError):
+                _val = 2
+            _ci = _c.findData(_val)
+            _c.blockSignals(True)
+            _c.setCurrentIndex(_ci if _ci >= 0 else 0)
+            _c.blockSignals(False)
+        self._sync_upscale_widgets()
         sm = (st.split_mode or "layer").strip().lower()
         if self.split_combo.findText(sm) >= 0:
             self.split_combo.setCurrentText(sm)
@@ -597,6 +1046,14 @@ class InferenceTab(QWidget):
         self.max_tokens_spin.setValue(mt)
         self.max_tokens_spin.blockSignals(False)
         st.max_tokens = mt
+        self.presence_penalty_spin.blockSignals(True)
+        self.presence_penalty_spin.setValue(
+            float(getattr(st, "presence_penalty", 0.0)))
+        self.presence_penalty_spin.blockSignals(False)
+        self.repetition_penalty_spin.blockSignals(True)
+        self.repetition_penalty_spin.setValue(
+            float(getattr(st, "repetition_penalty", 1.1)))
+        self.repetition_penalty_spin.blockSignals(False)
         # Reasoning budget: -1 (unlimited sentinel) is a valid slider value;
         # hydrate the Unlimited checkbox from it and show "Unlimited" instead
         # of the raw number on the value label.
@@ -620,6 +1077,42 @@ class InferenceTab(QWidget):
         self._refresh_binary_status()
         self._populate_run_models()
         self.refresh_plan()
+        self._update_comp_example()
+
+    # ------------------------------------------------ companion file naming
+    def _update_comp_example(self, *_args):
+        """Recompute the live example file names under 'Companion caption files'.
+
+        *save* is deterministic: an empty extension follows the active preset's
+        output format (json / txt / md).  *load* is exact when an explicit
+        extension is set, otherwise it shows the auto search order.  The base
+        name keeps the image's own extension when 'Preserve image extension'
+        is ticked (sample.png vs sample), mirroring companion_base().
+        """
+        base = ("sample.png" if self.comp_keep_ext_check.isChecked()
+                else "sample")
+        lsfx = self.comp_load_suffix.text().strip()
+        lex = self.comp_load_ext.text().strip().lstrip(".")
+        ssfx = self.comp_save_suffix.text().strip()
+        sex = self.comp_save_ext.text().strip().lstrip(".")
+        save_ext = sex or companion_ext(self.ctx.active_preset.output_format)
+        save_name = f"{base}{ssfx}.{save_ext}"
+        if lex:
+            load_desc = f"{base}{lsfx}.{lex}"
+        else:
+            load_desc = (f"{base}{lsfx}.*   "
+                         "(auto search: json \u2192 txt \u2192 md)")
+        self.comp_example_label.setText(
+            f'For an image named “sample.png”:\n'
+            f"  save \u2192 {save_name}\n"
+            f"  load \u2192 {load_desc}")
+
+    def _sync_upscale_widgets(self, *_args):
+        """Enable/disable the upscale method + scale combos with the toggle."""
+        on = bool(getattr(self.ctx.settings, "upscale_enabled", False))
+        for w in (self.upscale_method_combo, self.upscale_scale_x_combo,
+                  self.upscale_scale_y_combo):
+            w.setEnabled(on)
 
     def _profile(self):
         """ModelProfile of the run-target model (Tab 2 selection)."""

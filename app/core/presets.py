@@ -40,6 +40,32 @@ BOORU_SYSTEM_PROMPT = """You are an expert anime and digital art tagger. Generat
 Include: artist, copyright, character, meta, and general tags. Order by importance.
 Limit to 100 tokens maximum. Do not use sentences."""
 
+# Markdown mode: the model is asked to emit raw Markdown.  The *user* decides
+# what belongs in the document by editing this prompt (it is a preset like the
+# others, so custom instructions are saved into captioner_config.json and can
+# be recycled).  Kept deliberately generic; sidecars save as '.md'.
+MARKDOWN_SYSTEM_PROMPT = """You are an image captioner that responds ONLY in Markdown.
+Output raw Markdown text: no code fences, no preamble, no explanation.
+Use a short title plus structured sections or bullet lists as appropriate.
+Follow the user's request for exactly what to include.  This default is
+intentionally generic - replace it with your own Markdown instructions."""
+
+OCR_TRANSCRIPT_SYSTEM_PROMPT = """You are an image recaptioner working for a Japanese ero-manga company: your job is to extract the Japanese transcript from the scan. Return exactly one JSON object with this schema:
+{
+  "information": {
+    "page_reading_order": "RTL-TB",
+    "text_writing": "vertical, top-to-down right-to-left",
+    "number_of_bounding_boxes": "NNN",
+    "image_filename": "image_filename.ext"
+  },
+  "bbox": [{"box_2d": [y_min0, x_min0, y_max0, x_max0], "label": "text_transcript", "chronological_number": "0"}],
+  "bbox": [{"box_2d": [y_min1, x_min1, y_max1, x_max1], "label": "text_transcript", "chronological_number": "1"}]
+}
+Rules:
+- Preserve the original Japanese text as it is: kana, kanji, without romanization and/or translation.
+- Use the vision's native normalized 0-1000 coordinates for bounding boxes.
+- Return only the JSON object."""
+
 
 @dataclass
 class GenerationParams:
@@ -47,6 +73,9 @@ class GenerationParams:
     top_p: float = 0.95
     top_k: int = 40
     min_p: float = 0.05
+    # llama.cpp sampler penalties (previously never sent -> server defaults).
+    presence_penalty: float = 0.0     # -1..2, default 0; nudge away from seen tokens
+    repetition_penalty: float = 1.1   # 0..2,  default 1.1; >1 discourages repeats
     reasoning_budget: int = 0        # --reasoning-budget / reasoning_budget_tokens
     enable_thinking: bool = False    # Qwen-style thinking mode flag
     max_tokens: int = 2048
@@ -59,8 +88,23 @@ class CaptionPreset:
     system_prompt: str
     user_prompt: str
     params: GenerationParams
-    output_format: str               # "json" | "txt"
+    output_format: str               # "json" | "txt" | "md" | "ocr_json"
     explicit_suffix: str = EXPLICIT_TRIGGER
+    include_image_filename: bool = False  # inject image basename into system prompt
+    # Bounding-box overlay coordinate standard for THIS preset (Tab 4 dropdowns).
+    # MOSS-Image and OCR Transcript both ask for Y-X corners in native 0-1000
+    # units; Custom is included because only the user knows what a custom prompt
+    # emits.  They travel with the preset: ``export_config`` serialises presets via
+    # ``asdict`` and ``import_config`` filters by these field names, so both keys
+    # round-trip through Tab 3 export/import, the unified bundle and a startup
+    # captioner_config.json - and a legacy file simply gets the defaults.
+    overlay_box_layout: str = "yxyx"        # key into app.core.boxes.LAYOUTS
+    overlay_coord_scale: str = "0-1000"     # key into app.core.boxes.SCALES
+    # Presentation travels with the preset too, so a "this dataset is reviewed
+    # with numbered chips, bright colours" preset exports and imports whole.
+    overlay_labels: str = "none"            # none | number | text
+    overlay_colour_mode: str = "vivid"      # vivid | raw
+    overlay_any_preset: bool = False        # gate override, per preset
 
     def effective_system_prompt(self, explicit: bool, abliterated_model: bool) -> str:
         sp = self.system_prompt
@@ -95,6 +139,33 @@ def _booru_default() -> CaptionPreset:
     )
 
 
+def _markdown_default() -> CaptionPreset:
+    return CaptionPreset(
+        key="markdown",
+        display_name="Markdown",
+        system_prompt=MARKDOWN_SYSTEM_PROMPT,
+        user_prompt="Describe this image as Markdown.",
+        params=GenerationParams(temperature=0.7, top_p=0.9, top_k=40,
+                                min_p=0.05, reasoning_budget=0,
+                                enable_thinking=False),
+        output_format="md",
+    )
+
+
+def _ocr_transcript_default() -> CaptionPreset:
+    return CaptionPreset(
+        key="ocr_transcript",
+        display_name="OCR Transcript (Japanese)",
+        system_prompt=OCR_TRANSCRIPT_SYSTEM_PROMPT,
+        user_prompt="Extract the Japanese transcript from this scan.",
+        params=GenerationParams(temperature=0.7, top_p=0.9, top_k=40,
+                                min_p=0.05, reasoning_budget=0,
+                                enable_thinking=False, max_tokens=8192),
+        output_format="ocr_json",
+        include_image_filename=True,
+    )
+
+
 def _custom_default() -> CaptionPreset:
     return CaptionPreset(
         key="custom",
@@ -107,7 +178,8 @@ def _custom_default() -> CaptionPreset:
 
 
 DEFAULT_PRESETS: dict[str, CaptionPreset] = {
-    p.key: p for p in (_moss_default(), _booru_default(), _custom_default())
+    p.key: p for p in (_moss_default(), _booru_default(), _markdown_default(),
+                       _ocr_transcript_default(), _custom_default())
 }
 
 
@@ -296,6 +368,174 @@ def _balanced_span(text: str):
     return None
 
 
+# --------------------------------------------------------------------------
+# Robust (fuzzy) JSON recovery
+# --------------------------------------------------------------------------
+#: The model is unreliable about bracket discipline - a dropped closing brace,
+#: a trailing comma or an unterminated string all kill a stock json.loads while
+#: the data is still perfectly recoverable.  These helpers make BOTH the save
+#: path (parse_moss_json / parse_fuzzy_json) and the overlay path
+#: (boxes.extract_boxes) as forgiving as each other - in fact they now share
+#: exactly this recovery code, so a bracket-dropped response is saved repaired
+#: instead of failing the image.  The object is located even when it is wrapped
+#: in prose or code fences, and missing brackets are balanced so a truncated
+#: response still parses.  This mirrors the strategy of a fuzzy-JSON parser
+#: (e.g. github.com/livingbio/fuzzy-json) without adding a dependency to an
+#: otherwise self-contained app.
+def _strip_fences(text: str) -> str:
+    """Drop markdown code-fence lines at the very start / end of *text*."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[A-Za-z0-9_]*[ \t]*\r?\n?", "", t)
+        t = re.sub(r"\r?\n?[ \t]*```+[ \t]*$", "", t)
+    return t.strip()
+
+
+def _balance(text: str) -> tuple[str, int, int]:
+    """Close unterminated strings / containers in *text* (best-effort).
+
+    Walks the string honouring JSON string literals and escapes.  A closer that
+    does not match the innermost open container is resolved by auto-closing
+    whatever sits between it and the matching opener, so a dropped ``}`` before a
+    ``]`` is reconstructed in the right order; a closer with no possible opener is
+    dropped.  At the end an unterminated string is closed and every still-open
+    container is closed (in reverse).  Trailing commas directly before a closer
+    are removed, since json.loads rejects them.  Returns
+    ``(repaired_text, n_brackets, n_commas)``.
+    """
+    out: list[str] = []
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    fixes = 0
+    for ch in text:
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+        elif ch in "{[":
+            stack.append(ch)
+            out.append(ch)
+        elif ch in "}]":
+            want = "{" if ch == "}" else "["
+            if not stack:
+                continue                                # spurious closer
+            if stack[-1] == want:
+                stack.pop()
+            else:
+                for idx in range(len(stack) - 1, -1, -1):
+                    if stack[idx] == want:
+                        for j in range(len(stack) - 1, idx, -1):
+                            out.append("}" if stack[j] == "{" else "]")
+                            fixes += 1
+                        del stack[idx:]                 # consume opener + above
+                        break
+                else:
+                    continue                            # no opener -> drop
+            out.append(ch)
+        else:
+            out.append(ch)                              # :, digits, commas, spaces...
+    s = "".join(out)
+    if in_str:
+        s += '"'
+        fixes += 1
+    for opener in reversed(stack):                      # close what is still open
+        s += "}" if opener == "{" else "]"
+        fixes += 1
+    commas = 0
+
+    def _sub(m):
+        nonlocal commas
+        commas += 1
+        return m.group(1)
+
+    s = re.sub(r",(\s*[}\]])", _sub, s)                 # drop trailing commas
+    return s, fixes, commas
+
+
+def _robust_candidates(text: str) -> list[tuple[str, str]]:
+    """(candidate_string, note) pairs for *text*, least-intervention first.
+
+    Shared by the save path (parse_moss_json / parse_fuzzy_json) and the overlay
+    path (boxes.extract_boxes) so both tolerate identical LLM noise - a markdown
+    code fence, prose around an embedded object, dropped brackets or trailing
+    commas.  Candidates are deduplicated; callers run ``json.loads`` on them in
+    turn and apply their own validation / best-pick rule.  *note* says what was
+    done to the string ('' for the untouched input).
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(s, note):
+        if s and s not in seen:
+            seen.add(s)
+            out.append((s, note))
+
+    t = (text or "").strip()
+    if not t:
+        return out
+    add(t, "")                                    # raw, untouched
+    sf = _strip_fences(t)
+    if sf != t:
+        add(sf, "stripped a markdown code fence")  # fence-stripped
+    for probe in (sf, t):                          # balanced {...} span (prose-aware)
+        span = _balanced_span(probe)
+        if span and span != probe:
+            add(span, "parsed the embedded object, ignoring surrounding text")
+    base = sf
+    starts = sorted({i for i in (base.find("{"), base.find("[")) if i >= 0})
+    for i in starts:                               # bracket-balanced reconstructions
+        fixed, n_br, n_co = _balance(base[i:])
+        bits = []
+        if n_br:
+            bits.append(f"balanced {n_br} missing bracket(s)")
+        if n_co:
+            bits.append((f"removed {n_co} trailing comma(s)" if n_co > 1
+                         else "removed a trailing comma"))
+        add(fixed, "; ".join(bits) or "repaired the structure")
+    return out
+
+
+def _load_robust(text: str, object_pairs_hook=None):
+    """Parse *text* into a dict/list, tolerating the noise LLMs actually add.
+
+    Tries every candidate from :func:`_robust_candidates` (raw -> fence-stripped
+    -> balanced span -> bracket-balanced reconstruction).  When several parse,
+    the one that recovers the MOST content wins (so a truncated top-level array
+    keeps every box instead of only its first balanced member).  Returns
+    ``(obj, strict, note)``: *strict* is True only when the untouched string
+    parsed as-is; on success *note* is a short phrase describing what was
+    repaired (empty for the strict path); on failure *obj* is None and *note*
+    carries the last parse error.
+    """
+    if not (text or "").strip():
+        return None, False, "empty input"
+    best = None                       # (obj, note, size)
+    last_err = "unrecognised structure"
+    for s, note in _robust_candidates(text):
+        try:
+            o = json.loads(s, object_pairs_hook=object_pairs_hook)
+        except (ValueError, TypeError) as exc:
+            last_err = str(exc)
+            continue
+        if isinstance(o, (dict, list)):
+            size = len(json.dumps(o, ensure_ascii=False))
+            if best is None or size > best[2]:
+                best = (o, note, size)
+    if best is None:
+        return None, False, last_err
+    obj, note, _size = best
+    return obj, (note == ""), note
+
+
 def _walk_regions(node, path: list, out: list) -> None:
     """Recursively harvest every region-like dict from a fuzzy structure.
 
@@ -469,18 +709,12 @@ def parse_moss_json(raw: str) -> dict:
     into normalised lists.  Raises ValueError when no valid JSON object with
     the expected keys can be recovered.
     """
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
-    candidates = [text]
-    span = _balanced_span(text)
-    if span is not None and span != text:
-        candidates.append(span)
-    candidates += _JSON_BLOCK.findall(text)
-    for cand in candidates:
+    # Fuzzy recovery (fences / prose / dropped brackets) - shared with the
+    # overlay path, so a truncated response is saved repaired, not dropped.
+    for cand, _note in _robust_candidates(raw):
         try:
             obj = json.loads(cand)
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             continue
         if isinstance(obj, dict) and "caption" in obj:
             cap = _coerce_dict(obj.get("caption"))
@@ -528,20 +762,71 @@ def clean_booru_tags(raw: str) -> str:
     return ", ".join(out)
 
 
-def caption_path_for(image_path: str, fmt: str) -> str:
-    """Sidecar caption path for an image ('.json' for MOSS, '.txt' otherwise)."""
-    root = os.path.splitext(image_path)[0]
-    ext = ".json" if fmt == "json" else ".txt"
-    return root + ext
+def companion_base(image_path: str, keep_image_ext: bool = False) -> str:
+    """The ``<image_name>`` part of a companion caption path.
+
+    Default (keep_image_ext=False) drops the image's own extension so
+    ``cat.png`` -> ``cat``; with keep_image_ext=True it is preserved so
+    ``cat.png`` -> ``cat.png`` (the caption then reads e.g. ``cat.png.md``).
+    """
+    return image_path if keep_image_ext else os.path.splitext(image_path)[0]
 
 
-def save_caption(image_path: str, text: str, fmt: str) -> str:
-    """Persist a caption next to its image; returns the written path."""
-    target = caption_path_for(image_path, fmt)
+def companion_ext(fmt: str) -> str:
+    """Default sidecar extension for a caption format.
+
+    'json' -> .json (MOSS), 'ocr_json' -> .json (OCR Transcript),
+    'md' -> .md (Markdown mode), anything else -> .txt (Booru / tag presets).
+    """
+    if fmt in ("json", "ocr_json"):
+        return "json"
+    if fmt == "md":
+        return "md"
+    return "txt"
+
+
+def caption_path_for(image_path: str, fmt: str,
+                     suffix: str = "", ext: str = "",
+                     keep_image_ext: bool = False) -> str:
+    """Sidecar caption path for an image.
+
+    Named ``<image_name><suffix>.<ext>``.  By default the image's own extension
+    is dropped (``cat.png`` -> ``cat.json``); *keep_image_ext* preserves it
+    (``cat.png`` -> ``cat.png.json``).  When *ext* is empty the extension
+    follows the preset format ('json' / 'md' / 'txt'); with *suffix*, *ext* and
+    *keep_image_ext* all at their defaults this reproduces the original
+    behaviour exactly.
+    """
+    root = companion_base(image_path, keep_image_ext)
+    ext = (ext or "").strip().lstrip(".") or companion_ext(fmt)
+    return f"{root}{suffix}.{ext}"
+
+
+def save_caption(image_path: str, text: str, fmt: str,
+                 suffix: str = "", ext: str = "",
+                 keep_image_ext: bool = False) -> str:
+    """Persist a caption next to its image; returns the written path.
+
+    *fmt* still governs how the *content* is processed (parsed MOSS JSON vs
+    fuzzy OCR JSON vs Markdown verbatim vs cleaned tags); *suffix* / *ext* /
+    *keep_image_ext* only customise the resulting file name.
+    """
+    target = caption_path_for(image_path, fmt, suffix=suffix, ext=ext,
+                              keep_image_ext=keep_image_ext)
     if fmt == "json":
         obj = parse_moss_json(text)
         with open(target, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, ensure_ascii=False, indent=2)
+    elif fmt == "ocr_json":
+        # Fuzzy: find the first balanced JSON object and save it verbatim.
+        obj = parse_fuzzy_json(text)
+        with open(target, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+    elif fmt == "md":
+        # Markdown is written verbatim (no booru tag cleaning) - the model
+        # already produced formatted text.
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text.strip() + "\n")
     else:
         cleaned = clean_booru_tags(text)
         with open(target, "w", encoding="utf-8") as fh:
@@ -549,19 +834,123 @@ def save_caption(image_path: str, text: str, fmt: str) -> str:
     return target
 
 
-def load_existing_caption(image_path: str) -> tuple[str, str]:
-    """Return (kind, text) for an existing sidecar .json/.txt caption."""
+def load_existing_caption(image_path: str,
+                          suffix: str = "", ext: str = "",
+                          keep_image_ext: bool = False) -> tuple[str, str]:
+    """Return (kind, text) for an existing sidecar caption.
+
+    The companion name is ``<image_name><suffix>.<ext>``; *keep_image_ext*
+    preserves the image's own extension in ``<image_name>`` (see
+    :func:`companion_base`).  When *ext* is empty every sidecar type the app
+    can write (json, txt, md) is tried in that order.  Returns ("", "") when
+    no matching file exists or cannot be read.
+    """
     import os
-    root = os.path.splitext(image_path)[0]
-    for ext in (".json", ".txt"):
-        p = root + ext
+    base = companion_base(image_path, keep_image_ext) + (suffix or "")
+    # With no explicit extension, search every sidecar type the app can write
+    # (MOSS/OCR JSON, tag .txt, Markdown .md) in that order of preference.
+    exts = [ext.strip().lstrip(".")] if ext else ["json", "txt", "md"]
+    for e in exts:
+        p = f"{base}.{e}"
         if os.path.isfile(p):
             try:
                 with open(p, "r", encoding="utf-8") as fh:
-                    return ext[1:], fh.read()
+                    return e, fh.read()
             except OSError:
                 pass
     return "", ""
+
+
+# --------------------------------------------------------------------------
+# Shared sidecar discovery (Caption Editor + Tab 4 bounding-box overlay)
+# --------------------------------------------------------------------------
+def _sidecar_groups(settings) -> list[tuple[str, str, bool]]:
+    """``(suffix, ext, keep_image_ext)`` triples to try, load naming first."""
+    if settings is None:
+        return [("", "", False)]
+    def grp(attr_s: str, attr_e: str) -> tuple[str, str, bool]:
+        return (str(getattr(settings, attr_s, "") or ""),
+                str(getattr(settings, attr_e, "") or ""),
+                bool(getattr(settings, "caption_keep_image_ext", False)))
+    out = [grp("caption_load_suffix", "caption_load_ext"),
+           grp("caption_save_suffix", "caption_save_ext")]
+    # Collapse identical groups (the historical default has both sides empty).
+    dedup: list[tuple[str, str, bool]] = []
+    for item in out:
+        if item not in dedup:
+            dedup.append(item)
+    return dedup
+
+
+def caption_candidate_paths(image_path: str, settings=None) -> list[str]:
+    """Every sidecar path this app may read, in preference order.
+
+    Load naming first, then save naming (a batch that saved as
+    ``_transcript.json`` must be found even when the load naming is plain), and
+    inside a group ``.json`` before ``.txt`` before ``.md`` - the order
+    :func:`load_existing_caption` has always used.
+    """
+    out: list[str] = []
+    for suffix, ext, keep in _sidecar_groups(settings):
+        base = companion_base(image_path, keep) + suffix
+        exts = [ext.strip().lstrip(".")] if ext else ["json", "txt", "md"]
+        for e in exts:
+            p = f"{base}.{e}"
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def resolve_caption_file(image_path: str, settings=None) -> tuple[str, str]:
+    """``(kind, text)`` of the first existing sidecar for *image_path*.
+
+    One source of truth shared by the Caption Editor and the bounding-box
+    overlay, so the panel and the drawing can never disagree about which file a
+    caption came from.  Returns ("", "") when nothing readable exists.
+    """
+    for p in caption_candidate_paths(image_path, settings):
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                return p.rsplit(".", 1)[-1].lower(), fh.read()
+        except OSError:
+            continue
+    return "", ""
+
+
+def caption_json_paths(image_path: str, settings=None) -> list[str]:
+    """Existing ``.json`` sidecars only - the ones that can carry geometry."""
+    return [p for p in caption_candidate_paths(image_path, settings)
+            if p.lower().endswith(".json") and os.path.isfile(p)]
+
+
+# --------------------------------------------------------------------------
+# Fuzzy JSON extraction (OCR Transcript mode)
+# --------------------------------------------------------------------------
+def parse_fuzzy_json(raw: str) -> dict:
+    """Extract the first balanced JSON object from a model response.
+
+    Deliberately schema-agnostic: does NOT validate any keys or structure,
+    so the system prompt can be freely reconfigured (different schema, extra
+    fields, renamed sections) without touching this code.  The model is
+    assumed to be faithful in returning exactly one JSON object.
+
+    Handles: markdown fences, leading/trailing prose, thinking blocks before
+    the actual answer.  Raises ValueError when no valid JSON object is found.
+    """
+    # Fuzzy recovery (fences / prose / dropped brackets) - shared with the
+    # overlay path, so a truncated response is saved repaired, not dropped.
+    for cand, _note in _robust_candidates(raw):
+        try:
+            obj = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError(
+        "Model response did not contain a valid JSON object "
+        "(OCR Transcript mode)")
 
 
 # --------------------------------------------------------------------------
@@ -610,6 +999,12 @@ def _coerce_param(name: str, value):
     return value
 
 
+#: Warnings collected by the *last* :func:`import_config` call (rejected preset
+#: values etc.).  ``models.import_full_config`` drains and forwards them so the
+#: user sees them at startup and after a Tab 3 import.
+IMPORT_WARNINGS: list[str] = []
+
+
 def import_config(raw: str) -> tuple[dict[str, CaptionPreset], str, bool]:
     """Parse a preset config payload into fresh :class:`CaptionPreset` objects.
 
@@ -623,6 +1018,7 @@ def import_config(raw: str) -> tuple[dict[str, CaptionPreset], str, bool]:
     param_names = set(asdict(GenerationParams()))
     preset_names = set(CaptionPreset.__dataclass_fields__)
     presets: dict[str, CaptionPreset] = {}
+    IMPORT_WARNINGS.clear()
     for key, pd in (data.get("presets") or {}).items():
         if not isinstance(pd, dict):
             continue
@@ -631,8 +1027,46 @@ def import_config(raw: str) -> tuple[dict[str, CaptionPreset], str, bool]:
         gp = gp if isinstance(gp, dict) else {}
         pd["params"] = GenerationParams(**{
             k: _coerce_param(k, v) for k, v in gp.items() if k in param_names})
-        presets[key] = CaptionPreset(**{k: v for k, v in pd.items()
-                                       if k in preset_names})
+        preset = CaptionPreset(**{k: v for k, v in pd.items()
+                                  if k in preset_names})
+        # Preset-level *strings* never went through _coerce_param (only 'params'
+        # did), so a hand-edited config could smuggle a nonsense coordinate
+        # standard in.  Reject it to the default rather than drawing garbage.
+        from app.core.boxes import (is_supported_colour_mode,
+                                    is_supported_label_mode,
+                                    is_supported_layout, is_supported_scale)
+        if not is_supported_layout(preset.overlay_box_layout):
+            IMPORT_WARNINGS.append(
+                f"overlay_box_layout {preset.overlay_box_layout!r} not "
+                "recognised; using 'yxyx' (ymin,xmin,ymax,xmax).")
+            preset.overlay_box_layout = "yxyx"
+        if not is_supported_scale(preset.overlay_coord_scale):
+            IMPORT_WARNINGS.append(
+                f"overlay_coord_scale {preset.overlay_coord_scale!r} not "
+                "recognised; using '0-1000' (native normalized vision units).")
+            preset.overlay_coord_scale = "0-1000"
+        if not is_supported_label_mode(preset.overlay_labels):
+            IMPORT_WARNINGS.append(
+                f"overlay_labels {preset.overlay_labels!r} not recognised; "
+                "using 'none'.")
+            preset.overlay_labels = "none"
+        if not is_supported_colour_mode(preset.overlay_colour_mode):
+            IMPORT_WARNINGS.append(
+                f"overlay_colour_mode {preset.overlay_colour_mode!r} not "
+                "recognised; using 'vivid'.")
+            preset.overlay_colour_mode = "vivid"
+        if not isinstance(preset.overlay_any_preset, bool):
+            IMPORT_WARNINGS.append(
+                f"overlay_any_preset {preset.overlay_any_preset!r} is not a "
+                "true/false value; coercing.")
+            preset.overlay_any_preset = bool(preset.overlay_any_preset)
+        presets[key] = preset
+    # Merge in any built-in presets that are absent from the imported config.
+    # This ensures new hardwired presets (e.g. OCR Transcript) always appear
+    # in the dropdown even when loading a config exported before they existed.
+    for key, default_preset in DEFAULT_PRESETS.items():
+        if key not in presets:
+            presets[key] = _clone(default_preset)
     if not presets:
         presets = {k: _clone(v) for k, v in DEFAULT_PRESETS.items()}
     active = data.get("active_preset") or next(iter(presets))
